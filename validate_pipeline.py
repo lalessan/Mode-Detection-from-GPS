@@ -498,7 +498,7 @@ def level1_compare_features(gps_df, trips_df, df_stats_orig, df_pct_orig, trip_k
     print("  " + "-" * 60)
     for orig_col, new_col in compare_cols.items():
         if orig_col in orig_sub.columns and new_col in new_sub.columns:
-            aligned = orig_sub[[orig_col]].join(new_sub[[new_col]], how="inner")
+            aligned = orig_sub[[orig_col]].join(new_sub[[new_col]], how="inner", lsuffix="_orig", rsuffix="_new")
             diff = (aligned.iloc[:, 0] - aligned.iloc[:, 1]).abs()
             corr = aligned.iloc[:, 0].corr(aligned.iloc[:, 1])
             print(f"  {orig_col:<22} {diff.max():>12.4f} {diff.mean():>12.4f} {corr:>12.4f}")
