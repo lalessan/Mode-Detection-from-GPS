@@ -264,17 +264,20 @@ def train_original_model(merged, trip_key_col, mode_col):
 def link_gps_to_trips(gps_df, trips_df):
     """Assign trip KEY to each GPS point by matching person ID + time windows.
 
-    Replicates the logic from 1_Intial_Setup_Motion_Features/link_netmob25_gps.py.
+    Replicates the logic from 1_Intial_Setup_Motion_Features/link_netmob25_gps.py
+    but uses a vectorized merge_asof approach for speed.
     """
     print("  Linking GPS points to trips via person ID + time windows...")
 
     # Build start/end times from trips (using Date_EMG as authoritative date)
     trips = trips_df.copy()
     trips["start_time"] = pd.to_datetime(
-        trips["Date_EMG"].astype(str) + " " + trips["Time_O"].astype(str), errors="coerce"
+        trips["Date_EMG"].astype(str) + " " + trips["Time_O"].astype(str),
+        format="mixed", dayfirst=False, errors="coerce",
     )
     trips["end_time"] = pd.to_datetime(
-        trips["Date_EMG"].astype(str) + " " + trips["Time_D"].astype(str), errors="coerce"
+        trips["Date_EMG"].astype(str) + " " + trips["Time_D"].astype(str),
+        format="mixed", dayfirst=False, errors="coerce",
     )
     trips = trips.dropna(subset=["start_time", "end_time"])
 
@@ -284,30 +287,41 @@ def link_gps_to_trips(gps_df, trips_df):
 
     # Parse GPS timestamps
     gps_df = gps_df.copy()
-    gps_df["timestamp"] = pd.to_datetime(gps_df["LOCAL DATETIME"], errors="coerce")
-    gps_df["KEY"] = pd.Series(pd.NA, index=gps_df.index, dtype="string")
+    gps_df["timestamp"] = pd.to_datetime(
+        gps_df["LOCAL DATETIME"], format="mixed", dayfirst=False, errors="coerce",
+    )
 
-    # Match per person
-    n_linked = 0
-    person_ids = gps_df["FILE_NAME"].unique()
-    for pid in person_ids:
-        pid_trips = trips[trips["ID"] == pid]
-        if pid_trips.empty:
-            continue
-        gps_mask = gps_df["FILE_NAME"] == pid
-        for _, trip in pid_trips.iterrows():
-            time_mask = gps_mask & (
-                (gps_df["timestamp"] >= trip["start_time"]) &
-                (gps_df["timestamp"] <= trip["end_time"])
-            )
-            gps_df.loc[time_mask, "KEY"] = trip["KEY"]
-            n_linked += time_mask.sum()
+    # Vectorized linking: merge_asof per person ID
+    # For each GPS point, find the trip whose start_time is <= the GPS timestamp,
+    # then check if the GPS timestamp is also <= end_time.
+    trips_slim = trips[["ID", "KEY", "start_time", "end_time"]].copy()
+    trips_slim = trips_slim.sort_values("start_time")
 
-    # Drop unlinked points
-    n_total = len(gps_df)
-    gps_df = gps_df[gps_df["KEY"].notna()].copy()
+    gps_df = gps_df.sort_values(["FILE_NAME", "timestamp"])
+
+    print("  Running merge_asof (this may take a few minutes)...")
+    t0 = time.time()
+
+    # merge_asof: for each GPS row, find the nearest trip start_time <= timestamp
+    merged = pd.merge_asof(
+        gps_df,
+        trips_slim.rename(columns={"ID": "FILE_NAME"}),
+        left_on="timestamp",
+        right_on="start_time",
+        by="FILE_NAME",
+        direction="backward",
+    )
+
+    # Keep only rows where timestamp <= end_time (i.e., actually within the trip)
+    within_trip = merged["timestamp"] <= merged["end_time"]
+    n_total = len(merged)
+    n_linked = within_trip.sum()
+
+    gps_df = merged[within_trip].drop(columns=["start_time", "end_time"]).copy()
+
     print(f"  Linked {n_linked:,} of {n_total:,} GPS points ({n_linked/n_total:.1%})")
     print(f"  Unique trips with GPS data: {gps_df['KEY'].nunique()}")
+    print(f"  Linking took {time.time() - t0:.1f}s")
 
     return gps_df
 
