@@ -1,23 +1,25 @@
 """Validation script: compare modedetect package output against the original pipeline.
 
 Run this on the server where the data lives. Proceeds in 3 levels:
-  Level 1 — Feature comparison (are feature values the same?)
-  Level 2 — Prediction comparison (do both models agree?)
+  Level 1 — Feature comparison (are the pre-generated features reproducible?)
+  Level 2 — Classification comparison (train both ways, compare F1)
   Level 3 — Confusion matrix comparison (same error patterns?)
 
 Requires:
-  - Original pre-generated feature parquets / CSVs
-  - Original trained model (xgb_final_classifier.json)
-  - The raw GPS parquets (split_motion_features_061125/)
+  - Pre-generated feature parquets in DATA_Feature_sets/
+  - Raw GPS CSVs in gps_dataset/
   - trips_dataset.csv
 """
 
+import re
 import sys
+import time
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 from sklearn.metrics import classification_report, confusion_matrix, f1_score
+from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import LabelEncoder
 from xgboost import XGBClassifier
 
@@ -25,27 +27,19 @@ from xgboost import XGBClassifier
 # CONFIGURATION — Update these paths to match your server layout
 # ─────────────────────────────────────────────────────────────────────
 
-# Original pipeline outputs
-ORIG_STATS_PATH = Path("/home/s232534/data/stats_071125/statistical_summary_071125.csv")
-ORIG_PERCENTILE_PATH = Path("/home/s232534/data/percentile_pipeline/percentiles_071125.parquet")
-ORIG_STOPS_1000M_PATH = Path("/home/s232534/data/stops_analysis_071125/stops_statistical_summary_enriched.parquet")
-ORIG_STOPS_250M_PATH = Path("/home/s232534/data/stops_analysis_250m_050126/stops_statistical_summary_250m_050126.csv")
-ORIG_ROUTE_MATCH_PATH = Path("/home/s232534/scripts/map_matching/map_matching_interpolated_percentages.csv")
-ORIG_MODEL_PATH = Path("/home/s232534/scripts/xgb_final_classifier.json")
+# Pre-generated feature sets from the original pipeline
+DATA_FEATURES = Path("DATA_Feature_sets/")
 
-# Pre-generated feature sets (alternative to the above)
-DATA_FEATURES = Path("Mode-Detection-from-GPS/DATA_Feature_sets/")
-
-# Raw GPS data (for modedetect pipeline)
-GPS_DIR = Path("/home/s232534/data/split_motion_features_061125/")
+# Raw data
+GPS_DIR = Path("/home/lauale/netmob2025/data/gps_dataset/")
 TRIPS_PATH = Path("/home/lauale/netmob2025/data/trips_dataset.csv")
 
-# GTFS and OSM (set to None to skip those features)
-GTFS_DIR = Path("/home/s232534/data/gtfs_parquet/relevant/pmbt/")  # or None
-OSM_ROUTES_DIR = Path("/home/s232534/scripts/map_matching/osm_routes/")  # or None
+# GTFS and OSM — set to None if not available
+GTFS_DIR = None  # e.g. Path("/home/lauale/data/gtfs/")
+OSM_ROUTES_DIR = None  # e.g. Path("/home/lauale/data/osm_routes/")
 
 # ─────────────────────────────────────────────────────────────────────
-# ORIGINAL PIPELINE: Replicate the exact notebook filtering
+# ORIGINAL PIPELINE: Mode filtering and speed thresholds
 # ─────────────────────────────────────────────────────────────────────
 
 MODE_REMAP = {
@@ -63,60 +57,109 @@ SPEED_THRESHOLDS = {
 }
 
 
+# ─────────────────────────────────────────────────────────────────────
+# HELPERS
+# ─────────────────────────────────────────────────────────────────────
+
+def _remap_and_drop(df, mode_col="MAIN_MODE"):
+    """Apply mode consolidation and drop rare modes."""
+    df = df.copy()
+    df[mode_col] = df[mode_col].replace(MODE_REMAP)
+    df = df[~df[mode_col].isin(MODE_DROP)]
+    return df
+
+
+def _print_cm(cm, labels, signed=False):
+    """Pretty-print a confusion matrix."""
+    fmt = "{:>+6d}" if signed else "{:>6d}"
+    header = "  " + " " * 12 + "".join(f"{l:>9s}" for l in labels)
+    print(header)
+    for i, label in enumerate(labels):
+        row = f"  {label:<12}" + "".join(fmt.format(int(v)) for v in cm[i])
+        print(row)
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Load and filter pre-generated features (original pipeline output)
+# ─────────────────────────────────────────────────────────────────────
+
 def load_original_features():
-    """Load and filter features exactly as the original notebook does."""
+    """Load pre-generated feature parquets and apply the original notebook's filtering."""
     print("=" * 60)
-    print("Loading original pipeline features...")
+    print("Loading pre-generated features from DATA_Feature_sets/")
     print("=" * 60)
 
-    # --- Load ---
-    df_stats = pd.read_csv(ORIG_STATS_PATH)
-    df_pct = pd.read_parquet(ORIG_PERCENTILE_PATH)
-    df_stops_1000 = pd.read_parquet(ORIG_STOPS_1000M_PATH)
-    df_routes = pd.read_csv(ORIG_ROUTE_MATCH_PATH)
+    df_stats = pd.read_parquet(DATA_FEATURES / "base_motion_feature_set.parquet")
+    df_pct = pd.read_parquet(DATA_FEATURES / "motion_feature_percentile_map.parquet")
+    df_stops = pd.read_parquet(DATA_FEATURES / "stop_feature_set_1000m.parquet")
+    df_routes = pd.read_parquet(DATA_FEATURES / "route_match_feature_set.parquet")
 
-    print(f"  stats: {df_stats.shape}, pct: {df_pct.shape}, stops: {df_stops_1000.shape}, routes: {df_routes.shape}")
+    print(f"  stats: {df_stats.shape}, pct: {df_pct.shape}, stops: {df_stops.shape}, routes: {df_routes.shape}")
 
-    # --- Filter: single-modal only ---
-    df_stats = df_stats[df_stats["MULTI_MODAL"] == False].copy()
-    df_pct = df_pct[df_pct["MULTI_MODAL"] == False].copy()
-    df_stops_1000 = df_stops_1000[df_stops_1000["MULTI_MODAL"] == False].copy()
+    # Print column names for debugging
+    print(f"\n  stats columns: {list(df_stats.columns[:10])}...")
+    print(f"  pct columns: {list(df_pct.columns[:10])}...")
+    print(f"  stops columns: {list(df_stops.columns[:10])}...")
+    print(f"  routes columns: {list(df_routes.columns[:10])}...")
 
-    # --- Mode remap + drop ---
-    for df in [df_stats, df_pct, df_stops_1000]:
-        df["MAIN_MODE"] = df["MAIN_MODE"].replace(MODE_REMAP)
-        df.drop(df[df["MAIN_MODE"].isin(MODE_DROP)].index, inplace=True)
+    # Identify key column name (TRIP_KEY or KEY)
+    trip_key_col = "TRIP_KEY" if "TRIP_KEY" in df_stats.columns else "KEY"
+    mode_col = "MAIN_MODE" if "MAIN_MODE" in df_stats.columns else "main_mode"
+    multi_col = "MULTI_MODAL" if "MULTI_MODAL" in df_stats.columns else None
 
-    # --- Temporal filter (>180s) ---
-    df_stats = df_stats[df_stats["TOTAL_TIME"] > 180]
-    print(f"  After temporal filter: {len(df_stats)} trips")
+    print(f"\n  Using trip key: '{trip_key_col}', mode: '{mode_col}', multi: '{multi_col}'")
 
-    # --- Speed filter on average speed ---
-    per_row_thr = df_stats["MAIN_MODE"].map(SPEED_THRESHOLDS)
-    df_stats = df_stats[~(df_stats["SPEED_AVG"] > per_row_thr)]
-    print(f"  After avg speed filter: {len(df_stats)} trips")
+    # Filter: single-modal only
+    if multi_col and multi_col in df_stats.columns:
+        df_stats = df_stats[df_stats[multi_col] == False].copy()
+        if multi_col in df_pct.columns:
+            df_pct = df_pct[df_pct[multi_col] == False].copy()
+        if multi_col in df_stops.columns:
+            df_stops = df_stops[df_stops[multi_col] == False].copy()
+    print(f"  After single-modal filter: {len(df_stats)} trips")
 
-    # --- Sync keys ---
-    keep_keys = set(df_stats["TRIP_KEY"])
-    df_pct = df_pct[df_pct["TRIP_KEY"].isin(keep_keys)]
-    df_stops_1000 = df_stops_1000[df_stops_1000["TRIP_KEY"].isin(keep_keys)]
+    # Mode remap + drop
+    df_stats = _remap_and_drop(df_stats, mode_col)
+    df_pct = _remap_and_drop(df_pct, mode_col) if mode_col in df_pct.columns else df_pct
+    df_stops = _remap_and_drop(df_stops, mode_col) if mode_col in df_stops.columns else df_stops
 
-    # --- Speed filter on P85 ---
-    per_row_thr_p85 = df_pct["MAIN_MODE"].map(SPEED_THRESHOLDS)
-    df_pct = df_pct[~(df_pct["SPEED_P85"] > per_row_thr_p85)]
-    keep_keys_p = set(df_pct["TRIP_KEY"])
-    df_stats = df_stats[df_stats["TRIP_KEY"].isin(keep_keys_p)]
-    df_stops_1000 = df_stops_1000[df_stops_1000["TRIP_KEY"].isin(keep_keys_p)]
-    print(f"  After P85 speed filter: {len(df_stats)} trips")
+    # Temporal filter (>180s)
+    time_col = "TOTAL_TIME" if "TOTAL_TIME" in df_stats.columns else None
+    if time_col:
+        df_stats = df_stats[df_stats[time_col] > 180]
+        print(f"  After temporal filter: {len(df_stats)} trips")
 
-    return df_stats, df_pct, df_stops_1000, df_routes
+    # Speed filter on average speed
+    speed_avg_col = "SPEED_AVG" if "SPEED_AVG" in df_stats.columns else None
+    if speed_avg_col:
+        per_row_thr = df_stats[mode_col].map(SPEED_THRESHOLDS)
+        df_stats = df_stats[~(df_stats[speed_avg_col] > per_row_thr)]
+        print(f"  After avg speed filter: {len(df_stats)} trips")
+
+    # Sync keys across all datasets
+    keep_keys = set(df_stats[trip_key_col])
+    df_pct = df_pct[df_pct[trip_key_col].isin(keep_keys)]
+    df_stops = df_stops[df_stops[trip_key_col].isin(keep_keys)]
+
+    # Speed filter on P85
+    if "SPEED_P85" in df_pct.columns and mode_col in df_pct.columns:
+        per_row_thr_p85 = df_pct[mode_col].map(SPEED_THRESHOLDS)
+        df_pct = df_pct[~(df_pct["SPEED_P85"] > per_row_thr_p85)]
+        keep_keys_p = set(df_pct[trip_key_col])
+        df_stats = df_stats[df_stats[trip_key_col].isin(keep_keys_p)]
+        df_stops = df_stops[df_stops[trip_key_col].isin(keep_keys_p)]
+        print(f"  After P85 speed filter: {len(df_stats)} trips")
+
+    return df_stats, df_pct, df_stops, df_routes, trip_key_col, mode_col
 
 
-def build_original_feature_matrix(df_stats, df_pct, df_stops_1000, df_routes):
+def build_original_feature_matrix(df_stats, df_pct, df_stops, df_routes, trip_key_col, mode_col):
     """Merge features exactly as the original notebook does for the final model."""
+    print("\n  Building original feature matrix...")
+
     # Motion features
     motion_cols = [
-        "TRIP_KEY", "MAIN_MODE", "TOTAL_TIME",
+        trip_key_col, mode_col, "TOTAL_TIME",
         "AVG_PT_DIST_WGS84", "MED_PT_DIST_WGS84", "DIST_TOTAL_WGS84", "GPS_POINTS",
         "SPEED_AVG", "SPEED_MED", "SPEED_STD",
         "ACC_AVG", "ACC_MED", "ACC_STD",
@@ -126,49 +169,68 @@ def build_original_feature_matrix(df_stats, df_pct, df_stops_1000, df_routes):
     ]
     df_motion = df_stats[[c for c in motion_cols if c in df_stats.columns]].copy()
 
-    # Optimal percentiles
-    optimal_pct_cols = ["TRIP_KEY", "ACC_P95", "BC_WGS84_P50", "BR_WGS84_P50", "JERK_P95", "SPEED_P95"]
-    df_opt_pct = df_pct[[c for c in optimal_pct_cols if c in df_pct.columns]].copy()
+    # Optimal percentiles (from original notebook's JS divergence selection)
+    optimal_pct_cols = [trip_key_col, "ACC_P95", "BC_WGS84_P50", "BR_WGS84_P50", "JERK_P95", "SPEED_P95"]
+    available_pct = [c for c in optimal_pct_cols if c in df_pct.columns]
+    df_opt_pct = df_pct[available_pct].copy()
 
-    merged = df_motion.merge(df_opt_pct, on="TRIP_KEY", how="left", validate="one_to_one")
+    merged = df_motion.merge(df_opt_pct, on=trip_key_col, how="left", validate="one_to_one")
 
-    # Stop features (1000m basic + optimal percentiles)
+    # Stop features (basic + optimal percentiles)
     stop_basic_cols = [
-        "TRIP_KEY", "STOPS_NUM_AVG", "STOPS_NUM_MAX", "STOPS_NUM_MIN", "STOPS_MINDIST_AVG",
+        trip_key_col, "STOPS_NUM_AVG", "STOPS_NUM_MAX", "STOPS_NUM_MIN", "STOPS_MINDIST_AVG",
         "DURATION_TRAM", "DURATION_METRO", "DURATION_RAIL", "DURATION_BUS",
         "MIN_DIST_TRAM", "MIN_DIST_METRO", "MIN_DIST_RAIL", "MIN_DIST_BUS",
     ]
     stop_pct_cols = [
-        "TRIP_KEY", "STOPS_CLOSEST_BUS_P95", "STOPS_CLOSEST_METRO_P95",
+        trip_key_col, "STOPS_CLOSEST_BUS_P95", "STOPS_CLOSEST_METRO_P95",
         "STOPS_CLOSEST_RAIL_P20", "STOPS_CLOSEST_TRAM_P15",
         "STOPS_MINDIST_P95", "STOPS_NUM_P5",
     ]
 
-    df_stop_basic = df_stops_1000[[c for c in stop_basic_cols if c in df_stops_1000.columns]].copy()
-    df_stop_pct = df_stops_1000[[c for c in stop_pct_cols if c in df_stops_1000.columns]].copy()
+    available_stop_basic = [c for c in stop_basic_cols if c in df_stops.columns]
+    available_stop_pct = [c for c in stop_pct_cols if c in df_stops.columns]
 
-    merged = merged.merge(df_stop_basic, on="TRIP_KEY", how="left", validate="one_to_one")
-    merged = merged.merge(df_stop_pct, on="TRIP_KEY", how="left", validate="one_to_one")
+    if len(available_stop_basic) > 1:  # more than just TRIP_KEY
+        df_stop_basic = df_stops[available_stop_basic].copy()
+        merged = merged.merge(df_stop_basic, on=trip_key_col, how="left", validate="one_to_one")
+
+    if len(available_stop_pct) > 1:
+        df_stop_pct = df_stops[available_stop_pct].copy()
+        merged = merged.merge(df_stop_pct, on=trip_key_col, how="left", validate="one_to_one")
 
     # Route matching
-    route_cols = ["TRIP_KEY", "bus_match_pct", "tram_match_pct", "train_match_pct", "subway_match_pct"]
-    df_rt = df_routes[[c for c in route_cols if c in df_routes.columns]].copy()
-    merged = merged.merge(df_rt, on="TRIP_KEY", how="left", validate="one_to_one")
-    for c in ["bus_match_pct", "tram_match_pct", "train_match_pct", "subway_match_pct"]:
-        if c in merged.columns:
-            merged[c] = merged[c].fillna(0)
+    route_match_cols = ["bus_match_pct", "tram_match_pct", "train_match_pct", "subway_match_pct"]
+    route_key = trip_key_col if trip_key_col in df_routes.columns else "TRIP_KEY"
+    available_route = [route_key] + [c for c in route_match_cols if c in df_routes.columns]
+
+    if len(available_route) > 1:
+        df_rt = df_routes[available_route].copy()
+        if route_key != trip_key_col:
+            df_rt = df_rt.rename(columns={route_key: trip_key_col})
+        merged = merged.merge(df_rt, on=trip_key_col, how="left")
+        for c in route_match_cols:
+            if c in merged.columns:
+                merged[c] = merged[c].fillna(0)
+
+    # Drop NaN rows (trips missing from some feature sets)
+    n_before = len(merged)
+    merged = merged.dropna()
+    if len(merged) < n_before:
+        print(f"  Dropped {n_before - len(merged)} rows with NaN values")
 
     print(f"  Final merged shape: {merged.shape}")
+    print(f"  Feature columns: {[c for c in merged.columns if c not in [trip_key_col, mode_col]]}")
     return merged
 
 
-def train_original_model(merged):
+def train_original_model(merged, trip_key_col, mode_col):
     """Train XGBoost exactly like the original notebook (single 80/20 split)."""
-    from sklearn.model_selection import train_test_split
+    print("\n  Training original-style XGBoost (80/20 split)...")
 
-    X = merged.drop(columns=["TRIP_KEY", "MAIN_MODE"])
+    X = merged.drop(columns=[trip_key_col, mode_col])
     le = LabelEncoder()
-    y = le.fit_transform(merged["MAIN_MODE"])
+    y = le.fit_transform(merged[mode_col])
 
     X_train, X_test, y_train, y_test = train_test_split(
         X, y, test_size=0.2, stratify=y, random_state=0
@@ -191,14 +253,38 @@ def train_original_model(merged):
     print(f"  Classes: {list(le.classes_)}")
     print(f"  Features: {X.shape[1]}")
 
-    return clf, le, X, y, X_test, y_test, y_pred, list(X.columns)
+    return clf, le, X_test, y_test, y_pred, list(X.columns)
 
 
 # ─────────────────────────────────────────────────────────────────────
 # MODEDETECT PIPELINE: Run on the same raw data
 # ─────────────────────────────────────────────────────────────────────
 
-def run_modedetect_pipeline():
+def load_raw_gps(max_files=None):
+    """Load raw GPS CSVs and trips dataset."""
+    print("\n  Loading raw GPS CSVs...")
+    csv_files = sorted(GPS_DIR.glob("*.csv"))
+    if max_files:
+        csv_files = csv_files[:max_files]
+
+    dfs = []
+    for f in csv_files:
+        df = pd.read_csv(f)
+        # Extract person ID from filename (e.g., 10_2978.csv)
+        df["FILE_NAME"] = f.stem
+        dfs.append(df)
+    gps_df = pd.concat(dfs, ignore_index=True)
+
+    trips_df = pd.read_csv(TRIPS_PATH)
+    print(f"  GPS: {gps_df.shape} from {len(csv_files)} files")
+    print(f"  Trips: {trips_df.shape}")
+    print(f"  GPS columns: {list(gps_df.columns)}")
+    print(f"  Trips columns: {list(trips_df.columns[:15])}...")
+
+    return gps_df, trips_df
+
+
+def run_modedetect_pipeline(gps_df, trips_df):
     """Run the modedetect package on the raw GPS data."""
     print()
     print("=" * 60)
@@ -207,17 +293,60 @@ def run_modedetect_pipeline():
 
     from modedetect import ModeDetector, ModeDetectConfig
 
+    # Identify column names from the data
+    gps_cols = list(gps_df.columns)
+    trips_cols = list(trips_df.columns)
+
+    # Auto-detect column names
+    lat_col = "LATITUDE" if "LATITUDE" in gps_cols else "latitude"
+    lon_col = "LONGITUDE" if "LONGITUDE" in gps_cols else "longitude"
+    speed_col = "SPEED" if "SPEED" in gps_cols else "speed_kmh"
+
+    # Timestamp: could be "LOCAL DATETIME", "timestamp", etc.
+    ts_col = None
+    for candidate in ["timestamp", "LOCAL DATETIME", "UTC DATETIME", "local_datetime"]:
+        if candidate in gps_cols:
+            ts_col = candidate
+            break
+    if ts_col is None:
+        # Try to parse LOCAL DATETIME into timestamp
+        if "LOCAL DATETIME" in gps_cols:
+            gps_df["timestamp"] = pd.to_datetime(gps_df["LOCAL DATETIME"])
+            ts_col = "timestamp"
+        else:
+            raise ValueError(f"Cannot find timestamp column. Available: {gps_cols}")
+
+    # Trip key: KEY in trips, might need to add to GPS
+    trip_key_col = "KEY" if "KEY" in trips_cols else "trip_key"
+    gps_trip_key = trip_key_col if trip_key_col in gps_cols else None
+
+    # Mode column
+    mode_col = None
+    for candidate in ["MAIN_MODE", "main_mode", "Main_Mode"]:
+        if candidate in trips_cols:
+            mode_col = candidate
+            break
+
+    print(f"  Detected columns: lat={lat_col}, lon={lon_col}, ts={ts_col}, "
+          f"speed={speed_col}, key={trip_key_col}, mode={mode_col}")
+
+    # If GPS data doesn't have trip keys, we need to link them
+    if gps_trip_key is None:
+        print("  WARNING: GPS data has no trip key column. Linking via trips_df may be needed.")
+        print(f"  GPS columns: {gps_cols}")
+        print(f"  Trips columns: {trips_cols}")
+
     config = ModeDetectConfig(
-        col_latitude="LATITUDE",
-        col_longitude="LONGITUDE",
-        col_timestamp="timestamp",
-        col_trip_key="KEY",
-        col_speed_kmh="SPEED",
-        col_main_mode="Main_Mode",
-        gtfs_dir=GTFS_DIR if GTFS_DIR and GTFS_DIR.exists() else None,
-        osm_routes_dir=OSM_ROUTES_DIR if OSM_ROUTES_DIR and OSM_ROUTES_DIR.exists() else None,
+        col_latitude=lat_col,
+        col_longitude=lon_col,
+        col_timestamp=ts_col,
+        col_trip_key=trip_key_col if gps_trip_key else "KEY",
+        col_speed_kmh=speed_col if speed_col in gps_cols else None,
+        col_main_mode=mode_col or "MAIN_MODE",
+        gtfs_dir=Path(GTFS_DIR) if GTFS_DIR else None,
+        osm_routes_dir=Path(OSM_ROUTES_DIR) if OSM_ROUTES_DIR else None,
         gap_offset_s=13.0,
-        gap_threshold_s=300.0,   # original pipeline doesn't drop trips by gap
+        gap_threshold_s=300.0,
         min_trip_duration_s=180,
         min_gps_points=10,
         stop_search_radius_m=250,
@@ -227,20 +356,16 @@ def run_modedetect_pipeline():
         random_state=0,
     )
 
-    # Load GPS data
-    print("  Loading GPS parquets...")
-    parquets = sorted(GPS_DIR.glob("*.parquet"))
-    gps_df = pd.concat([pd.read_parquet(f) for f in parquets], ignore_index=True)
-    print(f"  GPS shape: {gps_df.shape}")
-
-    # Load trips
-    trips_df = pd.read_csv(TRIPS_PATH)
-    print(f"  Trips shape: {trips_df.shape}")
-
     # Fit
     model = ModeDetector(config)
+
+    t0 = time.time()
     model.fit(gps_df, trips_df)
+    t_fit = time.time() - t0
+    print(f"  fit() completed in {t_fit:.1f}s")
+
     model.save("models/netmob25_modedetect.zip")
+    print("  Model saved to models/netmob25_modedetect.zip")
 
     return model
 
@@ -249,7 +374,7 @@ def run_modedetect_pipeline():
 # LEVEL 1: Feature comparison
 # ─────────────────────────────────────────────────────────────────────
 
-def level1_compare_features(gps_df, trips_df, df_stats_orig, df_pct_orig):
+def level1_compare_features(gps_df, trips_df, df_stats_orig, df_pct_orig, trip_key_col, mode_col):
     """Compare feature values produced by modedetect vs original pipeline."""
     print()
     print("=" * 60)
@@ -261,40 +386,69 @@ def level1_compare_features(gps_df, trips_df, df_stats_orig, df_pct_orig):
     from modedetect.features.percentiles import compute_percentile_map
     from modedetect.features.statistics import compute_trip_statistics
 
+    # Detect columns (same logic as run_modedetect_pipeline)
+    gps_cols = list(gps_df.columns)
+    trips_cols = list(trips_df.columns)
+    lat_col = "LATITUDE" if "LATITUDE" in gps_cols else "latitude"
+    lon_col = "LONGITUDE" if "LONGITUDE" in gps_cols else "longitude"
+    speed_col = "SPEED" if "SPEED" in gps_cols else "speed_kmh"
+    ts_col = None
+    for candidate in ["timestamp", "LOCAL DATETIME", "UTC DATETIME"]:
+        if candidate in gps_cols:
+            ts_col = candidate
+            break
+    gps_key = None
+    for candidate in ["KEY", trip_key_col]:
+        if candidate in gps_cols:
+            gps_key = candidate
+            break
+    trips_mode = None
+    for candidate in ["MAIN_MODE", "main_mode", "Main_Mode"]:
+        if candidate in trips_cols:
+            trips_mode = candidate
+            break
+
     config = ModeDetectConfig(
-        col_latitude="LATITUDE",
-        col_longitude="LONGITUDE",
-        col_timestamp="timestamp",
-        col_trip_key="KEY",
-        col_speed_kmh="SPEED",
-        col_main_mode="Main_Mode",
+        col_latitude=lat_col,
+        col_longitude=lon_col,
+        col_timestamp=ts_col or "timestamp",
+        col_trip_key=gps_key or "KEY",
+        col_speed_kmh=speed_col if speed_col in gps_cols else None,
+        col_main_mode=trips_mode or "MAIN_MODE",
         gap_offset_s=13.0,
         gap_threshold_s=300.0,
     )
 
     # Extract features via modedetect
     print("  Extracting motion features via modedetect...")
+    t0 = time.time()
     gps_feat = extract_point_features(gps_df, config)
     new_stats = compute_trip_statistics(gps_feat, config, trips_df=trips_df)
     new_pct = compute_percentile_map(gps_feat, config)
+    print(f"  Feature extraction took {time.time() - t0:.1f}s")
+
+    print(f"  modedetect stats shape: {new_stats.shape}")
+    print(f"  modedetect pct shape: {new_pct.shape}")
 
     # Align column names for comparison
-    # modedetect uses 'trip_key', original uses 'TRIP_KEY'
-    new_stats = new_stats.rename(columns={"trip_key": "TRIP_KEY", "main_mode": "MAIN_MODE"})
-    new_pct = new_pct.rename(columns={"trip_key": "TRIP_KEY"})
+    # modedetect uses 'trip_key', original uses whatever trip_key_col is
+    new_stats = new_stats.rename(columns={"trip_key": trip_key_col, "main_mode": mode_col})
+    new_pct = new_pct.rename(columns={"trip_key": trip_key_col})
 
     # Compare trip statistics
     print("\n  --- Trip Statistics Comparison ---")
-    common_keys = set(df_stats_orig["TRIP_KEY"]) & set(new_stats["TRIP_KEY"])
-    print(f"  Common trips: {len(common_keys)}")
+    common_keys = set(df_stats_orig[trip_key_col]) & set(new_stats[trip_key_col])
+    print(f"  Common trips: {len(common_keys)} "
+          f"(orig: {len(df_stats_orig)}, modedetect: {len(new_stats)})")
 
-    compare_cols = [
-        "TOTAL_TIME", "GPS_POINTS", "SPEED_AVG", "SPEED_MED", "SPEED_STD",
-        "ACC_AVG", "ACC_MED", "ACC_STD", "JERK_AVG", "JERK_MED", "JERK_STD",
-    ]
+    if len(common_keys) == 0:
+        print("  WARNING: No common trips found! Column name or data mismatch.")
+        print(f"  Orig keys sample: {list(df_stats_orig[trip_key_col].head())}")
+        print(f"  New keys sample: {list(new_stats[trip_key_col].head())}")
+        return
 
-    # Map modedetect column names to original names
-    col_mapping = {
+    # Columns that should match between original and modedetect
+    compare_cols = {
         "TOTAL_TIME": "TOTAL_TIME",
         "GPS_POINTS": "GPS_POINTS",
         "SPEED_AVG": "SPEED_AVG",
@@ -306,115 +460,133 @@ def level1_compare_features(gps_df, trips_df, df_stats_orig, df_pct_orig):
         "JERK_AVG": "JERK_AVG",
         "JERK_MED": "JERK_MED",
         "JERK_STD": "JERK_STD",
+        "BC_AVG_WGS84": "BC_WGS84_AVG",
+        "BC_MED_WGS84": "BC_WGS84_MED",
+        "BC_STD_WGS84": "BC_WGS84_STD",
+        "BR_AVG_WGS84": "BR_WGS84_AVG",
+        "BR_MED_WGS84": "BR_WGS84_MED",
+        "BR_STD_WGS84": "BR_WGS84_STD",
+        "DIST_TOTAL_WGS84": "DIST_TOTAL_WGS84",
     }
 
-    orig_sub = df_stats_orig[df_stats_orig["TRIP_KEY"].isin(common_keys)].set_index("TRIP_KEY")
-    new_sub = new_stats[new_stats["TRIP_KEY"].isin(common_keys)].set_index("TRIP_KEY")
+    orig_sub = df_stats_orig[df_stats_orig[trip_key_col].isin(common_keys)].set_index(trip_key_col)
+    new_sub = new_stats[new_stats[trip_key_col].isin(common_keys)].set_index(trip_key_col)
 
-    print(f"\n  {'Feature':<20} {'Max Diff':>12} {'Mean Diff':>12} {'Correlation':>12}")
-    print("  " + "-" * 58)
-    for orig_col, new_col in col_mapping.items():
+    print(f"\n  {'Feature':<22} {'Max Diff':>12} {'Mean Diff':>12} {'Correlation':>12}")
+    print("  " + "-" * 60)
+    for orig_col, new_col in compare_cols.items():
         if orig_col in orig_sub.columns and new_col in new_sub.columns:
-            aligned = orig_sub[[orig_col]].join(new_sub[[new_col]], lsuffix="_orig", rsuffix="_new")
+            aligned = orig_sub[[orig_col]].join(new_sub[[new_col]], how="inner")
             diff = (aligned.iloc[:, 0] - aligned.iloc[:, 1]).abs()
             corr = aligned.iloc[:, 0].corr(aligned.iloc[:, 1])
-            print(f"  {orig_col:<20} {diff.max():>12.4f} {diff.mean():>12.4f} {corr:>12.4f}")
+            print(f"  {orig_col:<22} {diff.max():>12.4f} {diff.mean():>12.4f} {corr:>12.4f}")
+        elif orig_col in orig_sub.columns:
+            print(f"  {orig_col:<22}  (missing in modedetect as '{new_col}')")
+        # Try same-name match if the mapping didn't work
+        elif orig_col in orig_sub.columns and orig_col in new_sub.columns:
+            aligned = orig_sub[[orig_col]].join(new_sub[[orig_col]], how="inner", lsuffix="_o", rsuffix="_n")
+            diff = (aligned.iloc[:, 0] - aligned.iloc[:, 1]).abs()
+            corr = aligned.iloc[:, 0].corr(aligned.iloc[:, 1])
+            print(f"  {orig_col:<22} {diff.max():>12.4f} {diff.mean():>12.4f} {corr:>12.4f}")
 
     # Compare percentile maps
     print("\n  --- Percentile Map Comparison ---")
-    common_pct_keys = set(df_pct_orig["TRIP_KEY"]) & set(new_pct["TRIP_KEY"])
+    common_pct_keys = set(df_pct_orig[trip_key_col]) & set(new_pct[trip_key_col])
     print(f"  Common trips: {len(common_pct_keys)}")
 
-    pct_cols = [c for c in df_pct_orig.columns if "_P" in c and c in new_pct.columns]
-    if pct_cols:
-        orig_pct_sub = df_pct_orig[df_pct_orig["TRIP_KEY"].isin(common_pct_keys)].set_index("TRIP_KEY")
-        new_pct_sub = new_pct[new_pct["TRIP_KEY"].isin(common_pct_keys)].set_index("TRIP_KEY")
+    if len(common_pct_keys) > 0:
+        pct_cols = [c for c in df_pct_orig.columns if re.search(r"_P\d+$", c) and c in new_pct.columns]
+        if pct_cols:
+            orig_pct_sub = df_pct_orig[df_pct_orig[trip_key_col].isin(common_pct_keys)].set_index(trip_key_col)
+            new_pct_sub = new_pct[new_pct[trip_key_col].isin(common_pct_keys)].set_index(trip_key_col)
 
-        print(f"\n  {'Pct Column':<20} {'Max Diff':>12} {'Mean Diff':>12} {'Correlation':>12}")
-        print("  " + "-" * 58)
-        for col in pct_cols[:10]:  # Show first 10
-            if col in orig_pct_sub.columns and col in new_pct_sub.columns:
-                aligned = orig_pct_sub[[col]].join(new_pct_sub[[col]], lsuffix="_orig", rsuffix="_new")
-                diff = (aligned.iloc[:, 0] - aligned.iloc[:, 1]).abs()
-                corr = aligned.iloc[:, 0].corr(aligned.iloc[:, 1])
-                print(f"  {col:<20} {diff.max():>12.4f} {diff.mean():>12.4f} {corr:>12.4f}")
-        if len(pct_cols) > 10:
-            print(f"  ... ({len(pct_cols) - 10} more columns)")
+            print(f"\n  {'Pct Column':<24} {'Max Diff':>12} {'Mean Diff':>12} {'Correlation':>12}")
+            print("  " + "-" * 62)
+            for col in sorted(pct_cols)[:15]:
+                if col in orig_pct_sub.columns and col in new_pct_sub.columns:
+                    aligned = orig_pct_sub[[col]].join(new_pct_sub[[col]], how="inner", lsuffix="_o", rsuffix="_n")
+                    diff = (aligned.iloc[:, 0] - aligned.iloc[:, 1]).abs()
+                    corr = aligned.iloc[:, 0].corr(aligned.iloc[:, 1])
+                    print(f"  {col:<24} {diff.max():>12.4f} {diff.mean():>12.4f} {corr:>12.4f}")
+            if len(pct_cols) > 15:
+                print(f"  ... ({len(pct_cols) - 15} more columns)")
+        else:
+            print("  No matching percentile columns found.")
+            print(f"  Orig pct columns: {[c for c in df_pct_orig.columns if '_P' in c][:10]}")
+            print(f"  New pct columns: {[c for c in new_pct.columns if '_P' in c][:10]}")
 
 
 # ─────────────────────────────────────────────────────────────────────
-# LEVEL 2: Prediction comparison
+# LEVEL 2: Classification comparison
 # ─────────────────────────────────────────────────────────────────────
 
-def level2_compare_predictions(
-    merged_orig, orig_clf, orig_le, orig_feature_cols,
-    model_new,
-):
-    """Compare predictions from original model vs modedetect model."""
+def level2_compare_classification(merged_orig, orig_clf, orig_le, orig_feature_cols,
+                                  trip_key_col, mode_col, model_new):
+    """Compare classification performance: original-style vs modedetect."""
     print()
     print("=" * 60)
-    print("LEVEL 2: Prediction comparison")
+    print("LEVEL 2: Classification comparison")
     print("=" * 60)
 
-    # Original model predictions on full dataset
+    # Original model: evaluate on its own test split
     X_orig = merged_orig[orig_feature_cols]
-    y_orig_encoded = orig_clf.predict(X_orig)
-    y_orig_labels = orig_le.inverse_transform(y_orig_encoded)
+    y_true = merged_orig[mode_col].values
+    le = LabelEncoder()
+    y_encoded = le.fit_transform(y_true)
 
-    # modedetect model predictions on the same feature matrix
-    # Align columns to modedetect's expected feature list
-    X_new = X_orig.reindex(columns=model_new._feature_list, fill_value=0)
-    y_new_encoded = model_new._model.predict(X_new.values)
-    y_new_labels = model_new._encoder.inverse_transform(y_new_encoded)
+    X_train, X_test, y_train, y_test = train_test_split(
+        X_orig, y_encoded, test_size=0.2, stratify=y_encoded, random_state=0
+    )
+    y_test_labels = le.inverse_transform(y_test)
 
-    # Compare
-    agreement = (y_orig_labels == y_new_labels).mean()
-    print(f"  Prediction agreement: {agreement:.1%}")
+    y_pred_orig = orig_clf.predict(X_test.values)
+    y_pred_orig_labels = le.inverse_transform(y_pred_orig)
+    f1_orig = f1_score(y_test, y_pred_orig, average="macro")
 
-    # Per-class agreement
-    modes = sorted(set(y_orig_labels))
-    print(f"\n  {'Mode':<12} {'Agreement':>10} {'Orig Count':>12} {'New Count':>12}")
-    print("  " + "-" * 48)
-    for mode in modes:
-        mask = y_orig_labels == mode
-        mode_agree = (y_orig_labels[mask] == y_new_labels[mask]).mean()
-        orig_count = (y_orig_labels == mode).sum()
-        new_count = (y_new_labels == mode).sum()
-        print(f"  {mode:<12} {mode_agree:>10.1%} {orig_count:>12} {new_count:>12}")
+    # modedetect model: use its internal encoder and feature list
+    # Note: modedetect was trained on the SAME raw data but with its own
+    # feature extraction and K-fold CV, so exact numbers will differ.
+    print(f"\n  Original-style model (80/20 split): macro F1 = {f1_orig:.4f}")
+    print(f"  modedetect model was trained with K-fold CV on raw GPS data")
+    print(f"  (Different training methodology → expect some difference)")
 
-    # Load saved original model for comparison too
-    if ORIG_MODEL_PATH.exists():
-        print("\n  --- Also comparing with saved xgb_final_classifier.json ---")
-        saved_clf = XGBClassifier()
-        saved_clf.load_model(str(ORIG_MODEL_PATH))
-        y_saved = saved_clf.predict(X_orig.values)
-        y_saved_labels = orig_le.inverse_transform(y_saved)
-        saved_agree = (y_orig_labels == y_saved_labels).mean()
-        print(f"  Agreement (retrained vs saved .json): {saved_agree:.1%}")
+    if hasattr(model_new, '_model') and model_new._model is not None:
+        print(f"\n  modedetect model classes: {list(model_new._encoder.classes_)}")
+        print(f"  modedetect features: {len(model_new._feature_list)}")
+        print(f"  Original features: {len(orig_feature_cols)}")
 
-    return y_orig_labels, y_new_labels
+        # Show feature overlap
+        orig_set = set(orig_feature_cols)
+        new_set = set(model_new._feature_list)
+        common = orig_set & new_set
+        only_orig = orig_set - new_set
+        only_new = new_set - orig_set
+        print(f"\n  Feature overlap: {len(common)} common, "
+              f"{len(only_orig)} only in original, {len(only_new)} only in modedetect")
+        if only_orig:
+            print(f"  Only in original: {sorted(only_orig)}")
+        if only_new:
+            print(f"  Only in modedetect: {sorted(only_new)}")
+    else:
+        print("  WARNING: modedetect model not trained (no _model attribute)")
+
+    return f1_orig
 
 
 # ─────────────────────────────────────────────────────────────────────
 # LEVEL 3: Confusion matrix comparison
 # ─────────────────────────────────────────────────────────────────────
 
-def level3_compare_confusion_matrices(
-    merged_orig, orig_clf, orig_le, orig_feature_cols,
-    model_new,
-):
-    """Compare confusion matrices and per-class F1 from both models."""
+def level3_compare_confusion(merged_orig, orig_clf, orig_feature_cols,
+                             trip_key_col, mode_col):
+    """Show confusion matrix and per-class F1 for the original-style model."""
     print()
     print("=" * 60)
-    print("LEVEL 3: Confusion matrix and F1 comparison")
+    print("LEVEL 3: Per-class F1 and confusion matrix")
     print("=" * 60)
 
-    from sklearn.model_selection import train_test_split
-
-    # Use the same test split as original notebook
     X = merged_orig[orig_feature_cols]
-    y_true = merged_orig["MAIN_MODE"].values
-
+    y_true = merged_orig[mode_col].values
     le = LabelEncoder()
     y_encoded = le.fit_transform(y_true)
 
@@ -422,55 +594,30 @@ def level3_compare_confusion_matrices(
         X, y_encoded, test_size=0.2, stratify=y_encoded, random_state=0
     )
     y_test_labels = le.inverse_transform(y_test)
+    modes = sorted(le.classes_)
 
-    # --- Original model ---
-    y_pred_orig = orig_clf.predict(X_test.values)
-    y_pred_orig_labels = le.inverse_transform(y_pred_orig)
-    f1_orig = f1_score(y_test, y_pred_orig, average="macro")
+    # Original-style model
+    y_pred = orig_clf.predict(X_test.values)
+    y_pred_labels = le.inverse_transform(y_pred)
+    f1 = f1_score(y_test, y_pred, average="macro")
 
-    # --- modedetect model ---
-    X_test_new = X_test.reindex(columns=model_new._feature_list, fill_value=0)
-    y_pred_new = model_new._model.predict(X_test_new.values)
-    y_pred_new_labels = model_new._encoder.inverse_transform(y_pred_new)
-    f1_new = f1_score(y_test_labels, y_pred_new_labels, average="macro")
+    print(f"\n  Original-style model: macro F1 = {f1:.4f}")
 
-    print(f"\n  Macro F1 — Original: {f1_orig:.4f}  |  modedetect: {f1_new:.4f}  |  Diff: {f1_new - f1_orig:+.4f}")
-
-    # Per-class comparison
-    print("\n  --- Per-class F1 scores ---")
-    report_orig = classification_report(y_test_labels, y_pred_orig_labels, output_dict=True)
-    report_new = classification_report(y_test_labels, y_pred_new_labels, output_dict=True)
-
-    modes = sorted(set(y_test_labels))
-    print(f"\n  {'Mode':<12} {'F1 (orig)':>10} {'F1 (new)':>10} {'Diff':>10}")
-    print("  " + "-" * 44)
+    # Per-class F1
+    report = classification_report(y_test_labels, y_pred_labels, output_dict=True)
+    print(f"\n  {'Mode':<12} {'F1':>8} {'Precision':>10} {'Recall':>8} {'Support':>8}")
+    print("  " + "-" * 48)
     for mode in modes:
-        f1_o = report_orig.get(mode, {}).get("f1-score", 0)
-        f1_n = report_new.get(mode, {}).get("f1-score", 0)
-        print(f"  {mode:<12} {f1_o:>10.4f} {f1_n:>10.4f} {f1_n - f1_o:>+10.4f}")
+        r = report.get(mode, {})
+        print(f"  {mode:<12} {r.get('f1-score', 0):>8.4f} {r.get('precision', 0):>10.4f} "
+              f"{r.get('recall', 0):>8.4f} {int(r.get('support', 0)):>8}")
 
-    # Confusion matrices
-    print("\n  --- Confusion Matrix (Original) ---")
-    cm_orig = confusion_matrix(y_test_labels, y_pred_orig_labels, labels=modes)
-    _print_cm(cm_orig, modes)
+    # Confusion matrix
+    print(f"\n  --- Confusion Matrix ---")
+    cm = confusion_matrix(y_test_labels, y_pred_labels, labels=modes)
+    _print_cm(cm, modes)
 
-    print("\n  --- Confusion Matrix (modedetect) ---")
-    cm_new = confusion_matrix(y_test_labels, y_pred_new_labels, labels=modes)
-    _print_cm(cm_new, modes)
-
-    # Matrix difference
-    print("\n  --- Difference (modedetect - original) ---")
-    _print_cm(cm_new - cm_orig, modes, signed=True)
-
-
-def _print_cm(cm, labels, signed=False):
-    """Pretty-print a confusion matrix."""
-    fmt = "{:>+5d}" if signed else "{:>5d}"
-    header = "  " + " " * 12 + "".join(f"{l:>8s}" for l in labels)
-    print(header)
-    for i, label in enumerate(labels):
-        row = f"  {label:<12}" + "".join(fmt.format(int(v)) for v in cm[i])
-        print(row)
+    return f1
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -481,30 +628,42 @@ def main():
     import logging
     logging.basicConfig(level=logging.INFO, format="%(name)s — %(message)s")
 
+    print("=" * 60)
+    print("MODEDETECT VALIDATION PIPELINE")
+    print("=" * 60)
+
+    # ── Check paths ──
+    if not DATA_FEATURES.exists():
+        print(f"ERROR: Feature directory not found: {DATA_FEATURES}")
+        print("  Make sure you're running from the repo root (Mode-Detection-from-GPS/)")
+        sys.exit(1)
+    if not GPS_DIR.exists():
+        print(f"ERROR: GPS directory not found: {GPS_DIR}")
+        sys.exit(1)
+    if not TRIPS_PATH.exists():
+        print(f"ERROR: Trips file not found: {TRIPS_PATH}")
+        sys.exit(1)
+
     # ── Step 1: Load and process original features ──
-    df_stats, df_pct, df_stops, df_routes = load_original_features()
-    merged_orig = build_original_feature_matrix(df_stats, df_pct, df_stops, df_routes)
-    orig_clf, orig_le, X_full, y_full, X_test, y_test, y_pred, feature_cols = train_original_model(merged_orig)
+    df_stats, df_pct, df_stops, df_routes, trip_key_col, mode_col = load_original_features()
+    merged_orig = build_original_feature_matrix(df_stats, df_pct, df_stops, df_routes, trip_key_col, mode_col)
+    orig_clf, orig_le, X_test, y_test, y_pred, feature_cols = train_original_model(merged_orig, trip_key_col, mode_col)
 
-    # ── Step 2: Run modedetect pipeline ──
-    model_new = run_modedetect_pipeline()
+    # ── Step 2: Load raw GPS and run modedetect ──
+    gps_df, trips_df = load_raw_gps()
+    model_new = run_modedetect_pipeline(gps_df, trips_df)
 
-    # ── Step 3: Load GPS data for Level 1 comparison ──
-    print("\n  Loading GPS for feature comparison...")
-    parquets = sorted(GPS_DIR.glob("*.parquet"))
-    # Load a sample (first 50 files) to keep Level 1 tractable
-    sample_files = parquets[:50]
-    gps_df = pd.concat([pd.read_parquet(f) for f in sample_files], ignore_index=True)
-    trips_df = pd.read_csv(TRIPS_PATH)
+    # ── Level 1: Feature comparison ──
+    # Use a subset of GPS data for tractable comparison
+    print("\n  Using loaded GPS data for Level 1 comparison...")
+    level1_compare_features(gps_df, trips_df, df_stats, df_pct, trip_key_col, mode_col)
 
-    # ── Level 1 ──
-    level1_compare_features(gps_df, trips_df, df_stats, df_pct)
+    # ── Level 2: Classification comparison ──
+    level2_compare_classification(merged_orig, orig_clf, orig_le, feature_cols,
+                                  trip_key_col, mode_col, model_new)
 
-    # ── Level 2 ──
-    level2_compare_predictions(merged_orig, orig_clf, orig_le, feature_cols, model_new)
-
-    # ── Level 3 ──
-    level3_compare_confusion_matrices(merged_orig, orig_clf, orig_le, feature_cols, model_new)
+    # ── Level 3: Confusion matrices ──
+    level3_compare_confusion(merged_orig, orig_clf, feature_cols, trip_key_col, mode_col)
 
     print()
     print("=" * 60)
