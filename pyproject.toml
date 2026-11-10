@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.backends._legacy:_Backend"
+
+[project]
+name = "modedetect"
+version = "0.1.0"
+description = "Transport mode detection from GPS traces"
+requires-python = ">=3.11"
+dependencies = [
+    "numpy>=1.24",
+    "pandas>=2.0",
+    "pyarrow>=12.0",
+    "pyproj>=3.5",
+    "scikit-learn>=1.2",
+    "xgboost>=2.0",
+    "ruptures>=1.1",
+    "geopandas>=0.14",
+    "shapely>=2.0",
+    "joblib>=1.2",
+    "tqdm>=4.60",
+]
+
+[project.optional-dependencies]
+osm = ["pyrosm>=0.6"]
+dev = ["pytest>=7.0"]
+
+[tool.setuptools.packages.find]
+include = ["modedetect*"]
