@@ -89,7 +89,7 @@ def compute_trip_statistics(
     # Optionally join labels from trips_df
     if trips_df is not None and config.col_main_mode in trips_df.columns:
         mode_map = trips_df.set_index(config.col_trip_key)[config.col_main_mode].to_dict()
-        df_stats["main_mode"] = df_stats["trip_key"].map(mode_map)
+        df_stats[config.col_main_mode] = df_stats["trip_key"].map(mode_map)
 
     return df_stats
 
