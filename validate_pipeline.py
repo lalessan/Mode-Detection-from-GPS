@@ -672,7 +672,11 @@ def main():
     orig_clf, orig_le, X_test, y_test, y_pred, feature_cols = train_original_model(merged_orig, trip_key_col, mode_col)
 
     # ── Step 2: Load raw GPS and run modedetect ──
-    gps_df, trips_df = load_raw_gps()
+    quick = "--quick" in sys.argv
+    max_files = 100 if quick else None
+    if quick:
+        print("\n  *** QUICK MODE: using only 100 GPS files ***")
+    gps_df, trips_df = load_raw_gps(max_files=max_files)
     model_new = run_modedetect_pipeline(gps_df, trips_df)
 
     # ── Level 1: Feature comparison ──

@@ -468,7 +468,7 @@ class ModeDetector:
         y = self._encoder.fit_transform(merged[mode_col].values)
 
         # Feature matrix
-        exclude = {"trip_key", mode_col, "segment", "main_mode"}
+        exclude = {"trip_key", mode_col, "segment", "main_mode", cfg.col_main_mode, cfg.col_trip_key}
         feature_cols = [c for c in merged.columns if c not in exclude]
         self._feature_list = feature_cols
         X = merged[feature_cols].values

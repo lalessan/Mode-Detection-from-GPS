@@ -87,7 +87,7 @@ def find_optimal_percentiles(
     percentile_df: pd.DataFrame,
     stats_df: pd.DataFrame,
     config: ModeDetectConfig,
-    mode_col: str = "main_mode",
+    mode_col: str | None = None,
     aggregation: str = "mean",
 ) -> list[str]:
     """Select the single best percentile column per feature using JS divergence.
@@ -97,6 +97,9 @@ def find_optimal_percentiles(
 
     Returns a list of column names like ``['SPEED_P95', 'ACC_P95', 'BC_WGS84_P50', ...]``.
     """
+    if mode_col is None:
+        mode_col = config.col_main_mode
+
     # Merge labels onto percentile data
     df = percentile_df.merge(
         stats_df[["trip_key", mode_col]].drop_duplicates(),
