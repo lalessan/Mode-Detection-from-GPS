@@ -297,6 +297,11 @@ def link_gps_to_trips(gps_df, trips_df):
     trips_slim = trips[["ID", "KEY", "start_time", "end_time"]].copy()
     trips_slim = trips_slim.sort_values("start_time")
 
+    # Drop rows with unparseable timestamps
+    n_before = len(gps_df)
+    gps_df = gps_df.dropna(subset=["timestamp"])
+    if len(gps_df) < n_before:
+        print(f"  Dropped {n_before - len(gps_df)} rows with unparseable timestamps")
     gps_df = gps_df.sort_values(["FILE_NAME", "timestamp"])
 
     print("  Running merge_asof (this may take a few minutes)...")
