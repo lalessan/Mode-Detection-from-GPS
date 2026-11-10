@@ -213,11 +213,12 @@ def build_original_feature_matrix(df_stats, df_pct, df_stops, df_routes, trip_ke
             if c in merged.columns:
                 merged[c] = merged[c].fillna(0)
 
-    # Drop NaN rows (trips missing from some feature sets)
-    n_before = len(merged)
-    merged = merged.dropna()
-    if len(merged) < n_before:
-        print(f"  Dropped {n_before - len(merged)} rows with NaN values")
+    # Fill NaN for stop/route features (trips not covered by those datasets)
+    fill_cols = [c for c in merged.columns if c not in [trip_key_col, mode_col]]
+    n_any_nan = merged[fill_cols].isna().any(axis=1).sum()
+    if n_any_nan > 0:
+        print(f"  {n_any_nan} rows have NaN in some feature columns — filling with 0")
+        merged[fill_cols] = merged[fill_cols].fillna(0)
 
     print(f"  Final merged shape: {merged.shape}")
     print(f"  Feature columns: {[c for c in merged.columns if c not in [trip_key_col, mode_col]]}")
@@ -260,8 +261,59 @@ def train_original_model(merged, trip_key_col, mode_col):
 # MODEDETECT PIPELINE: Run on the same raw data
 # ─────────────────────────────────────────────────────────────────────
 
+def link_gps_to_trips(gps_df, trips_df):
+    """Assign trip KEY to each GPS point by matching person ID + time windows.
+
+    Replicates the logic from 1_Intial_Setup_Motion_Features/link_netmob25_gps.py.
+    """
+    print("  Linking GPS points to trips via person ID + time windows...")
+
+    # Build start/end times from trips (using Date_EMG as authoritative date)
+    trips = trips_df.copy()
+    trips["start_time"] = pd.to_datetime(
+        trips["Date_EMG"].astype(str) + " " + trips["Time_O"].astype(str), errors="coerce"
+    )
+    trips["end_time"] = pd.to_datetime(
+        trips["Date_EMG"].astype(str) + " " + trips["Time_D"].astype(str), errors="coerce"
+    )
+    trips = trips.dropna(subset=["start_time", "end_time"])
+
+    # Fix trips crossing midnight
+    mask = trips["end_time"] < trips["start_time"]
+    trips.loc[mask, "end_time"] += pd.Timedelta(days=1)
+
+    # Parse GPS timestamps
+    gps_df = gps_df.copy()
+    gps_df["timestamp"] = pd.to_datetime(gps_df["LOCAL DATETIME"], errors="coerce")
+    gps_df["KEY"] = pd.Series(pd.NA, index=gps_df.index, dtype="string")
+
+    # Match per person
+    n_linked = 0
+    person_ids = gps_df["FILE_NAME"].unique()
+    for pid in person_ids:
+        pid_trips = trips[trips["ID"] == pid]
+        if pid_trips.empty:
+            continue
+        gps_mask = gps_df["FILE_NAME"] == pid
+        for _, trip in pid_trips.iterrows():
+            time_mask = gps_mask & (
+                (gps_df["timestamp"] >= trip["start_time"]) &
+                (gps_df["timestamp"] <= trip["end_time"])
+            )
+            gps_df.loc[time_mask, "KEY"] = trip["KEY"]
+            n_linked += time_mask.sum()
+
+    # Drop unlinked points
+    n_total = len(gps_df)
+    gps_df = gps_df[gps_df["KEY"].notna()].copy()
+    print(f"  Linked {n_linked:,} of {n_total:,} GPS points ({n_linked/n_total:.1%})")
+    print(f"  Unique trips with GPS data: {gps_df['KEY'].nunique()}")
+
+    return gps_df
+
+
 def load_raw_gps(max_files=None):
-    """Load raw GPS CSVs and trips dataset."""
+    """Load raw GPS CSVs and trips dataset, with trip key linking."""
     print("\n  Loading raw GPS CSVs...")
     csv_files = sorted(GPS_DIR.glob("*.csv"))
     if max_files:
@@ -269,10 +321,14 @@ def load_raw_gps(max_files=None):
 
     dfs = []
     for f in csv_files:
-        df = pd.read_csv(f)
-        # Extract person ID from filename (e.g., 10_2978.csv)
-        df["FILE_NAME"] = f.stem
-        dfs.append(df)
+        try:
+            df = pd.read_csv(f)
+            if df.empty:
+                continue
+            df["FILE_NAME"] = f.stem
+            dfs.append(df)
+        except pd.errors.EmptyDataError:
+            continue
     gps_df = pd.concat(dfs, ignore_index=True)
 
     trips_df = pd.read_csv(TRIPS_PATH)
@@ -281,11 +337,18 @@ def load_raw_gps(max_files=None):
     print(f"  GPS columns: {list(gps_df.columns)}")
     print(f"  Trips columns: {list(trips_df.columns[:15])}...")
 
+    # Link GPS points to trips
+    gps_df = link_gps_to_trips(gps_df, trips_df)
+
     return gps_df, trips_df
 
 
 def run_modedetect_pipeline(gps_df, trips_df):
-    """Run the modedetect package on the raw GPS data."""
+    """Run the modedetect package on the raw GPS data.
+
+    Expects gps_df to already have KEY and timestamp columns
+    (from link_gps_to_trips).
+    """
     print()
     print("=" * 60)
     print("Running modedetect pipeline...")
@@ -293,56 +356,13 @@ def run_modedetect_pipeline(gps_df, trips_df):
 
     from modedetect import ModeDetector, ModeDetectConfig
 
-    # Identify column names from the data
-    gps_cols = list(gps_df.columns)
-    trips_cols = list(trips_df.columns)
-
-    # Auto-detect column names
-    lat_col = "LATITUDE" if "LATITUDE" in gps_cols else "latitude"
-    lon_col = "LONGITUDE" if "LONGITUDE" in gps_cols else "longitude"
-    speed_col = "SPEED" if "SPEED" in gps_cols else "speed_kmh"
-
-    # Timestamp: could be "LOCAL DATETIME", "timestamp", etc.
-    ts_col = None
-    for candidate in ["timestamp", "LOCAL DATETIME", "UTC DATETIME", "local_datetime"]:
-        if candidate in gps_cols:
-            ts_col = candidate
-            break
-    if ts_col is None:
-        # Try to parse LOCAL DATETIME into timestamp
-        if "LOCAL DATETIME" in gps_cols:
-            gps_df["timestamp"] = pd.to_datetime(gps_df["LOCAL DATETIME"])
-            ts_col = "timestamp"
-        else:
-            raise ValueError(f"Cannot find timestamp column. Available: {gps_cols}")
-
-    # Trip key: KEY in trips, might need to add to GPS
-    trip_key_col = "KEY" if "KEY" in trips_cols else "trip_key"
-    gps_trip_key = trip_key_col if trip_key_col in gps_cols else None
-
-    # Mode column
-    mode_col = None
-    for candidate in ["MAIN_MODE", "main_mode", "Main_Mode"]:
-        if candidate in trips_cols:
-            mode_col = candidate
-            break
-
-    print(f"  Detected columns: lat={lat_col}, lon={lon_col}, ts={ts_col}, "
-          f"speed={speed_col}, key={trip_key_col}, mode={mode_col}")
-
-    # If GPS data doesn't have trip keys, we need to link them
-    if gps_trip_key is None:
-        print("  WARNING: GPS data has no trip key column. Linking via trips_df may be needed.")
-        print(f"  GPS columns: {gps_cols}")
-        print(f"  Trips columns: {trips_cols}")
-
     config = ModeDetectConfig(
-        col_latitude=lat_col,
-        col_longitude=lon_col,
-        col_timestamp=ts_col,
-        col_trip_key=trip_key_col if gps_trip_key else "KEY",
-        col_speed_kmh=speed_col if speed_col in gps_cols else None,
-        col_main_mode=mode_col or "MAIN_MODE",
+        col_latitude="LATITUDE",
+        col_longitude="LONGITUDE",
+        col_timestamp="timestamp",
+        col_trip_key="KEY",
+        col_speed_kmh="SPEED",
+        col_main_mode="Main_Mode",
         gtfs_dir=Path(GTFS_DIR) if GTFS_DIR else None,
         osm_routes_dir=Path(OSM_ROUTES_DIR) if OSM_ROUTES_DIR else None,
         gap_offset_s=13.0,
@@ -356,7 +376,9 @@ def run_modedetect_pipeline(gps_df, trips_df):
         random_state=0,
     )
 
-    # Fit
+    print(f"  GPS shape: {gps_df.shape}, columns: {list(gps_df.columns)}")
+    print(f"  Trips shape: {trips_df.shape}")
+
     model = ModeDetector(config)
 
     t0 = time.time()
@@ -386,35 +408,13 @@ def level1_compare_features(gps_df, trips_df, df_stats_orig, df_pct_orig, trip_k
     from modedetect.features.percentiles import compute_percentile_map
     from modedetect.features.statistics import compute_trip_statistics
 
-    # Detect columns (same logic as run_modedetect_pipeline)
-    gps_cols = list(gps_df.columns)
-    trips_cols = list(trips_df.columns)
-    lat_col = "LATITUDE" if "LATITUDE" in gps_cols else "latitude"
-    lon_col = "LONGITUDE" if "LONGITUDE" in gps_cols else "longitude"
-    speed_col = "SPEED" if "SPEED" in gps_cols else "speed_kmh"
-    ts_col = None
-    for candidate in ["timestamp", "LOCAL DATETIME", "UTC DATETIME"]:
-        if candidate in gps_cols:
-            ts_col = candidate
-            break
-    gps_key = None
-    for candidate in ["KEY", trip_key_col]:
-        if candidate in gps_cols:
-            gps_key = candidate
-            break
-    trips_mode = None
-    for candidate in ["MAIN_MODE", "main_mode", "Main_Mode"]:
-        if candidate in trips_cols:
-            trips_mode = candidate
-            break
-
     config = ModeDetectConfig(
-        col_latitude=lat_col,
-        col_longitude=lon_col,
-        col_timestamp=ts_col or "timestamp",
-        col_trip_key=gps_key or "KEY",
-        col_speed_kmh=speed_col if speed_col in gps_cols else None,
-        col_main_mode=trips_mode or "MAIN_MODE",
+        col_latitude="LATITUDE",
+        col_longitude="LONGITUDE",
+        col_timestamp="timestamp",
+        col_trip_key="KEY",
+        col_speed_kmh="SPEED",
+        col_main_mode="Main_Mode",
         gap_offset_s=13.0,
         gap_threshold_s=300.0,
     )
@@ -430,10 +430,13 @@ def level1_compare_features(gps_df, trips_df, df_stats_orig, df_pct_orig, trip_k
     print(f"  modedetect stats shape: {new_stats.shape}")
     print(f"  modedetect pct shape: {new_pct.shape}")
 
-    # Align column names for comparison
-    # modedetect uses 'trip_key', original uses whatever trip_key_col is
+    # Align column names: modedetect uses 'trip_key' internally,
+    # original pre-generated features use TRIP_KEY
     new_stats = new_stats.rename(columns={"trip_key": trip_key_col, "main_mode": mode_col})
     new_pct = new_pct.rename(columns={"trip_key": trip_key_col})
+
+    print(f"  modedetect stats columns: {list(new_stats.columns[:15])}")
+    print(f"  Original stats columns: {list(df_stats_orig.columns[:15])}")
 
     # Compare trip statistics
     print("\n  --- Trip Statistics Comparison ---")
