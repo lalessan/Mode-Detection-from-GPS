@@ -34,9 +34,9 @@ DATA_FEATURES = Path("DATA_Feature_sets/")
 GPS_DIR = Path("/home/lauale/netmob2025/data/gps_dataset/")
 TRIPS_PATH = Path("/home/lauale/netmob2025/data/trips_dataset.csv")
 
-# GTFS and OSM — set to None if not available
-GTFS_DIR = None  # e.g. Path("/home/lauale/data/gtfs/")
-OSM_ROUTES_DIR = None  # e.g. Path("/home/lauale/data/osm_routes/")
+# GTFS and OSM
+GTFS_DIR = Path("/home/lauale/ModeDetection/gtfs/")
+OSM_ROUTES_DIR = Path("/home/lauale/ModeDetection/osm_routes/")
 
 # ─────────────────────────────────────────────────────────────────────
 # ORIGINAL PIPELINE: Mode filtering and speed thresholds
@@ -672,11 +672,7 @@ def main():
     orig_clf, orig_le, X_test, y_test, y_pred, feature_cols = train_original_model(merged_orig, trip_key_col, mode_col)
 
     # ── Step 2: Load raw GPS and run modedetect ──
-    quick = "--quick" in sys.argv
-    max_files = 100 if quick else None
-    if quick:
-        print("\n  *** QUICK MODE: using only 100 GPS files ***")
-    gps_df, trips_df = load_raw_gps(max_files=max_files)
+    gps_df, trips_df = load_raw_gps()
     model_new = run_modedetect_pipeline(gps_df, trips_df)
 
     # ── Level 1: Feature comparison ──
