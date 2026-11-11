@@ -166,7 +166,7 @@ def compute_stop_features(
         row["STOPS_MINDIST_AVG"] = float(np.nanmean(min_dists)) if min_dists else np.nan
 
         # Per-mode min distances and duration
-        for mode_name, mode_code in ROUTE_TYPE_NAMES.items():
+        for mode_code, mode_name in ROUTE_TYPE_NAMES.items():
             mode_min_dists = []
             near_count = 0
             for i, rt_list in enumerate(route_types):
