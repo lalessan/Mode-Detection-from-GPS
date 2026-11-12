@@ -137,9 +137,7 @@ def _compute_segment_features(seg: pd.DataFrame, config: ModeDetectConfig) -> pd
     seg["dist_bp_wgs84"] = dist_wgs84
 
     # ── Null out stacked coordinates and first row ──
-    stacked = (
-        np.isclose(lon0_d, lon1_d, equal_nan=False) & np.isclose(lat0_d, lat1_d, equal_nan=False)
-    )
+    stacked = (lon0_d == lon1_d) & (lat0_d == lat1_d)
     first_mask = np.zeros(len(seg), dtype=bool)
     first_mask[0] = True
     null_mask = stacked | first_mask

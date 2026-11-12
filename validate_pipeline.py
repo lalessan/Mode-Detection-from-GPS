@@ -415,7 +415,25 @@ def run_modedetect_pipeline(gps_df, trips_df):
 # LEVEL 1: Feature comparison
 # ─────────────────────────────────────────────────────────────────────
 
-def level1_compare_features(gps_df, trips_df, df_stats_orig, df_pct_orig, trip_key_col, mode_col):
+def _compare_table(orig_sub, new_sub, col_mapping, label="Feature"):
+    """Print a comparison table for aligned DataFrames."""
+    print(f"\n  {label:<30} {'Max Diff':>12} {'Mean Diff':>12} {'Correlation':>12}")
+    print("  " + "-" * 68)
+    for orig_col, new_col in col_mapping.items():
+        if orig_col in orig_sub.columns and new_col in new_sub.columns:
+            aligned = orig_sub[[orig_col]].join(new_sub[[new_col]], how="inner",
+                                                  lsuffix="_orig", rsuffix="_new")
+            diff = (aligned.iloc[:, 0] - aligned.iloc[:, 1]).abs()
+            corr = aligned.iloc[:, 0].corr(aligned.iloc[:, 1])
+            print(f"  {orig_col:<30} {diff.max():>12.4f} {diff.mean():>12.4f} {corr:>12.4f}")
+        elif orig_col in orig_sub.columns:
+            print(f"  {orig_col:<30}  (missing in modedetect as '{new_col}')")
+        elif new_col in new_sub.columns:
+            print(f"  {orig_col:<30}  (missing in original)")
+
+
+def level1_compare_features(gps_df, trips_df, df_stats_orig, df_pct_orig,
+                            df_stops_orig, df_routes_orig, trip_key_col, mode_col):
     """Compare feature values produced by modedetect vs original pipeline."""
     print()
     print("=" * 60)
@@ -438,10 +456,12 @@ def level1_compare_features(gps_df, trips_df, df_stats_orig, df_pct_orig, trip_k
         gap_threshold_s=300.0,
     )
 
-    # Try to load from fit checkpoints first, fall back to recomputing
+    # ── Load modedetect features from checkpoints ──────────────────────
     ckpt_dir = CHECKPOINT_DIR / "fit_steps"
     stats_ckpt = ckpt_dir / "02_stats.parquet"
     pct_ckpt = ckpt_dir / "02_pct_map.parquet"
+    stop_ckpt = ckpt_dir / "03_stop_features.parquet"
+    route_ckpt = ckpt_dir / "04_route_features.parquet"
 
     t0 = time.time()
     if stats_ckpt.exists() and pct_ckpt.exists():
@@ -453,33 +473,36 @@ def level1_compare_features(gps_df, trips_df, df_stats_orig, df_pct_orig, trip_k
         gps_feat = extract_point_features(gps_df, config)
         new_stats = compute_trip_statistics(gps_feat, config, trips_df=trips_df)
         new_pct = compute_percentile_map(gps_feat, config)
-    print(f"  Feature loading/extraction took {time.time() - t0:.1f}s")
 
-    print(f"  modedetect stats shape: {new_stats.shape}")
-    print(f"  modedetect pct shape: {new_pct.shape}")
+    new_stops = pd.read_parquet(stop_ckpt) if stop_ckpt.exists() else None
+    new_routes = pd.read_parquet(route_ckpt) if route_ckpt.exists() else None
+    print(f"  Feature loading took {time.time() - t0:.1f}s")
 
-    # Align column names: modedetect uses 'trip_key' internally,
-    # original pre-generated features use TRIP_KEY
+    print(f"  modedetect stats: {new_stats.shape}, pct: {new_pct.shape}")
+    if new_stops is not None:
+        print(f"  modedetect stops: {new_stops.shape}")
+    if new_routes is not None:
+        print(f"  modedetect routes: {new_routes.shape}")
+
+    # Align column names
     new_stats = new_stats.rename(columns={"trip_key": trip_key_col, "main_mode": mode_col})
     new_pct = new_pct.rename(columns={"trip_key": trip_key_col})
+    if new_stops is not None:
+        new_stops = new_stops.rename(columns={"trip_key": trip_key_col})
+    if new_routes is not None:
+        new_routes = new_routes.rename(columns={"trip_key": trip_key_col})
 
-    print(f"  modedetect stats columns: {list(new_stats.columns[:15])}")
-    print(f"  Original stats columns: {list(df_stats_orig.columns[:15])}")
-
-    # Compare trip statistics
-    print("\n  --- Trip Statistics Comparison ---")
+    # ── 1A: Trip Statistics ────────────────────────────────────────────
+    print("\n  --- 1A: Trip Statistics ---")
     common_keys = set(df_stats_orig[trip_key_col]) & set(new_stats[trip_key_col])
     print(f"  Common trips: {len(common_keys)} "
           f"(orig: {len(df_stats_orig)}, modedetect: {len(new_stats)})")
 
     if len(common_keys) == 0:
-        print("  WARNING: No common trips found! Column name or data mismatch.")
-        print(f"  Orig keys sample: {list(df_stats_orig[trip_key_col].head())}")
-        print(f"  New keys sample: {list(new_stats[trip_key_col].head())}")
+        print("  WARNING: No common trips found!")
         return
 
-    # Columns that should match between original and modedetect
-    compare_cols = {
+    stats_mapping = {
         "TOTAL_TIME": "TOTAL_TIME",
         "GPS_POINTS": "GPS_POINTS",
         "SPEED_AVG": "SPEED_AVG",
@@ -502,49 +525,114 @@ def level1_compare_features(gps_df, trips_df, df_stats_orig, df_pct_orig, trip_k
 
     orig_sub = df_stats_orig[df_stats_orig[trip_key_col].isin(common_keys)].set_index(trip_key_col)
     new_sub = new_stats[new_stats[trip_key_col].isin(common_keys)].set_index(trip_key_col)
+    _compare_table(orig_sub, new_sub, stats_mapping, label="Feature")
 
-    print(f"\n  {'Feature':<22} {'Max Diff':>12} {'Mean Diff':>12} {'Correlation':>12}")
-    print("  " + "-" * 60)
-    for orig_col, new_col in compare_cols.items():
-        if orig_col in orig_sub.columns and new_col in new_sub.columns:
-            aligned = orig_sub[[orig_col]].join(new_sub[[new_col]], how="inner", lsuffix="_orig", rsuffix="_new")
-            diff = (aligned.iloc[:, 0] - aligned.iloc[:, 1]).abs()
-            corr = aligned.iloc[:, 0].corr(aligned.iloc[:, 1])
-            print(f"  {orig_col:<22} {diff.max():>12.4f} {diff.mean():>12.4f} {corr:>12.4f}")
-        elif orig_col in orig_sub.columns:
-            print(f"  {orig_col:<22}  (missing in modedetect as '{new_col}')")
-        # Try same-name match if the mapping didn't work
-        elif orig_col in orig_sub.columns and orig_col in new_sub.columns:
-            aligned = orig_sub[[orig_col]].join(new_sub[[orig_col]], how="inner", lsuffix="_o", rsuffix="_n")
-            diff = (aligned.iloc[:, 0] - aligned.iloc[:, 1]).abs()
-            corr = aligned.iloc[:, 0].corr(aligned.iloc[:, 1])
-            print(f"  {orig_col:<22} {diff.max():>12.4f} {diff.mean():>12.4f} {corr:>12.4f}")
-
-    # Compare percentile maps
-    print("\n  --- Percentile Map Comparison ---")
+    # ── 1B: Percentile Map (ALL columns) ──────────────────────────────
+    print("\n  --- 1B: Percentile Map ---")
     common_pct_keys = set(df_pct_orig[trip_key_col]) & set(new_pct[trip_key_col])
     print(f"  Common trips: {len(common_pct_keys)}")
 
     if len(common_pct_keys) > 0:
-        pct_cols = [c for c in df_pct_orig.columns if re.search(r"_P\d+$", c) and c in new_pct.columns]
+        pct_cols = sorted(c for c in df_pct_orig.columns
+                          if re.search(r"_P\d+$", c) and c in new_pct.columns)
         if pct_cols:
             orig_pct_sub = df_pct_orig[df_pct_orig[trip_key_col].isin(common_pct_keys)].set_index(trip_key_col)
             new_pct_sub = new_pct[new_pct[trip_key_col].isin(common_pct_keys)].set_index(trip_key_col)
+            pct_mapping = {c: c for c in pct_cols}
+            _compare_table(orig_pct_sub, new_pct_sub, pct_mapping, label="Percentile")
 
-            print(f"\n  {'Pct Column':<24} {'Max Diff':>12} {'Mean Diff':>12} {'Correlation':>12}")
-            print("  " + "-" * 62)
-            for col in sorted(pct_cols)[:15]:
-                if col in orig_pct_sub.columns and col in new_pct_sub.columns:
-                    aligned = orig_pct_sub[[col]].join(new_pct_sub[[col]], how="inner", lsuffix="_o", rsuffix="_n")
-                    diff = (aligned.iloc[:, 0] - aligned.iloc[:, 1]).abs()
-                    corr = aligned.iloc[:, 0].corr(aligned.iloc[:, 1])
-                    print(f"  {col:<24} {diff.max():>12.4f} {diff.mean():>12.4f} {corr:>12.4f}")
-            if len(pct_cols) > 15:
-                print(f"  ... ({len(pct_cols) - 15} more columns)")
-        else:
-            print("  No matching percentile columns found.")
-            print(f"  Orig pct columns: {[c for c in df_pct_orig.columns if '_P' in c][:10]}")
-            print(f"  New pct columns: {[c for c in new_pct.columns if '_P' in c][:10]}")
+            # Show columns only in original or only in modedetect
+            orig_only = sorted(c for c in df_pct_orig.columns
+                               if re.search(r"_P\d+$", c) and c not in new_pct.columns)
+            new_only = sorted(c for c in new_pct.columns
+                              if re.search(r"_P\d+$", c) and c not in df_pct_orig.columns)
+            if orig_only:
+                print(f"\n  Percentile cols only in original ({len(orig_only)}): {orig_only[:10]}...")
+            if new_only:
+                print(f"  Percentile cols only in modedetect ({len(new_only)}): {new_only[:10]}...")
+
+    # ── 1C: Stop Proximity Features ───────────────────────────────────
+    print("\n  --- 1C: Stop Proximity Features ---")
+    if new_stops is not None and df_stops_orig is not None:
+        common_stop_keys = set(df_stops_orig[trip_key_col]) & set(new_stops[trip_key_col])
+        print(f"  Common trips: {len(common_stop_keys)} "
+              f"(orig: {len(df_stops_orig)}, modedetect: {len(new_stops)})")
+
+        if len(common_stop_keys) > 0:
+            orig_stop_sub = df_stops_orig[df_stops_orig[trip_key_col].isin(common_stop_keys)].set_index(trip_key_col)
+            new_stop_sub = new_stops[new_stops[trip_key_col].isin(common_stop_keys)].set_index(trip_key_col)
+
+            # Find all numeric columns that exist in both
+            stop_compare = {}
+            for col in orig_stop_sub.columns:
+                if col in new_stop_sub.columns and orig_stop_sub[col].dtype in ("float64", "float32", "int64", "int32"):
+                    stop_compare[col] = col
+            # Also check common names with different case/format
+            name_map = {
+                "STOPS_NUM_AVG": "STOPS_NUM_AVG",
+                "STOPS_NUM_MAX": "STOPS_NUM_MAX",
+                "STOPS_NUM_MIN": "STOPS_NUM_MIN",
+                "STOPS_MINDIST_AVG": "STOPS_MINDIST_AVG",
+                "MIN_DIST_TRAM": "MIN_DIST_TRAM",
+                "MIN_DIST_METRO": "MIN_DIST_METRO",
+                "MIN_DIST_RAIL": "MIN_DIST_RAIL",
+                "MIN_DIST_BUS": "MIN_DIST_BUS",
+                "DURATION_TRAM": "DURATION_TRAM",
+                "DURATION_METRO": "DURATION_METRO",
+                "DURATION_RAIL": "DURATION_RAIL",
+                "DURATION_BUS": "DURATION_BUS",
+            }
+            for orig_c, new_c in name_map.items():
+                if orig_c in orig_stop_sub.columns and new_c in new_stop_sub.columns:
+                    stop_compare[orig_c] = new_c
+
+            # Add stop percentile columns
+            for col in sorted(orig_stop_sub.columns):
+                if re.search(r"_P\d+$", col) and col in new_stop_sub.columns:
+                    stop_compare[col] = col
+
+            _compare_table(orig_stop_sub, new_stop_sub, stop_compare, label="Stop Feature")
+
+            # Show columns only in one side
+            orig_stop_only = sorted(c for c in orig_stop_sub.select_dtypes("number").columns
+                                    if c not in new_stop_sub.columns)
+            new_stop_only = sorted(c for c in new_stop_sub.select_dtypes("number").columns
+                                   if c not in orig_stop_sub.columns)
+            if orig_stop_only:
+                print(f"\n  Stop cols only in original ({len(orig_stop_only)}): {orig_stop_only[:15]}")
+            if new_stop_only:
+                print(f"  Stop cols only in modedetect ({len(new_stop_only)}): {new_stop_only[:15]}")
+    else:
+        print("  Skipped (checkpoint not available)")
+
+    # ── 1D: Route Matching Features ───────────────────────────────────
+    print("\n  --- 1D: Route Matching Features ---")
+    if new_routes is not None and df_routes_orig is not None:
+        common_route_keys = set(df_routes_orig[trip_key_col]) & set(new_routes[trip_key_col])
+        print(f"  Common trips: {len(common_route_keys)} "
+              f"(orig: {len(df_routes_orig)}, modedetect: {len(new_routes)})")
+
+        if len(common_route_keys) > 0:
+            orig_route_sub = df_routes_orig[df_routes_orig[trip_key_col].isin(common_route_keys)].set_index(trip_key_col)
+            new_route_sub = new_routes[new_routes[trip_key_col].isin(common_route_keys)].set_index(trip_key_col)
+
+            route_compare = {}
+            for col in orig_route_sub.columns:
+                if col in new_route_sub.columns and orig_route_sub[col].dtype in ("float64", "float32"):
+                    route_compare[col] = col
+
+            _compare_table(orig_route_sub, new_route_sub, route_compare, label="Route Feature")
+
+            orig_route_only = sorted(c for c in orig_route_sub.select_dtypes("number").columns
+                                     if c not in new_route_sub.columns)
+            new_route_only = sorted(c for c in new_route_sub.select_dtypes("number").columns
+                                    if c not in orig_route_sub.columns)
+            if orig_route_only:
+                print(f"\n  Route cols only in original: {orig_route_only}")
+            if new_route_only:
+                print(f"  Route cols only in modedetect: {new_route_only}")
+    else:
+        print("  Skipped (checkpoint not available)")
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -709,7 +797,8 @@ def main():
 
     # ── Level 1: Feature comparison ──
     print("\n  Using loaded GPS data for Level 1 comparison...")
-    level1_compare_features(gps_df, trips_df, df_stats, df_pct, trip_key_col, mode_col)
+    level1_compare_features(gps_df, trips_df, df_stats, df_pct, df_stops, df_routes,
+                            trip_key_col, mode_col)
 
     # ── Level 2: Classification comparison ──
     level2_compare_classification(merged_orig, orig_clf, orig_le, feature_cols,
