@@ -48,11 +48,18 @@ stops = load_gtfs_stops(GTFS_DIR)
 tree, stops_df = build_stop_balltree(stops)
 print(f"  Stops: {len(stops_df)}")
 
-# Compute stop features at 1000m
-print(f"Computing stop features (radius={config.stop_search_radius_m}m)...")
-t0 = time.time()
-new_stops = compute_stop_features(gps_df, tree, stops_df, config)
-print(f"  Done in {time.time() - t0:.1f}s")
+# Compute stop features at 1000m (with checkpoint)
+stop_ckpt = CHECKPOINT_DIR / "fit_steps" / "03_stop_features_1000m.parquet"
+if stop_ckpt.exists():
+    print(f"Loading 1000m stop features from checkpoint: {stop_ckpt}")
+    new_stops = pd.read_parquet(stop_ckpt)
+else:
+    print(f"Computing stop features (radius={config.stop_search_radius_m}m)...")
+    t0 = time.time()
+    new_stops = compute_stop_features(gps_df, tree, stops_df, config)
+    print(f"  Done in {time.time() - t0:.1f}s")
+    new_stops.to_parquet(stop_ckpt, index=False)
+    print(f"  Saved checkpoint: {stop_ckpt}")
 print(f"  Shape: {new_stops.shape}")
 
 # Compare
