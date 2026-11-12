@@ -91,6 +91,7 @@ class ModeDetectConfig:
 
     # ── XGBoost classifier ────────────────────────────────────────────
     xgb_params: dict | None = None  # extra kwargs passed to XGBClassifier
+    feature_selection: bool = True   # forward feature selection before training
     test_size: float = 0.2
     random_state: int = 0
     n_folds: int = 5

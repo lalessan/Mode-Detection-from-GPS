@@ -495,7 +495,10 @@ class ModeDetector:
     # ── Internal: training ────────────────────────────────────────────
 
     def _train_model(self, merged: pd.DataFrame, cfg: ModeDetectConfig) -> None:
-        """Train XGBoost via stratified K-fold, keep best model by macro F1."""
+        """Train XGBoost with optional forward feature selection + K-fold CV."""
+        from sklearn.metrics import f1_score
+        from sklearn.model_selection import train_test_split
+
         mode_col = cfg.col_main_mode
         if mode_col not in merged.columns:
             raise ModeDetectError("Merged feature table is missing the mode label column.")
@@ -510,8 +513,6 @@ class ModeDetector:
         # Feature matrix
         exclude = {"trip_key", mode_col, "segment", "main_mode", cfg.col_main_mode, cfg.col_trip_key}
         feature_cols = [c for c in merged.columns if c not in exclude]
-        self._feature_list = feature_cols
-        X = merged[feature_cols].values
 
         # XGBoost params
         n_classes = len(self._encoder.classes_)
@@ -522,16 +523,23 @@ class ModeDetector:
             "random_state": cfg.random_state,
             "eval_metric": "mlogloss",
         }
-        # n_jobs
         n_jobs = cfg.n_jobs if cfg.n_jobs != -1 else os.cpu_count()
         xgb_kwargs["n_jobs"] = n_jobs
-
         if cfg.xgb_params:
             xgb_kwargs.update(cfg.xgb_params)
 
-        # Stratified K-fold
-        from sklearn.metrics import f1_score
+        # ── Forward feature selection ─────────────────────────────────
+        if cfg.feature_selection:
+            logger.info("Running forward feature selection on %d candidate features...", len(feature_cols))
+            feature_cols = self._forward_feature_selection(
+                merged, feature_cols, y, xgb_kwargs, cfg,
+            )
+            logger.info("Selected %d features: %s", len(feature_cols), feature_cols)
 
+        self._feature_list = feature_cols
+        X = merged[feature_cols].values
+
+        # ── Stratified K-fold training ────────────────────────────────
         skf = StratifiedKFold(n_splits=cfg.n_folds, shuffle=True, random_state=cfg.random_state)
         best_f1 = -1.0
         best_model = None
@@ -551,6 +559,69 @@ class ModeDetector:
 
         self._model = best_model
         logger.info("Best fold macro F1: %.4f", best_f1)
+
+    def _forward_feature_selection(
+        self,
+        merged: pd.DataFrame,
+        feature_cols: list[str],
+        y: np.ndarray,
+        xgb_kwargs: dict,
+        cfg: ModeDetectConfig,
+    ) -> list[str]:
+        """Greedy forward feature selection on a single train/test split.
+
+        Starts with no features, adds the one that improves macro F1 the
+        most at each step. Stops when no feature improves the score.
+        """
+        from sklearn.metrics import f1_score
+        from sklearn.model_selection import train_test_split
+
+        X_all = merged[feature_cols]
+        X_train, X_test, y_train, y_test = train_test_split(
+            X_all, y, test_size=cfg.test_size, stratify=y, random_state=cfg.random_state,
+        )
+
+        selected = []
+        remaining = list(feature_cols)
+        best_overall = None
+
+        for step in range(len(feature_cols)):
+            best_feature = None
+            best_score = None
+
+            for candidate in remaining:
+                cols = selected + [candidate]
+                clf = XGBClassifier(**xgb_kwargs)
+                clf.fit(X_train[cols], y_train)
+                y_pred = clf.predict(X_test[cols])
+                score = f1_score(y_test, y_pred, average="macro")
+
+                if best_score is None or score > best_score:
+                    best_score = score
+                    best_feature = candidate
+
+            if best_feature is None:
+                break
+
+            if best_overall is not None and best_score <= best_overall:
+                logger.info(
+                    "Step %d: no improvement (%.4f <= %.4f). Stopping.",
+                    step + 1, best_score, best_overall,
+                )
+                break
+
+            selected.append(best_feature)
+            remaining.remove(best_feature)
+            best_overall = best_score
+            logger.info(
+                "Step %d: +%s → macro F1 = %.4f (%d features)",
+                step + 1, best_feature, best_overall, len(selected),
+            )
+
+            if not remaining:
+                break
+
+        return selected
 
     # ── Internal: feature merging ─────────────────────────────────────
 
