@@ -388,7 +388,7 @@ def run_modedetect_pipeline(gps_df, trips_df):
         gap_threshold_s=300.0,
         min_trip_duration_s=180,
         min_gps_points=10,
-        stop_search_radius_m=250,
+        stop_search_radius_m=1000,
         route_search_radius_m=20,
         route_densify_spacing_m=10,
         n_folds=5,
@@ -460,7 +460,7 @@ def level1_compare_features(gps_df, trips_df, df_stats_orig, df_pct_orig,
     ckpt_dir = CHECKPOINT_DIR / "fit_steps"
     stats_ckpt = ckpt_dir / "02_stats.parquet"
     pct_ckpt = ckpt_dir / "02_pct_map.parquet"
-    stop_ckpt = ckpt_dir / "03_stop_features.parquet"
+    stop_ckpt = ckpt_dir / "03_stop_features_1000m.parquet"
     route_ckpt = ckpt_dir / "04_route_features.parquet"
 
     t0 = time.time()
