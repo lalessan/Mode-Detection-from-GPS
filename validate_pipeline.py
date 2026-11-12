@@ -153,9 +153,13 @@ def load_original_features():
     return df_stats, df_pct, df_stops, df_routes, trip_key_col, mode_col
 
 
-def build_original_feature_matrix(df_stats, df_pct, df_stops, df_routes, trip_key_col, mode_col):
-    """Merge features exactly as the original notebook does for the final model."""
-    print("\n  Building original feature matrix...")
+def build_original_feature_matrix(df_stats, df_pct, df_stops_250m, df_stops_1000m, df_routes, trip_key_col, mode_col):
+    """Merge features exactly as the original notebook does for the final model.
+
+    Uses hybrid stop features: 250m for basic proximity, 1000m for optimal percentiles.
+    This matches the student's best model (F1=0.7815).
+    """
+    print("\n  Building original feature matrix (hybrid: 250m basic + 1000m percentiles)...")
 
     # Motion features
     motion_cols = [
@@ -176,27 +180,28 @@ def build_original_feature_matrix(df_stats, df_pct, df_stops, df_routes, trip_ke
 
     merged = df_motion.merge(df_opt_pct, on=trip_key_col, how="left", validate="one_to_one")
 
-    # Stop features (basic + optimal percentiles)
+    # Stop basic features from 250m (matching student's best model)
     stop_basic_cols = [
         trip_key_col, "STOPS_NUM_AVG", "STOPS_NUM_MAX", "STOPS_NUM_MIN", "STOPS_MINDIST_AVG",
         "DURATION_TRAM", "DURATION_METRO", "DURATION_RAIL", "DURATION_BUS",
         "MIN_DIST_TRAM", "MIN_DIST_METRO", "MIN_DIST_RAIL", "MIN_DIST_BUS",
     ]
+    # Stop optimal percentiles from 1000m (matching student's best model)
     stop_pct_cols = [
         trip_key_col, "STOPS_CLOSEST_BUS_P95", "STOPS_CLOSEST_METRO_P95",
         "STOPS_CLOSEST_RAIL_P20", "STOPS_CLOSEST_TRAM_P15",
         "STOPS_MINDIST_P95", "STOPS_NUM_P5",
     ]
 
-    available_stop_basic = [c for c in stop_basic_cols if c in df_stops.columns]
-    available_stop_pct = [c for c in stop_pct_cols if c in df_stops.columns]
+    available_stop_basic = [c for c in stop_basic_cols if c in df_stops_250m.columns]
+    available_stop_pct = [c for c in stop_pct_cols if c in df_stops_1000m.columns]
 
-    if len(available_stop_basic) > 1:  # more than just TRIP_KEY
-        df_stop_basic = df_stops[available_stop_basic].copy()
+    if len(available_stop_basic) > 1:
+        df_stop_basic = df_stops_250m[available_stop_basic].copy()
         merged = merged.merge(df_stop_basic, on=trip_key_col, how="left", validate="one_to_one")
 
     if len(available_stop_pct) > 1:
-        df_stop_pct = df_stops[available_stop_pct].copy()
+        df_stop_pct = df_stops_1000m[available_stop_pct].copy()
         merged = merged.merge(df_stop_pct, on=trip_key_col, how="left", validate="one_to_one")
 
     # Route matching
@@ -767,12 +772,48 @@ def main():
         sys.exit(1)
 
     # ── Step 1: Load and process original features ──
-    df_stats, df_pct, df_stops, df_routes, trip_key_col, mode_col = load_original_features()
-    merged_orig = build_original_feature_matrix(df_stats, df_pct, df_stops, df_routes, trip_key_col, mode_col)
+    df_stats, df_pct, df_stops_1000m, df_routes, trip_key_col, mode_col = load_original_features()
+
+    # ── Step 1b: Generate 250m stop features (for hybrid model) ──
+    gps_ckpt = CHECKPOINT_DIR / "gps_linked.parquet"
+    stop_250m_ckpt = CHECKPOINT_DIR / "fit_steps" / "03_stop_features_250m.parquet"
+    stop_250m_points_ckpt = CHECKPOINT_DIR / "fit_steps" / "03_stop_points_250m.npz"
+
+    if stop_250m_ckpt.exists():
+        print(f"\n  Loading 250m stop features from checkpoint: {stop_250m_ckpt}")
+        df_stops_250m = pd.read_parquet(stop_250m_ckpt)
+    else:
+        print("\n  Generating 250m stop features (needed for hybrid model)...")
+        from modedetect.config import ModeDetectConfig as _MC
+        from modedetect.features.stops import build_stop_balltree, compute_stop_features, load_gtfs_stops
+
+        _gps = pd.read_parquet(CHECKPOINT_DIR / "fit_steps" / "01_gps_motion.parquet")
+        _stops = load_gtfs_stops(GTFS_DIR)
+        _tree, _stops_df = build_stop_balltree(_stops)
+        _cfg = _MC(
+            col_latitude="LATITUDE", col_longitude="LONGITUDE",
+            col_timestamp="timestamp", col_trip_key="KEY",
+            col_speed_kmh="SPEED", col_main_mode="Main_Mode",
+            stop_search_radius_m=250, n_jobs=8,
+        )
+        df_stops_250m = compute_stop_features(
+            _gps, _tree, _stops_df, _cfg,
+            point_cache_path=stop_250m_points_ckpt,
+        )
+        df_stops_250m.to_parquet(stop_250m_ckpt, index=False)
+        print(f"  Saved 250m stop features: {stop_250m_ckpt}")
+        del _gps, _stops, _tree, _stops_df
+
+    # Rename trip_key for 250m stops
+    df_stops_250m = df_stops_250m.rename(columns={"trip_key": trip_key_col})
+    print(f"  250m stops: {df_stops_250m.shape}")
+
+    merged_orig = build_original_feature_matrix(
+        df_stats, df_pct, df_stops_250m, df_stops_1000m, df_routes, trip_key_col, mode_col,
+    )
     orig_clf, orig_le, X_test, y_test, y_pred, feature_cols = train_original_model(merged_orig, trip_key_col, mode_col)
 
     # ── Step 2: Load raw GPS (with checkpoint) ──
-    gps_ckpt = CHECKPOINT_DIR / "gps_linked.parquet"
     if gps_ckpt.exists():
         print(f"\n  Loading GPS from checkpoint: {gps_ckpt}")
         gps_df = pd.read_parquet(gps_ckpt)
@@ -797,7 +838,7 @@ def main():
 
     # ── Level 1: Feature comparison ──
     print("\n  Using loaded GPS data for Level 1 comparison...")
-    level1_compare_features(gps_df, trips_df, df_stats, df_pct, df_stops, df_routes,
+    level1_compare_features(gps_df, trips_df, df_stats, df_pct, df_stops_1000m, df_routes,
                             trip_key_col, mode_col)
 
     # ── Level 2: Classification comparison ──
