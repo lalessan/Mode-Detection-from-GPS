@@ -438,13 +438,22 @@ def level1_compare_features(gps_df, trips_df, df_stats_orig, df_pct_orig, trip_k
         gap_threshold_s=300.0,
     )
 
-    # Extract features via modedetect
-    print("  Extracting motion features via modedetect...")
+    # Try to load from fit checkpoints first, fall back to recomputing
+    ckpt_dir = CHECKPOINT_DIR / "fit_steps"
+    stats_ckpt = ckpt_dir / "02_stats.parquet"
+    pct_ckpt = ckpt_dir / "02_pct_map.parquet"
+
     t0 = time.time()
-    gps_feat = extract_point_features(gps_df, config)
-    new_stats = compute_trip_statistics(gps_feat, config, trips_df=trips_df)
-    new_pct = compute_percentile_map(gps_feat, config)
-    print(f"  Feature extraction took {time.time() - t0:.1f}s")
+    if stats_ckpt.exists() and pct_ckpt.exists():
+        print("  Loading modedetect features from fit checkpoints...")
+        new_stats = pd.read_parquet(stats_ckpt)
+        new_pct = pd.read_parquet(pct_ckpt)
+    else:
+        print("  Extracting motion features via modedetect (no checkpoint found)...")
+        gps_feat = extract_point_features(gps_df, config)
+        new_stats = compute_trip_statistics(gps_feat, config, trips_df=trips_df)
+        new_pct = compute_percentile_map(gps_feat, config)
+    print(f"  Feature loading/extraction took {time.time() - t0:.1f}s")
 
     print(f"  modedetect stats shape: {new_stats.shape}")
     print(f"  modedetect pct shape: {new_pct.shape}")
