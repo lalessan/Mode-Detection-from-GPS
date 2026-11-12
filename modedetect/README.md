@@ -1,8 +1,8 @@
 # modedetect
 
-A Python package for **transport mode detection from GPS traces**. Given raw GPS data and trip metadata, it classifies trips into transport modes (walk, bike, car, bus, metro, train, tram) using motion features, stop proximity, route matching, and an XGBoost classifier.
+A Python package for **transport mode detection from GPS traces**. Given timestamped GPS trajectories grouped into trips, it classifies each trip's transport mode (walk, bike, car, bus, metro, train, tram).
 
-Built as a scikit-learn-style API: `fit()` to train, `predict()` to classify, `save()`/`load()` to persist.
+The package follows a scikit-learn-style API: `fit()` to train on labelled data, `predict()` to classify new trips, and `save()`/`load()` to persist trained models.
 
 ## Installation
 
@@ -18,6 +18,54 @@ For OSM route extraction (optional):
 pip install -e ".[osm]"
 ```
 
+## What you need
+
+### Required: GPS traces with trip identifiers
+
+The minimum input is a **GPS DataFrame** -- one row per recorded GPS point, with at least a latitude, longitude, timestamp, and a trip identifier. Most GPS datasets already look like this:
+
+| lat | lon | time | trip_id |
+|-----|-----|------|---------|
+| 48.857 | 2.352 | 2023-01-15 08:30:00 | trip_42 |
+| 48.858 | 2.354 | 2023-01-15 08:30:05 | trip_42 |
+| ... | ... | ... | ... |
+
+For **training**, you also need a **trips DataFrame** with one row per trip and a ground-truth mode label:
+
+| trip_id | mode |
+|---------|------|
+| trip_42 | CAR |
+| trip_43 | BUS |
+
+For **prediction**, only the GPS DataFrame is needed.
+
+For multi-modal trips (e.g. walk then bus then walk), you can add columns `mode_1`, `mode_2`, ... to the trips DataFrame listing the sequence of modes; the package will then automatically enable segmentation during training.
+
+Your column names will probably differ from the defaults. You tell the package which columns to use through `ModeDetectConfig`:
+
+```python
+config = ModeDetectConfig(
+    col_latitude="LATITUDE",       # name of the latitude column in your GPS data
+    col_longitude="LONGITUDE",     # name of the longitude column
+    col_timestamp="timestamp",     # name of the timestamp column (must be datetime-parseable)
+    col_trip_key="KEY",            # name of the column linking GPS points to trips
+    col_main_mode="Main_Mode",    # name of the mode label column in trips_df (training only)
+    col_speed_kmh="SPEED",        # name of a GPS speed column, or None to compute from coords
+)
+```
+
+### Optional: GTFS and OSM data (for transit features)
+
+Without any external data, the model classifies trips using **motion features** alone -- statistics derived from speed, acceleration, jerk, and bearing changes. This works well for distinguishing walk, bike, and car, but transit modes (bus, tram, metro, train) can look similar in motion alone.
+
+To improve transit mode accuracy, you can provide two additional data sources:
+
+- **GTFS feeds** (stop proximity features): Standard transit schedule files that contain stop locations. The package measures how close each GPS point is to bus stops, tram stops, metro stations, etc. A trip that consistently passes near metro stations is more likely to be a metro trip. Point `config.gtfs_dir` to a directory containing one or more GTFS `.zip` files.
+
+- **OSM route geometries** (route matching features): OpenStreetMap data containing the physical paths of transit routes. The package checks what fraction of a trip's GPS points fall along a bus route, tram line, train track, etc. Point `config.osm_routes_dir` to a directory containing pre-extracted route parquets (see [External data setup](#external-data-setup) below).
+
+Both are optional. You can use one, both, or neither.
+
 ## Quick start
 
 ### Training a model
@@ -27,26 +75,26 @@ from pathlib import Path
 import pandas as pd
 from modedetect import ModeDetector, ModeDetectConfig
 
-# 1. Configure — map your column names and set optional data paths
+# Configure column names and optional data paths
 config = ModeDetectConfig(
     col_latitude="LATITUDE",
     col_longitude="LONGITUDE",
-    col_timestamp="timestamp",       # must be datetime-parseable
-    col_trip_key="KEY",              # unique trip identifier
-    col_main_mode="Main_Mode",      # ground-truth label (only needed for fit)
-    gtfs_dir=Path("data/gtfs/"),    # optional: directory with GTFS .zip files
-    osm_routes_dir=Path("data/osm_routes/"),  # optional: pre-extracted route parquets
+    col_timestamp="timestamp",
+    col_trip_key="KEY",
+    col_main_mode="Main_Mode",
+    gtfs_dir=Path("data/gtfs/"),              # optional
+    osm_routes_dir=Path("data/osm_routes/"),  # optional
 )
 
-# 2. Load your data
+# Load your data
 gps_df = pd.read_parquet("data/gps_points.parquet")
 trips_df = pd.read_csv("data/trips.csv")
 
-# 3. Train
+# Train
 model = ModeDetector(config)
 model.fit(gps_df, trips_df)
 
-# 4. Save the trained model
+# Save the trained model
 model.save("models/my_model.zip")
 ```
 
@@ -77,39 +125,39 @@ segment_predictions = model.predict(new_gps_df, segment=True)
 
 Each row is a GPS point. Required columns (names configurable via `ModeDetectConfig`):
 
-| Column | Description | Example |
-|--------|-------------|---------|
-| `latitude` | WGS84 latitude | `48.8566` |
-| `longitude` | WGS84 longitude | `2.3522` |
-| `timestamp` | Date/time of the fix (datetime or parseable string) | `2023-01-15 08:30:00` |
-| `trip_key` | Identifier linking the point to a trip | `"49_1414"` |
+| Column | Default name | Description | Example |
+|--------|-------------|-------------|---------|
+| Latitude | `latitude` | WGS84 latitude in degrees | `48.8566` |
+| Longitude | `longitude` | WGS84 longitude in degrees | `2.3522` |
+| Timestamp | `timestamp` | Date/time of the GPS fix (datetime or parseable string) | `2023-01-15 08:30:00` |
+| Trip key | `trip_key` | Identifier linking this point to a trip | `"49_1414"` |
 
 Optional:
 
-| Column | Description |
-|--------|-------------|
-| `speed_kmh` | GPS-reported speed in km/h. If absent, speed is computed from coordinates. |
+| Column | Default name | Description |
+|--------|-------------|-------------|
+| Speed | `speed_kmh` | GPS-reported speed in km/h. If not provided (set `col_speed_kmh=None`), speed is computed from successive coordinates and timestamps. |
 
 ### Trips DataFrame (training only)
 
 Each row is a trip. Required columns:
 
-| Column | Description | Example |
-|--------|-------------|---------|
-| `trip_key` | Must match the GPS data's trip key column | `"49_1414"` |
-| `main_mode` | Ground-truth transport mode label | `"CAR"` |
+| Column | Default name | Description | Example |
+|--------|-------------|-------------|---------|
+| Trip key | `trip_key` | Must match the GPS data's trip key column | `"49_1414"` |
+| Mode label | `main_mode` | Ground-truth transport mode | `"CAR"` |
 
-For multi-modal trips, include additional columns `mode_1`, `mode_2`, ... to list the sequence of modes. When these are present, `fit()` automatically enables segmentation support.
+For multi-modal trips, include additional columns `mode_1`, `mode_2`, ... listing the sequence of modes used during the trip. When these columns are present, `fit()` automatically enables segmentation support.
 
 ## Configuration
 
-All parameters are set through `ModeDetectConfig`. The defaults work well for urban GPS data at ~1 Hz sampling rate. Only column names and data paths typically need to be changed.
+All parameters are set through `ModeDetectConfig`. The defaults work for urban GPS data at ~1 Hz sampling rate. You typically only need to set column names and data paths.
 
 ```python
 from modedetect import ModeDetectConfig
 
 config = ModeDetectConfig(
-    # -- Column mapping (adapt to your dataset) --
+    # -- Column mapping (match your DataFrame column names) --
     col_latitude="latitude",
     col_longitude="longitude",
     col_timestamp="timestamp",
@@ -117,17 +165,17 @@ config = ModeDetectConfig(
     col_speed_kmh="speed_kmh",       # set to None to compute from coordinates
     col_main_mode="main_mode",       # ground-truth label column in trips_df
 
-    # -- External data (optional, improves accuracy) --
+    # -- External data (optional, improves transit mode accuracy) --
     gtfs_dir=None,                   # path to directory containing GTFS .zip files
     osm_routes_dir=None,             # path to pre-extracted OSM route parquets
 
-    # -- GPS quality --
-    min_gps_points=10,               # trips with fewer points are dropped
-    min_trip_duration_s=180,         # trips shorter than 3 min are dropped
-    gap_threshold_s=300,             # gaps >5 min: drop trip (fit) or split (predict)
+    # -- GPS quality filters --
+    min_gps_points=10,               # drop trips with fewer GPS points
+    min_trip_duration_s=180,         # drop trips shorter than 3 minutes
+    gap_threshold_s=300,             # temporal gaps > 5 min: drop (fit) or split (predict)
 
-    # -- Mode consolidation --
-    mode_remap={                     # merge similar modes before training
+    # -- Mode consolidation (applied before training) --
+    mode_remap={                     # merge similar mode labels
         "PRIV_CAR_DRIVER": "CAR",
         "PRIV_CAR_PASSENGER": "CAR",
         "TAXI": "CAR",
@@ -135,36 +183,38 @@ config = ModeDetectConfig(
     },
     modes_to_drop=["OTHER", "PLANE"],  # remove rare/ambiguous modes
 
-    # -- Stop proximity (GTFS) --
-    stop_search_radius_m=250,        # search radius around each GPS point
+    # -- Stop proximity (requires GTFS) --
+    stop_search_radius_m=250,        # search radius around each GPS point (metres)
 
-    # -- Route matching (OSM) --
-    route_search_radius_m=20,        # match radius to route geometries
-    route_densify_spacing_m=10,      # interpolation spacing on route lines
+    # -- Route matching (requires OSM) --
+    route_search_radius_m=20,        # max distance from GPS point to route (metres)
+    route_densify_spacing_m=10,      # interpolation spacing on route geometries (metres)
 
     # -- Classifier --
-    n_folds=5,                       # stratified K-fold cross-validation
-    random_state=0,
+    n_folds=5,                       # stratified K-fold cross-validation during training
+    random_state=0,                  # for reproducibility
     xgb_params=None,                 # extra kwargs passed to XGBClassifier
 )
 ```
 
-## External data (GTFS and OSM)
+## External data setup
 
-GTFS and OSM data are **optional**. Without them, the model uses only motion features (speed, acceleration, jerk, bearing). Adding stop proximity and route matching features improves accuracy, especially for distinguishing between bus, tram, metro, and train.
+GTFS and OSM data are **optional**. Without them, the model uses only motion features. Adding them improves accuracy for transit modes.
 
 ### GTFS (stop proximity)
 
-Place one or more GTFS `.zip` files in a directory and point `config.gtfs_dir` to it. The package reads `stops.txt`, `routes.txt`, `trips.txt`, and `stop_times.txt` from each zip to build a stop location database with route type information.
+Place one or more standard GTFS `.zip` files in a directory. The package reads `stops.txt`, `routes.txt`, `trips.txt`, and `stop_times.txt` to build a stop location database with route type information (bus, tram, metro, rail).
 
 ```
 data/gtfs/
-  IDFM-gtfs.zip        # one or more standard GTFS feeds
+  IDFM-gtfs.zip        # standard GTFS feed(s) for your region
 ```
+
+GTFS feeds are published by transit agencies. For example, the Ile-de-France feed is available from [data.iledefrance-mobilites.fr](https://data.iledefrance-mobilites.fr).
 
 ### OSM (route matching)
 
-Pre-extract route networks from an OSM PBF file into parquet format. The package expects these files:
+The package expects pre-extracted route network parquet files:
 
 ```
 data/osm_routes/
@@ -174,7 +224,7 @@ data/osm_routes/
   subway.parquet
 ```
 
-To generate them from a PBF file (requires `pyrosm`):
+To generate these from an OpenStreetMap PBF file (requires `pip install modedetect[osm]`):
 
 ```python
 from modedetect.features.routes import extract_osm_routes
@@ -182,6 +232,8 @@ from pathlib import Path
 
 extract_osm_routes(Path("ile-de-france-latest.osm.pbf"), Path("data/osm_routes/"))
 ```
+
+Regional PBF files can be downloaded from [download.geofabrik.de](https://download.geofabrik.de).
 
 ## Checkpointing
 
@@ -281,18 +333,47 @@ modedetect/
 
 ## Saving and loading models
 
-Trained models are saved as `.zip` files containing the XGBoost model, label encoder, feature list, configuration, and learned thresholds. This is a self-contained artifact -- no external data is needed to make predictions.
+Trained models are saved as `.zip` files containing the XGBoost model, label encoder, feature list, configuration, and learned thresholds.
 
 ```python
 # Save after training
 model.save("models/paris_v1.zip")
 
-# Load for inference (no GTFS/OSM needed)
+# Load for inference
 model = ModeDetector.load("models/paris_v1.zip")
 predictions = model.predict(new_gps_df)
 ```
 
-Note: for prediction, GTFS and OSM data paths should be configured if the model was trained with stop/route features. If they are not available at prediction time, those features will be filled with zeros.
+The `.zip` artifact stores everything needed for the classifier itself. However, if the model was trained with GTFS/OSM features, the same external data should be available at prediction time so the package can compute those features for new trips. If the data is not available, those features are filled with zeros and predictions rely on motion features alone.
+
+### What is stored in the artifact
+
+| File | Contents |
+|------|----------|
+| `model.ubj` | XGBoost decision trees (split thresholds and leaf weights) |
+| `label_encoder.joblib` | Mode label mapping (e.g. `CAR -> 0, BUS -> 1`) |
+| `feature_list.json` | Ordered list of feature column names |
+| `config.json` | Configuration parameters (paths are stripped, see below) |
+| `speed_thresholds.json` | Per-mode 99th percentile speed thresholds |
+| `optimal_percentiles.json` | Which percentile features were selected |
+| `metadata.json` | Timestamp, class list, feature count |
+
+**No GPS coordinates, trip identifiers, timestamps, or individual-level data are stored.** The XGBoost model contains only split thresholds on aggregate feature statistics (e.g. "if SPEED_AVG < 12.3, go left") learned over the full training set, not individual trips.
+
+### Path privacy
+
+Local file paths (GTFS directory, OSM directory) are **automatically stripped** from the saved artifact so the `.zip` is safe to share. When loading a model, paths are restored from a per-machine config file at `~/.modedetect.json`.
+
+Create this file on each machine where you use the package:
+
+```json
+{
+    "gtfs_dir": "/path/to/your/gtfs",
+    "osm_routes_dir": "/path/to/your/osm_routes"
+}
+```
+
+This file lives in your home directory, is not part of the repository, and is never included in the model artifact. Each machine can have different paths.
 
 ## Error handling
 

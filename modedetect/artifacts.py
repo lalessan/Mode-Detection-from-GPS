@@ -160,10 +160,25 @@ def _read_json(path: Path):
         return json.load(f)
 
 
+# Path fields that are stripped from saved artifacts (contain local machine paths)
+_PATH_FIELDS = {"gtfs_dir", "osm_pbf_path", "osm_routes_dir"}
+
+# Location of the per-machine user config file
+_USER_CONFIG_PATH = Path.home() / ".modedetect.json"
+
+
 def _config_to_serializable(config: ModeDetectConfig) -> dict:
-    """Convert config dataclass to a JSON-serializable dict."""
+    """Convert config dataclass to a JSON-serializable dict.
+
+    Local file paths are stripped (set to null) so the artifact
+    is safe to share. Paths are restored at load time from
+    ~/.modedetect.json if it exists.
+    """
     d = asdict(config)
-    # Convert Path objects to strings
+    # Strip local paths — these should not be in shared artifacts
+    for key in _PATH_FIELDS:
+        d[key] = None
+    # Convert remaining Path objects to strings
     for key, val in d.items():
         if isinstance(val, Path):
             d[key] = str(val)
@@ -175,10 +190,18 @@ def _config_to_serializable(config: ModeDetectConfig) -> dict:
 
 
 def _config_from_serializable(d: dict) -> ModeDetectConfig:
-    """Reconstruct a ModeDetectConfig from a deserialized dict."""
+    """Reconstruct a ModeDetectConfig from a deserialized dict.
+
+    Missing paths are filled from ~/.modedetect.json if it exists.
+    """
+    # Load user-local paths from ~/.modedetect.json
+    user_paths = _load_user_config()
+    for key in _PATH_FIELDS:
+        if (d.get(key) is None) and (key in user_paths):
+            d[key] = user_paths[key]
+
     # Convert path strings back to Path objects
-    path_fields = {"gtfs_dir", "osm_pbf_path", "osm_routes_dir"}
-    for key in path_fields:
+    for key in _PATH_FIELDS:
         if key in d and d[key] is not None:
             d[key] = Path(d[key])
 
@@ -194,3 +217,24 @@ def _config_from_serializable(d: dict) -> ModeDetectConfig:
     d = {k: v for k, v in d.items() if k in valid_fields}
 
     return ModeDetectConfig(**d)
+
+
+def _load_user_config() -> dict:
+    """Load user-local config from ~/.modedetect.json.
+
+    Returns an empty dict if the file doesn't exist.
+
+    Example ~/.modedetect.json::
+
+        {
+            "gtfs_dir": "/home/lauale/ModeDetection/gtfs",
+            "osm_routes_dir": "/home/lauale/ModeDetection/osm_routes"
+        }
+    """
+    if _USER_CONFIG_PATH.exists():
+        try:
+            with open(_USER_CONFIG_PATH) as f:
+                return json.load(f)
+        except (json.JSONDecodeError, OSError):
+            return {}
+    return {}
