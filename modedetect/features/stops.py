@@ -132,11 +132,36 @@ def compute_stop_features(
     config : ModeDetectConfig
     segment_col : optional segment column for segment-level aggregation
     """
+    import warnings
+    from tqdm import tqdm
+
     key_col = config.col_trip_key
     group_cols = [key_col] if segment_col is None else [key_col, segment_col]
 
+    # Batch BallTree query on ALL points at once (much faster than per-trip)
+    logger.info("Querying BallTree for all %d GPS points...", len(gps_df))
+    all_lat = gps_df[config.col_latitude].astype("float64").values
+    all_lon = gps_df[config.col_longitude].astype("float64").values
+    gps_rad = np.radians(np.column_stack([all_lat, all_lon]))
+    rad = config.stop_search_radius_m / EARTH_RADIUS_M
+
+    all_idx, all_dist = tree.query_radius(gps_rad, r=rad, return_distance=True, sort_results=True)
+
+    # Convert radians to metres
+    all_dist_m = [d * EARTH_RADIUS_M for d in all_dist]
+
+    # Pre-extract route type sets for each stop
+    has_route_type = "route_type_set" in stops_df.columns
+    if has_route_type:
+        rt_values = stops_df["route_type_set"].values
+
+    # Build position index so we can slice batch results per trip
+    gps_positions = np.arange(len(gps_df))
+
+    groups = list(gps_df.groupby(group_cols, sort=False, observed=True))
     rows = []
-    for group_key, grp in gps_df.groupby(group_cols, sort=False, observed=True):
+
+    for group_key, grp in tqdm(groups, desc="Stop features", unit="trip"):
         if isinstance(group_key, str):
             trip_key = group_key
             seg_id = None
@@ -144,49 +169,57 @@ def compute_stop_features(
             trip_key = group_key[0]
             seg_id = group_key[1] if len(group_key) > 1 else None
 
-        lat = grp[config.col_latitude].astype("float64").values
-        lon = grp[config.col_longitude].astype("float64").values
-
-        stop_ids, dists_m, route_types = query_nearest_stops(
-            tree, stops_df, lat, lon, config.stop_search_radius_m
-        )
+        # Get the row indices for this trip's points in the batch results
+        point_indices = grp.index
+        n_points = len(point_indices)
 
         row = {"trip_key": trip_key}
         if seg_id is not None:
             row["segment"] = seg_id
 
+        # Slice batch results for this trip
+        trip_idx_arrays = [all_idx[i] for i in point_indices]
+        trip_dist_arrays = [all_dist_m[i] for i in point_indices]
+
         # Aggregate counts
-        counts = [len(d) for d in dists_m]
+        counts = [len(d) for d in trip_dist_arrays]
         row["STOPS_NUM_AVG"] = float(np.mean(counts)) if counts else 0.0
         row["STOPS_NUM_MAX"] = int(np.max(counts)) if counts else 0
         row["STOPS_NUM_MIN"] = int(np.min(counts)) if counts else 0
 
-        # Aggregate min distance per point, then stats
-        min_dists = [float(np.min(d)) if len(d) > 0 else np.nan for d in dists_m]
-        row["STOPS_MINDIST_AVG"] = float(np.nanmean(min_dists)) if min_dists else np.nan
+        # Aggregate min distance per point
+        min_dists = [float(np.min(d)) if len(d) > 0 else np.nan for d in trip_dist_arrays]
+        valid_min_dists = [d for d in min_dists if not np.isnan(d)]
+        row["STOPS_MINDIST_AVG"] = float(np.mean(valid_min_dists)) if valid_min_dists else np.nan
 
         # Per-mode min distances and duration
         for mode_code, mode_name in ROUTE_TYPE_NAMES.items():
             mode_min_dists = []
             near_count = 0
-            for i, rt_list in enumerate(route_types):
-                # Find stops of this mode type
-                mode_dists_this_point = []
-                for j, rt in enumerate(rt_list):
-                    if isinstance(rt, (list, tuple, set, np.ndarray)):
-                        if mode_code in rt:
-                            mode_dists_this_point.append(dists_m[i][j])
-                    elif rt == mode_code:
-                        mode_dists_this_point.append(dists_m[i][j])
 
-                if mode_dists_this_point:
-                    mode_min_dists.append(min(mode_dists_this_point))
-                    near_count += 1
+            if has_route_type:
+                for pt_idx, pt_dist in zip(trip_idx_arrays, trip_dist_arrays):
+                    if len(pt_idx) == 0:
+                        continue
+                    pt_idx = np.asarray(pt_idx, dtype=np.int64)
+                    # Find stops of this mode type at this point
+                    mode_dists = []
+                    for j, stop_i in enumerate(pt_idx):
+                        rt = rt_values[stop_i]
+                        if isinstance(rt, (list, tuple, set, np.ndarray)):
+                            if mode_code in rt:
+                                mode_dists.append(pt_dist[j])
+                        elif rt == mode_code:
+                            mode_dists.append(pt_dist[j])
+
+                    if mode_dists:
+                        mode_min_dists.append(min(mode_dists))
+                        near_count += 1
 
             row[f"MIN_DIST_{mode_name.upper()}"] = (
                 float(np.min(mode_min_dists)) if mode_min_dists else np.nan
             )
-            row[f"DURATION_{mode_name.upper()}"] = near_count / len(grp) if len(grp) > 0 else 0.0
+            row[f"DURATION_{mode_name.upper()}"] = near_count / n_points if n_points > 0 else 0.0
 
         rows.append(row)
 

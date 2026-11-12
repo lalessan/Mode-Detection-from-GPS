@@ -251,8 +251,11 @@ def compute_route_features(
     key_col = config.col_trip_key
     group_cols = [key_col] if segment_col is None else [key_col, segment_col]
 
+    from tqdm import tqdm
+
+    groups = list(gps_df.groupby(group_cols, sort=False, observed=True))
     rows = []
-    for group_key, grp in gps_df.groupby(group_cols, sort=False, observed=True):
+    for group_key, grp in tqdm(groups, desc="Route matching", unit="trip"):
         if isinstance(group_key, str):
             trip_key = group_key
             seg_id = None
