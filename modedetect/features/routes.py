@@ -239,6 +239,9 @@ def compute_route_features(
 ) -> pd.DataFrame:
     """Compute per-trip (or per-segment) route match percentage features.
 
+    Uses batch BallTree queries (one per mode) and vectorized aggregation
+    instead of per-trip loops.
+
     Parameters
     ----------
     gps_df : GPS DataFrame with lat/lon and trip_key
@@ -248,41 +251,101 @@ def compute_route_features(
 
     Returns DataFrame with columns like ``bus_match_pct``, ``tram_match_pct``, etc.
     """
-    key_col = config.col_trip_key
-    group_cols = [key_col] if segment_col is None else [key_col, segment_col]
-
     from tqdm import tqdm
 
-    groups = list(gps_df.groupby(group_cols, sort=False, observed=True))
-    rows = []
-    for group_key, grp in tqdm(groups, desc="Route matching", unit="trip"):
-        if isinstance(group_key, str):
-            trip_key = group_key
-            seg_id = None
-        else:
-            trip_key = group_key[0]
-            seg_id = group_key[1] if len(group_key) > 1 else None
+    key_col = config.col_trip_key
+    n_points = len(gps_df)
 
-        lat = grp[config.col_latitude].astype("float64").values
-        lon = grp[config.col_longitude].astype("float64").values
+    # Prepare GPS coordinates once
+    all_lat = gps_df[config.col_latitude].astype("float64").values
+    all_lon = gps_df[config.col_longitude].astype("float64").values
+    gps_rad = np.radians(np.column_stack([all_lat, all_lon]))
+    rad = config.route_search_radius_m / EARTH_RADIUS_M
 
-        row = {"trip_key": trip_key}
-        if seg_id is not None:
-            row["segment"] = seg_id
+    # Build trip key + segment arrays
+    trip_keys = gps_df[key_col].values
+    merge_cols = [key_col]
+    if segment_col is not None:
+        seg_ids = gps_df[segment_col].values
+        merge_cols = [key_col, segment_col]
 
-        for mode_name in TRANSIT_MODES:
-            rbt = route_balltrees.get(mode_name)
-            if rbt is None or rbt.is_empty:
-                row[f"{mode_name}_match_pct"] = 0.0
-                continue
+    # Build the result DataFrame with one row per trip/segment
+    if segment_col is not None:
+        base_df = pd.DataFrame({key_col: trip_keys, segment_col: seg_ids})
+    else:
+        base_df = pd.DataFrame({key_col: trip_keys})
+    points_per_trip = base_df.groupby(merge_cols, sort=False, observed=True).size()
+    result = points_per_trip.reset_index(name="_n_points")
 
-            freq = fast_match(rbt, lat, lon, config.route_search_radius_m)
-            if freq is None:
-                row[f"{mode_name}_match_pct"] = 0.0
-            else:
-                best_pct = max(pct for _, pct in freq.values())
-                row[f"{mode_name}_match_pct"] = best_pct
+    CHUNK = 500_000
+    n_chunks = (n_points + CHUNK - 1) // CHUNK
 
-        rows.append(row)
+    for mode_name in TRANSIT_MODES:
+        col = f"{mode_name}_match_pct"
+        rbt = route_balltrees.get(mode_name)
 
-    return pd.DataFrame(rows)
+        if rbt is None or rbt.is_empty:
+            result[col] = 0.0
+            continue
+
+        # ── Chunked BallTree query for this mode ──────────────────────
+        logger.info("Batch route query: %s (%d chunks)...", mode_name, n_chunks)
+        all_route_ids = [None] * n_points  # route indices per GPS point
+
+        for c in tqdm(range(n_chunks), desc=f"Route query ({mode_name})", unit="chunk"):
+            lo = c * CHUNK
+            hi = min(lo + CHUNK, n_points)
+            ind = rbt.tree.query_radius(gps_rad[lo:hi], r=rad)
+            for j in range(hi - lo):
+                if len(ind[j]) > 0:
+                    all_route_ids[lo + j] = np.unique(rbt.route_idx[ind[j]])
+
+        # ── Explode to (gps_pos, route_idx) pairs ────────────────────
+        gps_pos_list = []
+        route_idx_list = []
+        for i in range(n_points):
+            if all_route_ids[i] is not None:
+                n = len(all_route_ids[i])
+                gps_pos_list.append(np.full(n, i, dtype=np.int64))
+                route_idx_list.append(all_route_ids[i])
+
+        if not gps_pos_list:
+            result[col] = 0.0
+            continue
+
+        flat_gps_pos = np.concatenate(gps_pos_list)
+        flat_route_idx = np.concatenate(route_idx_list)
+
+        # ── Per-trip, per-route: count matching GPS points ────────────
+        flat_df = pd.DataFrame({
+            key_col: trip_keys[flat_gps_pos],
+            "_route": flat_route_idx,
+            "_gps_pos": flat_gps_pos,
+        })
+        if segment_col is not None:
+            flat_df[segment_col] = seg_ids[flat_gps_pos]
+
+        # Count unique GPS points per trip per route
+        hits = flat_df.groupby(
+            merge_cols + ["_route"], sort=False, observed=True
+        )["_gps_pos"].nunique().reset_index(name="_hits")
+
+        # Join with trip point counts to get percentages
+        hits = hits.merge(result[merge_cols + ["_n_points"]], on=merge_cols, how="left")
+        hits["_pct"] = hits["_hits"] / hits["_n_points"]
+
+        # Best route per trip = max match percentage
+        best = hits.groupby(merge_cols, sort=False, observed=True)["_pct"].max()
+        best.name = col
+
+        result = result.merge(best.reset_index(), on=merge_cols, how="left")
+        result[col] = result[col].fillna(0.0)
+
+    # Clean up and rename
+    result = result.drop(columns=["_n_points"])
+    result = result.rename(columns={key_col: "trip_key"})
+    if segment_col is not None:
+        result = result.rename(columns={segment_col: "segment"})
+
+    logger.info("Route feature aggregation complete: %d trips", len(result))
+    return result
