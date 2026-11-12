@@ -138,14 +138,29 @@ def compute_stop_features(
     group_cols = [key_col] if segment_col is None else [key_col, segment_col]
     n_points = len(gps_df)
 
-    # ── Batch BallTree query on ALL points at once ────────────────────
-    logger.info("Querying BallTree for all %d GPS points...", n_points)
+    # ── Chunked BallTree query (avoids hanging on huge arrays) ─────────
+    from tqdm import tqdm
+
     all_lat = gps_df[config.col_latitude].astype("float64").values
     all_lon = gps_df[config.col_longitude].astype("float64").values
     gps_rad = np.radians(np.column_stack([all_lat, all_lon]))
     rad = config.stop_search_radius_m / EARTH_RADIUS_M
 
-    all_idx, all_dist = tree.query_radius(gps_rad, r=rad, return_distance=True, sort_results=True)
+    CHUNK = 500_000
+    n_chunks = (n_points + CHUNK - 1) // CHUNK
+    all_idx = [None] * n_points
+    all_dist = [None] * n_points
+
+    for c in tqdm(range(n_chunks), desc="BallTree query", unit="chunk"):
+        lo = c * CHUNK
+        hi = min(lo + CHUNK, n_points)
+        chunk_idx, chunk_dist = tree.query_radius(
+            gps_rad[lo:hi], r=rad, return_distance=True, sort_results=True,
+        )
+        for j in range(hi - lo):
+            all_idx[lo + j] = chunk_idx[j]
+            all_dist[lo + j] = chunk_dist[j]
+
     logger.info("BallTree query complete. Building flat index...")
 
     # ── Per-point counts and min distances (vectorized) ───────────────
