@@ -27,6 +27,9 @@ from xgboost import XGBClassifier
 # CONFIGURATION — Update these paths to match your server layout
 # ─────────────────────────────────────────────────────────────────────
 
+# Checkpoint directory for intermediate results
+CHECKPOINT_DIR = Path("checkpoints/")
+
 # Pre-generated feature sets from the original pipeline
 DATA_FEATURES = Path("DATA_Feature_sets/")
 
@@ -648,7 +651,10 @@ def level3_compare_confusion(merged_orig, orig_clf, orig_feature_cols,
 
 def main():
     import logging
+    import pickle
     logging.basicConfig(level=logging.INFO, format="%(name)s — %(message)s")
+
+    CHECKPOINT_DIR.mkdir(exist_ok=True)
 
     print("=" * 60)
     print("MODEDETECT VALIDATION PIPELINE")
@@ -671,12 +677,31 @@ def main():
     merged_orig = build_original_feature_matrix(df_stats, df_pct, df_stops, df_routes, trip_key_col, mode_col)
     orig_clf, orig_le, X_test, y_test, y_pred, feature_cols = train_original_model(merged_orig, trip_key_col, mode_col)
 
-    # ── Step 2: Load raw GPS and run modedetect ──
-    gps_df, trips_df = load_raw_gps()
-    model_new = run_modedetect_pipeline(gps_df, trips_df)
+    # ── Step 2: Load raw GPS (with checkpoint) ──
+    gps_ckpt = CHECKPOINT_DIR / "gps_linked.parquet"
+    if gps_ckpt.exists():
+        print(f"\n  Loading GPS from checkpoint: {gps_ckpt}")
+        gps_df = pd.read_parquet(gps_ckpt)
+        trips_df = pd.read_csv(TRIPS_PATH)
+        print(f"  GPS: {gps_df.shape}, Trips: {trips_df.shape}")
+    else:
+        gps_df, trips_df = load_raw_gps()
+        print(f"  Saving GPS checkpoint to {gps_ckpt}...")
+        gps_df.to_parquet(gps_ckpt, index=False)
+
+    # ── Step 3: Run modedetect (with checkpoint) ──
+    model_ckpt = CHECKPOINT_DIR / "modedetect_model.zip"
+    if model_ckpt.exists():
+        print(f"\n  Loading modedetect model from checkpoint: {model_ckpt}")
+        from modedetect import ModeDetector
+        model_new = ModeDetector.load(model_ckpt)
+    else:
+        model_new = run_modedetect_pipeline(gps_df, trips_df)
+        import shutil
+        if Path("models/netmob25_modedetect.zip").exists():
+            shutil.copy("models/netmob25_modedetect.zip", model_ckpt)
 
     # ── Level 1: Feature comparison ──
-    # Use a subset of GPS data for tractable comparison
     print("\n  Using loaded GPS data for Level 1 comparison...")
     level1_compare_features(gps_df, trips_df, df_stats, df_pct, trip_key_col, mode_col)
 
