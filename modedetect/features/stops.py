@@ -139,6 +139,21 @@ def compute_stop_features(
     gps_rad = np.radians(np.column_stack([all_lat, all_lon]))
     rad = config.stop_search_radius_m / EARTH_RADIUS_M
 
+    # ── Compute dt (time delta in seconds) per GPS point ─────────────────
+    # Needed for DURATION features (sum of seconds near each mode's stops)
+    ts_col = config.col_timestamp
+    trip_keys_arr = gps_df[key_col].values
+    timestamps = pd.to_datetime(gps_df[ts_col]).values
+    dt_seconds = np.full(n_points, np.nan)
+    # Compute dt within each trip (diff from previous point)
+    trip_boundaries = np.where(trip_keys_arr[1:] != trip_keys_arr[:-1])[0] + 1
+    # dt[i] = timestamp[i] - timestamp[i-1], NaN at trip starts
+    raw_dt = (timestamps[1:] - timestamps[:-1]).astype("timedelta64[ns]").astype(np.float64) / 1e9
+    dt_seconds[1:] = raw_dt
+    # Set trip boundaries to NaN (first point of each trip has no dt)
+    dt_seconds[0] = np.nan
+    dt_seconds[trip_boundaries] = np.nan
+
     # ── Pre-compute mode masks for stops ───────────────────────────────
     has_route_type = "route_type_set" in stops_df.columns
     mode_masks = {}
@@ -157,6 +172,9 @@ def compute_stop_features(
     # ── Per-point arrays (O(n_points), not O(n_pairs)) ─────────────────
     counts = np.zeros(n_points, dtype=np.int32)
     min_dist = np.full(n_points, np.nan)
+    # mode_min_dist_top5: for MIN_DIST features (student uses top 5 nearest stops)
+    mode_min_dist_top5 = {mc: np.full(n_points, np.nan) for mc in ROUTE_TYPE_NAMES}
+    # mode_min_dist: for STOPS_CLOSEST percentiles (student uses all stops)
     mode_min_dist = {mc: np.full(n_points, np.nan) for mc in ROUTE_TYPE_NAMES}
     mode_has_stop = {mc: np.zeros(n_points, dtype=bool) for mc in ROUTE_TYPE_NAMES}
 
@@ -181,11 +199,21 @@ def compute_stop_features(
             min_dist[pos] = dist_m.min()
 
             if has_route_type:
+                # Top 5 nearest stops — for MIN_DIST (matching student)
+                top5_idx = idx_arr[:5]
+                top5_dist = dist_m[:5]
+
                 for mode_code in ROUTE_TYPE_NAMES:
-                    mode_hits = mode_masks[mode_code][idx_arr]
-                    if mode_hits.any():
+                    # All stops within radius — for STOPS_CLOSEST percentiles
+                    all_mode_hits = mode_masks[mode_code][idx_arr]
+                    if all_mode_hits.any():
                         mode_has_stop[mode_code][pos] = True
-                        mode_min_dist[mode_code][pos] = dist_m[mode_hits].min()
+                        mode_min_dist[mode_code][pos] = dist_m[all_mode_hits].min()
+
+                    # Top 5 only — for MIN_DIST per mode
+                    top5_mode_hits = mode_masks[mode_code][top5_idx]
+                    if top5_mode_hits.any():
+                        mode_min_dist_top5[mode_code][pos] = top5_dist[top5_mode_hits].min()
 
     logger.info("BallTree query complete. Aggregating to trip level...")
 
@@ -194,7 +222,10 @@ def compute_stop_features(
     if segment_col is not None:
         seg_ids = gps_df[segment_col].values
 
-    agg_df = pd.DataFrame({"_key": trip_keys, "_count": counts, "_min_dist": min_dist})
+    agg_df = pd.DataFrame({
+        "_key": trip_keys, "_count": counts, "_min_dist": min_dist,
+        "_dt": dt_seconds,
+    })
     if segment_col is not None:
         agg_df["_seg"] = seg_ids
         gb_cols = ["_key", "_seg"]
@@ -216,9 +247,6 @@ def compute_stop_features(
 
     merge_cols = ["trip_key"] if segment_col is None else ["trip_key", "segment"]
 
-    # Points per trip (for duration denominator)
-    n_points_per_trip = grouped.size()
-
     # ── Per-mode features ─────────────────────────────────────────────
     if has_route_type:
         for mode_code, mode_name in ROUTE_TYPE_NAMES.items():
@@ -227,24 +255,28 @@ def compute_stop_features(
 
             # Add per-mode columns to agg_df for groupby
             mode_dist_col = f"_mdist_{mode_code}"
-            mode_near_col = f"_mnear_{mode_code}"
-            agg_df[mode_dist_col] = mode_min_dist[mode_code]
-            agg_df[mode_near_col] = mode_has_stop[mode_code].astype(np.int8)
+            mode_dur_col = f"_mdur_{mode_code}"
+            # MIN_DIST uses top-5 nearest stops (matching student's approach)
+            agg_df[mode_dist_col] = mode_min_dist_top5[mode_code]
+            # DURATION: dt (seconds) for points near this mode's stops
+            mode_dt = np.where(mode_has_stop[mode_code], dt_seconds, 0.0)
+            # NaN dt → 0 (first point of trip, or last point — no contribution)
+            mode_dt = np.nan_to_num(mode_dt, nan=0.0)
+            agg_df[mode_dur_col] = mode_dt
 
             mode_grouped = agg_df.groupby(gb_cols, sort=False, observed=True)
 
-            # MIN_DIST: min across all points per trip
+            # MIN_DIST: min across all points per trip (top-5 only)
             mode_min_series = mode_grouped[mode_dist_col].min()
             mode_min_series.name = col_min
             basic = basic.merge(mode_min_series.reset_index().rename(
                 columns={"_key": "trip_key"} | ({"_seg": "segment"} if segment_col else {})
             ), on=merge_cols, how="left")
 
-            # DURATION: fraction of points near this mode's stops
-            mode_near_sum = mode_grouped[mode_near_col].sum()
-            dur_vals = (mode_near_sum / n_points_per_trip).fillna(0.0)
-            dur_vals.name = col_dur
-            basic = basic.merge(dur_vals.reset_index().rename(
+            # DURATION: sum of seconds near this mode's stops
+            mode_dur_sum = mode_grouped[mode_dur_col].sum()
+            mode_dur_sum.name = col_dur
+            basic = basic.merge(mode_dur_sum.reset_index().rename(
                 columns={"_key": "trip_key"} | ({"_seg": "segment"} if segment_col else {})
             ), on=merge_cols, how="left")
             basic[col_dur] = basic[col_dur].fillna(0.0)
