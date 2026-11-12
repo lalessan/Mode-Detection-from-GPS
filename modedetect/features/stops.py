@@ -172,11 +172,11 @@ def compute_stop_features(
     # ── Per-point arrays (O(n_points), not O(n_pairs)) ─────────────────
     counts = np.zeros(n_points, dtype=np.int32)
     min_dist = np.full(n_points, np.nan)
-    # mode_min_dist_top5: for MIN_DIST features (student uses top 5 nearest stops)
+    # mode_min_dist_top5: for MIN_DIST and DURATION (student uses top 5 nearest stops)
     mode_min_dist_top5 = {mc: np.full(n_points, np.nan) for mc in ROUTE_TYPE_NAMES}
+    mode_has_stop_top5 = {mc: np.zeros(n_points, dtype=bool) for mc in ROUTE_TYPE_NAMES}
     # mode_min_dist: for STOPS_CLOSEST percentiles (student uses all stops)
     mode_min_dist = {mc: np.full(n_points, np.nan) for mc in ROUTE_TYPE_NAMES}
-    mode_has_stop = {mc: np.zeros(n_points, dtype=bool) for mc in ROUTE_TYPE_NAMES}
 
     # ── Chunked BallTree query — summarize per point, discard raw results ──
     CHUNK = 500_000
@@ -207,12 +207,12 @@ def compute_stop_features(
                     # All stops within radius — for STOPS_CLOSEST percentiles
                     all_mode_hits = mode_masks[mode_code][idx_arr]
                     if all_mode_hits.any():
-                        mode_has_stop[mode_code][pos] = True
                         mode_min_dist[mode_code][pos] = dist_m[all_mode_hits].min()
 
-                    # Top 5 only — for MIN_DIST per mode
+                    # Top 5 only — for MIN_DIST and DURATION per mode
                     top5_mode_hits = mode_masks[mode_code][top5_idx]
                     if top5_mode_hits.any():
+                        mode_has_stop_top5[mode_code][pos] = True
                         mode_min_dist_top5[mode_code][pos] = top5_dist[top5_mode_hits].min()
 
     logger.info("BallTree query complete. Aggregating to trip level...")
@@ -258,8 +258,8 @@ def compute_stop_features(
             mode_dur_col = f"_mdur_{mode_code}"
             # MIN_DIST uses top-5 nearest stops (matching student's approach)
             agg_df[mode_dist_col] = mode_min_dist_top5[mode_code]
-            # DURATION: dt (seconds) for points near this mode's stops
-            mode_dt = np.where(mode_has_stop[mode_code], dt_seconds, 0.0)
+            # DURATION: dt (seconds) for points near this mode's stops (top 5)
+            mode_dt = np.where(mode_has_stop_top5[mode_code], dt_seconds, 0.0)
             # NaN dt → 0 (first point of trip, or last point — no contribution)
             mode_dt = np.nan_to_num(mode_dt, nan=0.0)
             agg_df[mode_dur_col] = mode_dt
