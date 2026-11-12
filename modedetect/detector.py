@@ -685,6 +685,7 @@ class ModeDetector:
         for mode in feat_routes.TRANSIT_MODES:
             pq = routes_dir / f"{mode}.parquet"
             if pq.exists():
+                logger.info("Loading route BallTree: %s ...", mode)
                 self._route_balltrees[mode] = feat_routes.build_route_balltree(
                     pq, densify_spacing_m=cfg.route_densify_spacing_m,
                 )
