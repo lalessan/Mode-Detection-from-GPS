@@ -1,7 +1,6 @@
 """Compare stop features at 1000m radius against student's pre-generated features."""
 
 import time
-import re
 import numpy as np
 import pandas as pd
 from pathlib import Path
@@ -25,7 +24,7 @@ config = ModeDetectConfig(
     col_speed_kmh="SPEED",
     col_main_mode="Main_Mode",
     stop_search_radius_m=1000,  # Match student's 1000m
-    n_jobs=1,  # Sequential (threading causes hangs with BallTree)
+    n_jobs=8,  # Multiprocessing (not threading)
 )
 
 # Load student's 1000m stop features
@@ -49,15 +48,22 @@ stops = load_gtfs_stops(GTFS_DIR)
 tree, stops_df = build_stop_balltree(stops)
 print(f"  Stops: {len(stops_df)}")
 
-# Compute stop features at 1000m (with checkpoint)
+# Per-point BallTree cache (the slow part — ~22 min)
+# Aggregation changes don't need to re-query; just delete the final parquet.
+point_cache = CHECKPOINT_DIR / "fit_steps" / "03_stop_points_1000m.npz"
+
+# Final aggregated features checkpoint
 stop_ckpt = CHECKPOINT_DIR / "fit_steps" / "03_stop_features_1000m.parquet"
 if stop_ckpt.exists():
     print(f"Loading 1000m stop features from checkpoint: {stop_ckpt}")
     new_stops = pd.read_parquet(stop_ckpt)
 else:
-    print(f"Computing stop features (radius={config.stop_search_radius_m}m)...")
+    print(f"Computing stop features (radius={config.stop_search_radius_m}m, n_jobs={config.n_jobs})...")
     t0 = time.time()
-    new_stops = compute_stop_features(gps_df, tree, stops_df, config)
+    new_stops = compute_stop_features(
+        gps_df, tree, stops_df, config,
+        point_cache_path=point_cache,
+    )
     print(f"  Done in {time.time() - t0:.1f}s")
     new_stops.to_parquet(stop_ckpt, index=False)
     print(f"  Saved checkpoint: {stop_ckpt}")

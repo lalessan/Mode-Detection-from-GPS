@@ -109,17 +109,130 @@ def query_nearest_stops(
 # ── Trip-level aggregation ───────────────────────────────────────────
 
 
+def _process_chunk(
+    gps_rad_chunk: np.ndarray,
+    tree: BallTree,
+    rad: float,
+    mode_mask_arrays: dict[int, np.ndarray] | None,
+) -> tuple[np.ndarray, np.ndarray, dict, dict, dict]:
+    """Process a single chunk of GPS points against the BallTree.
+
+    Returns per-point summaries for the chunk.
+    """
+    n = len(gps_rad_chunk)
+    counts = np.zeros(n, dtype=np.int32)
+    min_dist = np.full(n, np.nan)
+    mode_min_dist_top5 = {mc: np.full(n, np.nan) for mc in ROUTE_TYPE_NAMES}
+    mode_has_stop_top5 = {mc: np.zeros(n, dtype=bool) for mc in ROUTE_TYPE_NAMES}
+    mode_min_dist = {mc: np.full(n, np.nan) for mc in ROUTE_TYPE_NAMES}
+
+    chunk_idx, chunk_dist = tree.query_radius(
+        gps_rad_chunk, r=rad, return_distance=True, sort_results=True,
+    )
+    for j in range(n):
+        idx_arr = chunk_idx[j]
+        if len(idx_arr) == 0:
+            continue
+
+        dist_m = chunk_dist[j] * EARTH_RADIUS_M
+        counts[j] = len(idx_arr)
+        min_dist[j] = dist_m.min()
+
+        if mode_mask_arrays is not None:
+            top5_idx = idx_arr[:5]
+            top5_dist = dist_m[:5]
+
+            for mode_code in ROUTE_TYPE_NAMES:
+                all_mode_hits = mode_mask_arrays[mode_code][idx_arr]
+                if all_mode_hits.any():
+                    mode_min_dist[mode_code][j] = dist_m[all_mode_hits].min()
+
+                top5_mode_hits = mode_mask_arrays[mode_code][top5_idx]
+                if top5_mode_hits.any():
+                    mode_has_stop_top5[mode_code][j] = True
+                    mode_min_dist_top5[mode_code][j] = top5_dist[top5_mode_hits].min()
+
+    return counts, min_dist, mode_min_dist_top5, mode_has_stop_top5, mode_min_dist
+
+
+def _query_balltree_parallel(
+    gps_rad: np.ndarray,
+    tree: BallTree,
+    rad: float,
+    mode_mask_arrays: dict[int, np.ndarray] | None,
+    n_jobs: int = 1,
+    chunk_size: int = 500_000,
+) -> tuple[np.ndarray, np.ndarray, dict, dict, dict]:
+    """Run chunked BallTree queries, optionally in parallel with multiprocessing."""
+    from tqdm import tqdm
+
+    n_points = len(gps_rad)
+    n_chunks = (n_points + chunk_size - 1) // chunk_size
+
+    # Build chunk slices
+    chunks = []
+    for c in range(n_chunks):
+        lo = c * chunk_size
+        hi = min(lo + chunk_size, n_points)
+        chunks.append((lo, hi))
+
+    # Allocate output arrays
+    counts = np.zeros(n_points, dtype=np.int32)
+    min_dist = np.full(n_points, np.nan)
+    mode_min_dist_top5 = {mc: np.full(n_points, np.nan) for mc in ROUTE_TYPE_NAMES}
+    mode_has_stop_top5 = {mc: np.zeros(n_points, dtype=bool) for mc in ROUTE_TYPE_NAMES}
+    mode_min_dist = {mc: np.full(n_points, np.nan) for mc in ROUTE_TYPE_NAMES}
+
+    effective_jobs = min(n_jobs, n_chunks)
+
+    if effective_jobs <= 1:
+        # Sequential
+        for lo, hi in tqdm(chunks, desc="BallTree query", unit="chunk"):
+            c_counts, c_min, c_top5, c_has, c_all = _process_chunk(
+                gps_rad[lo:hi], tree, rad, mode_mask_arrays,
+            )
+            counts[lo:hi] = c_counts
+            min_dist[lo:hi] = c_min
+            for mc in ROUTE_TYPE_NAMES:
+                mode_min_dist_top5[mc][lo:hi] = c_top5[mc]
+                mode_has_stop_top5[mc][lo:hi] = c_has[mc]
+                mode_min_dist[mc][lo:hi] = c_all[mc]
+    else:
+        # Parallel with multiprocessing (not threading — avoids GIL/deadlock)
+        from concurrent.futures import ProcessPoolExecutor, as_completed
+
+        logger.info("Using %d processes for BallTree query...", effective_jobs)
+        futures = {}
+        with ProcessPoolExecutor(max_workers=effective_jobs) as pool:
+            for lo, hi in chunks:
+                fut = pool.submit(
+                    _process_chunk, gps_rad[lo:hi], tree, rad, mode_mask_arrays,
+                )
+                futures[fut] = (lo, hi)
+
+            for fut in tqdm(as_completed(futures), total=len(futures),
+                            desc="BallTree query", unit="chunk"):
+                lo, hi = futures[fut]
+                c_counts, c_min, c_top5, c_has, c_all = fut.result()
+                counts[lo:hi] = c_counts
+                min_dist[lo:hi] = c_min
+                for mc in ROUTE_TYPE_NAMES:
+                    mode_min_dist_top5[mc][lo:hi] = c_top5[mc]
+                    mode_has_stop_top5[mc][lo:hi] = c_has[mc]
+                    mode_min_dist[mc][lo:hi] = c_all[mc]
+
+    return counts, min_dist, mode_min_dist_top5, mode_has_stop_top5, mode_min_dist
+
+
 def compute_stop_features(
     gps_df: pd.DataFrame,
     tree: BallTree,
     stops_df: pd.DataFrame,
     config: ModeDetectConfig,
     segment_col: str | None = None,
+    point_cache_path: Path | str | None = None,
 ) -> pd.DataFrame:
     """Compute trip-level stop proximity features.
-
-    Memory-efficient: computes per-point summaries during the chunked
-    BallTree query instead of storing all raw stop matches.
 
     Parameters
     ----------
@@ -128,92 +241,73 @@ def compute_stop_features(
     stops_df : aligned stops DataFrame from ``build_stop_balltree``
     config : ModeDetectConfig
     segment_col : optional segment column for segment-level aggregation
+    point_cache_path : optional path to cache per-point BallTree results (.npz).
+        If the file exists, the BallTree query is skipped entirely and
+        only the (fast) aggregation runs. Saves ~20 min on re-runs.
     """
-    from tqdm import tqdm
-
     key_col = config.col_trip_key
     n_points = len(gps_df)
 
-    all_lat = gps_df[config.col_latitude].astype("float64").values
-    all_lon = gps_df[config.col_longitude].astype("float64").values
-    gps_rad = np.radians(np.column_stack([all_lat, all_lon]))
-    rad = config.stop_search_radius_m / EARTH_RADIUS_M
-
     # ── Compute dt (time delta in seconds) per GPS point ─────────────────
-    # Needed for DURATION features (sum of seconds near each mode's stops)
     ts_col = config.col_timestamp
     trip_keys_arr = gps_df[key_col].values
     timestamps = pd.to_datetime(gps_df[ts_col]).values
     dt_seconds = np.full(n_points, np.nan)
-    # Compute dt within each trip (diff from previous point)
     trip_boundaries = np.where(trip_keys_arr[1:] != trip_keys_arr[:-1])[0] + 1
-    # dt[i] = timestamp[i] - timestamp[i-1], NaN at trip starts
     raw_dt = (timestamps[1:] - timestamps[:-1]).astype("timedelta64[ns]").astype(np.float64) / 1e9
     dt_seconds[1:] = raw_dt
-    # Set trip boundaries to NaN (first point of each trip has no dt)
     dt_seconds[0] = np.nan
     dt_seconds[trip_boundaries] = np.nan
 
-    # ── Pre-compute mode masks for stops ───────────────────────────────
-    has_route_type = "route_type_set" in stops_df.columns
-    mode_masks = {}
-    if has_route_type:
-        rt_values = stops_df["route_type_set"].values
-        for mode_code in ROUTE_TYPE_NAMES:
-            mask = np.zeros(len(stops_df), dtype=bool)
-            for si, rt in enumerate(rt_values):
-                if isinstance(rt, (list, tuple, set, np.ndarray)):
-                    if mode_code in rt:
+    # ── BallTree query (or load from cache) ──────────────────────────────
+    cache_path = Path(point_cache_path) if point_cache_path is not None else None
+
+    if cache_path is not None and cache_path.exists():
+        logger.info("Loading per-point BallTree cache from %s", cache_path)
+        data = np.load(cache_path, allow_pickle=False)
+        counts = data["counts"]
+        min_dist = data["min_dist"]
+        mode_min_dist_top5 = {mc: data[f"mdist_top5_{mc}"] for mc in ROUTE_TYPE_NAMES}
+        mode_has_stop_top5 = {mc: data[f"mhas_top5_{mc}"] for mc in ROUTE_TYPE_NAMES}
+        mode_min_dist = {mc: data[f"mdist_all_{mc}"] for mc in ROUTE_TYPE_NAMES}
+    else:
+        # Pre-compute mode masks for stops
+        has_route_type = "route_type_set" in stops_df.columns
+        mode_mask_arrays = None
+        if has_route_type:
+            mode_mask_arrays = {}
+            rt_values = stops_df["route_type_set"].values
+            for mode_code in ROUTE_TYPE_NAMES:
+                mask = np.zeros(len(stops_df), dtype=bool)
+                for si, rt in enumerate(rt_values):
+                    if isinstance(rt, (list, tuple, set, np.ndarray)):
+                        if mode_code in rt:
+                            mask[si] = True
+                    elif rt == mode_code:
                         mask[si] = True
-                elif rt == mode_code:
-                    mask[si] = True
-            mode_masks[mode_code] = mask
+                mode_mask_arrays[mode_code] = mask
 
-    # ── Per-point arrays (O(n_points), not O(n_pairs)) ─────────────────
-    counts = np.zeros(n_points, dtype=np.int32)
-    min_dist = np.full(n_points, np.nan)
-    # mode_min_dist_top5: for MIN_DIST and DURATION (student uses top 5 nearest stops)
-    mode_min_dist_top5 = {mc: np.full(n_points, np.nan) for mc in ROUTE_TYPE_NAMES}
-    mode_has_stop_top5 = {mc: np.zeros(n_points, dtype=bool) for mc in ROUTE_TYPE_NAMES}
-    # mode_min_dist: for STOPS_CLOSEST percentiles (student uses all stops)
-    mode_min_dist = {mc: np.full(n_points, np.nan) for mc in ROUTE_TYPE_NAMES}
+        all_lat = gps_df[config.col_latitude].astype("float64").values
+        all_lon = gps_df[config.col_longitude].astype("float64").values
+        gps_rad = np.radians(np.column_stack([all_lat, all_lon]))
+        rad = config.stop_search_radius_m / EARTH_RADIUS_M
 
-    # ── Chunked BallTree query — summarize per point, discard raw results ──
-    CHUNK = 500_000
-    n_chunks = (n_points + CHUNK - 1) // CHUNK
+        counts, min_dist, mode_min_dist_top5, mode_has_stop_top5, mode_min_dist = \
+            _query_balltree_parallel(
+                gps_rad, tree, rad, mode_mask_arrays,
+                n_jobs=config.n_jobs, chunk_size=500_000,
+            )
 
-    for c in tqdm(range(n_chunks), desc="BallTree query", unit="chunk"):
-        lo = c * CHUNK
-        hi = min(lo + CHUNK, n_points)
-        chunk_idx, chunk_dist = tree.query_radius(
-            gps_rad[lo:hi], r=rad, return_distance=True, sort_results=True,
-        )
-        for j in range(hi - lo):
-            idx_arr = chunk_idx[j]
-            if len(idx_arr) == 0:
-                continue
-
-            pos = lo + j
-            dist_m = chunk_dist[j] * EARTH_RADIUS_M
-            counts[pos] = len(idx_arr)
-            min_dist[pos] = dist_m.min()
-
-            if has_route_type:
-                # Top 5 nearest stops — for MIN_DIST (matching student)
-                top5_idx = idx_arr[:5]
-                top5_dist = dist_m[:5]
-
-                for mode_code in ROUTE_TYPE_NAMES:
-                    # All stops within radius — for STOPS_CLOSEST percentiles
-                    all_mode_hits = mode_masks[mode_code][idx_arr]
-                    if all_mode_hits.any():
-                        mode_min_dist[mode_code][pos] = dist_m[all_mode_hits].min()
-
-                    # Top 5 only — for MIN_DIST and DURATION per mode
-                    top5_mode_hits = mode_masks[mode_code][top5_idx]
-                    if top5_mode_hits.any():
-                        mode_has_stop_top5[mode_code][pos] = True
-                        mode_min_dist_top5[mode_code][pos] = top5_dist[top5_mode_hits].min()
+        # Save cache
+        if cache_path is not None:
+            cache_path.parent.mkdir(parents=True, exist_ok=True)
+            save_dict = {"counts": counts, "min_dist": min_dist}
+            for mc in ROUTE_TYPE_NAMES:
+                save_dict[f"mdist_top5_{mc}"] = mode_min_dist_top5[mc]
+                save_dict[f"mhas_top5_{mc}"] = mode_has_stop_top5[mc]
+                save_dict[f"mdist_all_{mc}"] = mode_min_dist[mc]
+            np.savez(cache_path, **save_dict)
+            logger.info("Saved per-point BallTree cache to %s", cache_path)
 
     logger.info("BallTree query complete. Aggregating to trip level...")
 
