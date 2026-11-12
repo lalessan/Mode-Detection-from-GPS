@@ -118,13 +118,8 @@ def compute_stop_features(
 ) -> pd.DataFrame:
     """Compute trip-level stop proximity features.
 
-    For each trip (or segment), queries the BallTree and computes:
-    - min distance to nearest stop per transit mode (tram/metro/rail/bus)
-    - number of stops within radius (avg, min, max)
-    - overall min distance stats
-    - duration (fraction of points) near each transit mode's stops
-
-    Uses fully vectorized aggregation (no per-trip Python loop).
+    Memory-efficient: computes per-point summaries during the chunked
+    BallTree query instead of storing all raw stop matches.
 
     Parameters
     ----------
@@ -134,80 +129,21 @@ def compute_stop_features(
     config : ModeDetectConfig
     segment_col : optional segment column for segment-level aggregation
     """
-    key_col = config.col_trip_key
-    group_cols = [key_col] if segment_col is None else [key_col, segment_col]
-    n_points = len(gps_df)
-
-    # ── Chunked BallTree query (avoids hanging on huge arrays) ─────────
     from tqdm import tqdm
+
+    key_col = config.col_trip_key
+    n_points = len(gps_df)
 
     all_lat = gps_df[config.col_latitude].astype("float64").values
     all_lon = gps_df[config.col_longitude].astype("float64").values
     gps_rad = np.radians(np.column_stack([all_lat, all_lon]))
     rad = config.stop_search_radius_m / EARTH_RADIUS_M
 
-    CHUNK = 500_000
-    n_chunks = (n_points + CHUNK - 1) // CHUNK
-    all_idx = [None] * n_points
-    all_dist = [None] * n_points
-
-    for c in tqdm(range(n_chunks), desc="BallTree query", unit="chunk"):
-        lo = c * CHUNK
-        hi = min(lo + CHUNK, n_points)
-        chunk_idx, chunk_dist = tree.query_radius(
-            gps_rad[lo:hi], r=rad, return_distance=True, sort_results=True,
-        )
-        for j in range(hi - lo):
-            all_idx[lo + j] = chunk_idx[j]
-            all_dist[lo + j] = chunk_dist[j]
-
-    logger.info("BallTree query complete. Building flat index...")
-
-    # ── Per-point counts and min distances (vectorized) ───────────────
-    counts = np.array([len(a) for a in all_idx], dtype=np.int32)
-    min_dist_per_point = np.full(n_points, np.nan)
-    has_hits = counts > 0
-    for i in np.where(has_hits)[0]:
-        min_dist_per_point[i] = all_dist[i].min() * EARTH_RADIUS_M
-
-    # ── Build trip-key array for each GPS point (positional) ──────────
-    trip_keys = gps_df[key_col].values
-    if segment_col is not None:
-        seg_ids = gps_df[segment_col].values
-
-    # ── Basic stop stats via pandas groupby ───────────────────────────
-    logger.info("Aggregating basic stop stats per trip...")
-    agg_df = pd.DataFrame({
-        "_key": trip_keys,
-        "_count": counts,
-        "_min_dist": min_dist_per_point,
-    })
-    if segment_col is not None:
-        agg_df["_seg"] = seg_ids
-        gb_cols = ["_key", "_seg"]
-    else:
-        gb_cols = ["_key"]
-
-    grouped = agg_df.groupby(gb_cols, sort=False, observed=True)
-    basic = grouped.agg(
-        STOPS_NUM_AVG=("_count", "mean"),
-        STOPS_NUM_MAX=("_count", "max"),
-        STOPS_NUM_MIN=("_count", "min"),
-        STOPS_MINDIST_AVG=("_min_dist", "mean"),
-    ).reset_index()
-
-    # Rename key columns back
-    basic = basic.rename(columns={"_key": "trip_key"})
-    if segment_col is not None:
-        basic = basic.rename(columns={"_seg": "segment"})
-
-    # ── Per-mode features via exploded flat table ─────────────────────
+    # ── Pre-compute mode masks for stops ───────────────────────────────
     has_route_type = "route_type_set" in stops_df.columns
-
+    mode_masks = {}
     if has_route_type:
-        # Pre-compute boolean mask per mode for each stop
         rt_values = stops_df["route_type_set"].values
-        mode_masks = {}  # mode_code → bool array over stops
         for mode_code in ROUTE_TYPE_NAMES:
             mask = np.zeros(len(stops_df), dtype=bool)
             for si, rt in enumerate(rt_values):
@@ -218,100 +154,124 @@ def compute_stop_features(
                     mask[si] = True
             mode_masks[mode_code] = mask
 
-        # Explode: (gps_point_pos, stop_idx, dist_m)
-        logger.info("Exploding %d point-stop pairs for mode aggregation...",
-                     int(counts.sum()))
-        hit_positions = np.where(has_hits)[0]
-        gps_pos_list = []
-        stop_idx_list = []
-        dist_m_list = []
-        for i in hit_positions:
-            n = len(all_idx[i])
-            gps_pos_list.append(np.full(n, i, dtype=np.int64))
-            stop_idx_list.append(all_idx[i].astype(np.int64))
-            dist_m_list.append(all_dist[i] * EARTH_RADIUS_M)
+    # ── Per-point arrays (O(n_points), not O(n_pairs)) ─────────────────
+    counts = np.zeros(n_points, dtype=np.int32)
+    min_dist = np.full(n_points, np.nan)
+    mode_min_dist = {mc: np.full(n_points, np.nan) for mc in ROUTE_TYPE_NAMES}
+    mode_has_stop = {mc: np.zeros(n_points, dtype=bool) for mc in ROUTE_TYPE_NAMES}
 
-        if gps_pos_list:
-            flat_gps_pos = np.concatenate(gps_pos_list)
-            flat_stop_idx = np.concatenate(stop_idx_list)
-            flat_dist_m = np.concatenate(dist_m_list)
-        else:
-            flat_gps_pos = np.array([], dtype=np.int64)
-            flat_stop_idx = np.array([], dtype=np.int64)
-            flat_dist_m = np.array([], dtype=np.float64)
+    # ── Chunked BallTree query — summarize per point, discard raw results ──
+    CHUNK = 500_000
+    n_chunks = (n_points + CHUNK - 1) // CHUNK
 
-        # Map gps_pos → trip key (and segment)
-        flat_keys = trip_keys[flat_gps_pos]
+    for c in tqdm(range(n_chunks), desc="BallTree query", unit="chunk"):
+        lo = c * CHUNK
+        hi = min(lo + CHUNK, n_points)
+        chunk_idx, chunk_dist = tree.query_radius(
+            gps_rad[lo:hi], r=rad, return_distance=True, sort_results=True,
+        )
+        for j in range(hi - lo):
+            idx_arr = chunk_idx[j]
+            if len(idx_arr) == 0:
+                continue
 
-        flat_df = pd.DataFrame({
-            "_key": flat_keys,
-            "_gps_pos": flat_gps_pos,
-            "_stop_idx": flat_stop_idx,
-            "_dist_m": flat_dist_m,
-        })
-        if segment_col is not None:
-            flat_df["_seg"] = seg_ids[flat_gps_pos]
+            pos = lo + j
+            dist_m = chunk_dist[j] * EARTH_RADIUS_M
+            counts[pos] = len(idx_arr)
+            min_dist[pos] = dist_m.min()
 
-        # Count points per trip (for duration denominator)
-        merge_cols = ["trip_key"] if segment_col is None else ["trip_key", "segment"]
-        points_per_trip = basic[merge_cols].copy()
-        points_per_trip["_n_points"] = grouped.size().values
+            if has_route_type:
+                for mode_code in ROUTE_TYPE_NAMES:
+                    mode_hits = mode_masks[mode_code][idx_arr]
+                    if mode_hits.any():
+                        mode_has_stop[mode_code][pos] = True
+                        mode_min_dist[mode_code][pos] = dist_m[mode_hits].min()
 
+    logger.info("BallTree query complete. Aggregating to trip level...")
+
+    # ── Build trip-key / segment arrays ────────────────────────────────
+    trip_keys = gps_df[key_col].values
+    if segment_col is not None:
+        seg_ids = gps_df[segment_col].values
+
+    agg_df = pd.DataFrame({"_key": trip_keys, "_count": counts, "_min_dist": min_dist})
+    if segment_col is not None:
+        agg_df["_seg"] = seg_ids
+        gb_cols = ["_key", "_seg"]
+    else:
+        gb_cols = ["_key"]
+
+    # ── Basic stop stats ──────────────────────────────────────────────
+    grouped = agg_df.groupby(gb_cols, sort=False, observed=True)
+    basic = grouped.agg(
+        STOPS_NUM_AVG=("_count", "mean"),
+        STOPS_NUM_MAX=("_count", "max"),
+        STOPS_NUM_MIN=("_count", "min"),
+        STOPS_MINDIST_AVG=("_min_dist", "mean"),
+    ).reset_index()
+
+    basic = basic.rename(columns={"_key": "trip_key"})
+    if segment_col is not None:
+        basic = basic.rename(columns={"_seg": "segment"})
+
+    merge_cols = ["trip_key"] if segment_col is None else ["trip_key", "segment"]
+
+    # Points per trip (for duration denominator)
+    n_points_per_trip = grouped.size()
+
+    # ── Per-mode features ─────────────────────────────────────────────
+    if has_route_type:
         for mode_code, mode_name in ROUTE_TYPE_NAMES.items():
             col_min = f"MIN_DIST_{mode_name.upper()}"
             col_dur = f"DURATION_{mode_name.upper()}"
 
-            # Filter to stops of this mode
-            mask = mode_masks[mode_code][flat_stop_idx]
-            mode_df = flat_df[mask].copy()
+            # Add per-mode columns to agg_df for groupby
+            mode_dist_col = f"_mdist_{mode_code}"
+            mode_near_col = f"_mnear_{mode_code}"
+            agg_df[mode_dist_col] = mode_min_dist[mode_code]
+            agg_df[mode_near_col] = mode_has_stop[mode_code].astype(np.int8)
 
-            if len(mode_df) == 0:
-                basic[col_min] = np.nan
-                basic[col_dur] = 0.0
-                continue
+            mode_grouped = agg_df.groupby(gb_cols, sort=False, observed=True)
 
-            # Rename for groupby
-            mode_df = mode_df.rename(columns={"_key": "trip_key"})
-            if segment_col is not None:
-                mode_df = mode_df.rename(columns={"_seg": "segment"})
+            # MIN_DIST: min across all points per trip
+            mode_min_series = mode_grouped[mode_dist_col].min()
+            mode_min_series.name = col_min
+            basic = basic.merge(mode_min_series.reset_index().rename(
+                columns={"_key": "trip_key"} | ({"_seg": "segment"} if segment_col else {})
+            ), on=merge_cols, how="left")
 
-            # MIN_DIST: min distance across all points and stops of this mode per trip
-            mode_min = mode_df.groupby(merge_cols, sort=False, observed=True)["_dist_m"].min()
-            mode_min.name = col_min
-            basic = basic.merge(mode_min.reset_index(), on=merge_cols, how="left")
-
-            # DURATION: number of unique GPS points near this mode / total points
-            mode_pts = mode_df.groupby(merge_cols, sort=False, observed=True)["_gps_pos"].nunique()
-            mode_pts.name = "_near_pts"
-            dur_df = mode_pts.reset_index().merge(points_per_trip, on=merge_cols, how="left")
-            dur_df[col_dur] = dur_df["_near_pts"] / dur_df["_n_points"]
-            basic = basic.merge(dur_df[merge_cols + [col_dur]], on=merge_cols, how="left")
+            # DURATION: fraction of points near this mode's stops
+            mode_near_sum = mode_grouped[mode_near_col].sum()
+            dur_vals = (mode_near_sum / n_points_per_trip).fillna(0.0)
+            dur_vals.name = col_dur
+            basic = basic.merge(dur_vals.reset_index().rename(
+                columns={"_key": "trip_key"} | ({"_seg": "segment"} if segment_col else {})
+            ), on=merge_cols, how="left")
             basic[col_dur] = basic[col_dur].fillna(0.0)
     else:
-        # No route type info — fill with NaN/0
         for mode_code, mode_name in ROUTE_TYPE_NAMES.items():
             basic[f"MIN_DIST_{mode_name.upper()}"] = np.nan
             basic[f"DURATION_{mode_name.upper()}"] = 0.0
 
     # ── Percentile features ───────────────────────────────────────────
-    quantiles = config.stop_quantiles  # e.g. (5, 10, 15, ..., 95)
+    quantiles = config.stop_quantiles
     if quantiles:
         logger.info("Computing stop distance percentiles (P%d–P%d)...",
                      quantiles[0], quantiles[-1])
 
         q_fracs = [q / 100.0 for q in quantiles]
 
-        # STOPS_MINDIST_Pq: percentile of min_dist_per_point per trip
-        # STOPS_NUM_Pq:     percentile of stop count per trip
-        pct_df = pd.DataFrame({**{c: agg_df[c] for c in gb_cols},
-                                "_min_dist": min_dist_per_point,
-                                "_count": counts.astype("float64")})
+        # STOPS_MINDIST_Pq and STOPS_NUM_Pq: percentiles of per-point values
+        pct_df = pd.DataFrame({
+            **{c: agg_df[c] for c in gb_cols},
+            "_min_dist": min_dist,
+            "_count": counts.astype("float64"),
+        })
         pct_grouped = pct_df.groupby(gb_cols, sort=False, observed=True)
 
         mindist_pcts = pct_grouped["_min_dist"].quantile(q_fracs)
         num_pcts = pct_grouped["_count"].quantile(q_fracs)
 
-        # Unstack the quantile level to columns
         mindist_wide = mindist_pcts.unstack(level=-1)
         mindist_wide.columns = [f"STOPS_MINDIST_P{int(q*100)}" for q in mindist_wide.columns]
 
@@ -322,29 +282,28 @@ def compute_stop_features(
         pct_result = pct_result.rename(columns={"_key": "trip_key"})
         if segment_col is not None:
             pct_result = pct_result.rename(columns={"_seg": "segment"})
+        basic = basic.merge(pct_result, on=merge_cols, how="left")
 
-        merge_cols_local = ["trip_key"] if segment_col is None else ["trip_key", "segment"]
-        basic = basic.merge(pct_result, on=merge_cols_local, how="left")
-
-        # STOPS_CLOSEST_{MODE}_Pq: percentile of closest-stop-of-mode distance
-        if has_route_type and len(flat_gps_pos) > 0:
+        # STOPS_CLOSEST_{MODE}_Pq: percentiles of per-point closest-mode distance
+        if has_route_type:
             for mode_code, mode_name in ROUTE_TYPE_NAMES.items():
-                mask = mode_masks[mode_code][flat_stop_idx]
-                mode_df = flat_df[mask]
+                mode_dist_arr = mode_min_dist[mode_code]
 
-                if len(mode_df) == 0:
+                # Only include points that had a stop of this mode
+                mode_pct_df = pd.DataFrame({
+                    **{c: agg_df[c] for c in gb_cols},
+                    "_dist": mode_dist_arr,
+                })
+                # Keep only points with a mode stop (non-NaN)
+                mode_pct_df = mode_pct_df.dropna(subset=["_dist"])
+
+                if len(mode_pct_df) == 0:
                     for q in quantiles:
                         basic[f"STOPS_CLOSEST_{mode_name.upper()}_P{q}"] = np.nan
                     continue
 
-                # Closest stop of this mode per GPS point per trip
-                closest_gb = mode_df.groupby(gb_cols + ["_gps_pos"], sort=False,
-                                              observed=True)["_dist_m"].min().reset_index()
-
-                # Percentiles across GPS points per trip
-                closest_pcts = closest_gb.groupby(
-                    gb_cols, sort=False, observed=True
-                )["_dist_m"].quantile(q_fracs)
+                mode_pct_grouped = mode_pct_df.groupby(gb_cols, sort=False, observed=True)
+                closest_pcts = mode_pct_grouped["_dist"].quantile(q_fracs)
                 closest_wide = closest_pcts.unstack(level=-1)
                 closest_wide.columns = [
                     f"STOPS_CLOSEST_{mode_name.upper()}_P{int(q*100)}"
@@ -354,10 +313,8 @@ def compute_stop_features(
                 closest_wide = closest_wide.rename(columns={"_key": "trip_key"})
                 if segment_col is not None:
                     closest_wide = closest_wide.rename(columns={"_seg": "segment"})
-
-                basic = basic.merge(closest_wide, on=merge_cols_local, how="left")
+                basic = basic.merge(closest_wide, on=merge_cols, how="left")
         else:
-            # No route type info — fill percentile columns with NaN
             for mode_code, mode_name in ROUTE_TYPE_NAMES.items():
                 for q in quantiles:
                     basic[f"STOPS_CLOSEST_{mode_name.upper()}_P{q}"] = np.nan
