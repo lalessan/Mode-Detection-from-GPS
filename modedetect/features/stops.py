@@ -293,7 +293,77 @@ def compute_stop_features(
             basic[f"MIN_DIST_{mode_name.upper()}"] = np.nan
             basic[f"DURATION_{mode_name.upper()}"] = 0.0
 
-    logger.info("Stop feature aggregation complete: %d trips", len(basic))
+    # ── Percentile features ───────────────────────────────────────────
+    quantiles = config.stop_quantiles  # e.g. (5, 10, 15, ..., 95)
+    if quantiles:
+        logger.info("Computing stop distance percentiles (P%d–P%d)...",
+                     quantiles[0], quantiles[-1])
+
+        q_fracs = [q / 100.0 for q in quantiles]
+
+        # STOPS_MINDIST_Pq: percentile of min_dist_per_point per trip
+        # STOPS_NUM_Pq:     percentile of stop count per trip
+        pct_df = pd.DataFrame({**{c: agg_df[c] for c in gb_cols},
+                                "_min_dist": min_dist_per_point,
+                                "_count": counts.astype("float64")})
+        pct_grouped = pct_df.groupby(gb_cols, sort=False, observed=True)
+
+        mindist_pcts = pct_grouped["_min_dist"].quantile(q_fracs)
+        num_pcts = pct_grouped["_count"].quantile(q_fracs)
+
+        # Unstack the quantile level to columns
+        mindist_wide = mindist_pcts.unstack(level=-1)
+        mindist_wide.columns = [f"STOPS_MINDIST_P{int(q*100)}" for q in mindist_wide.columns]
+
+        num_wide = num_pcts.unstack(level=-1)
+        num_wide.columns = [f"STOPS_NUM_P{int(q*100)}" for q in num_wide.columns]
+
+        pct_result = mindist_wide.join(num_wide).reset_index()
+        pct_result = pct_result.rename(columns={"_key": "trip_key"})
+        if segment_col is not None:
+            pct_result = pct_result.rename(columns={"_seg": "segment"})
+
+        merge_cols_local = ["trip_key"] if segment_col is None else ["trip_key", "segment"]
+        basic = basic.merge(pct_result, on=merge_cols_local, how="left")
+
+        # STOPS_CLOSEST_{MODE}_Pq: percentile of closest-stop-of-mode distance
+        if has_route_type and len(flat_gps_pos) > 0:
+            for mode_code, mode_name in ROUTE_TYPE_NAMES.items():
+                mask = mode_masks[mode_code][flat_stop_idx]
+                mode_df = flat_df[mask]
+
+                if len(mode_df) == 0:
+                    for q in quantiles:
+                        basic[f"STOPS_CLOSEST_{mode_name.upper()}_P{q}"] = np.nan
+                    continue
+
+                # Closest stop of this mode per GPS point per trip
+                closest_gb = mode_df.groupby(gb_cols + ["_gps_pos"], sort=False,
+                                              observed=True)["_dist_m"].min().reset_index()
+
+                # Percentiles across GPS points per trip
+                closest_pcts = closest_gb.groupby(
+                    gb_cols, sort=False, observed=True
+                )["_dist_m"].quantile(q_fracs)
+                closest_wide = closest_pcts.unstack(level=-1)
+                closest_wide.columns = [
+                    f"STOPS_CLOSEST_{mode_name.upper()}_P{int(q*100)}"
+                    for q in closest_wide.columns
+                ]
+                closest_wide = closest_wide.reset_index()
+                closest_wide = closest_wide.rename(columns={"_key": "trip_key"})
+                if segment_col is not None:
+                    closest_wide = closest_wide.rename(columns={"_seg": "segment"})
+
+                basic = basic.merge(closest_wide, on=merge_cols_local, how="left")
+        else:
+            # No route type info — fill percentile columns with NaN
+            for mode_code, mode_name in ROUTE_TYPE_NAMES.items():
+                for q in quantiles:
+                    basic[f"STOPS_CLOSEST_{mode_name.upper()}_P{q}"] = np.nan
+
+    logger.info("Stop feature aggregation complete: %d trips, %d columns",
+                len(basic), len(basic.columns))
     return basic
 
 

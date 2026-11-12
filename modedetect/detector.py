@@ -183,6 +183,12 @@ class ModeDetector:
 
         # ── Step 3: Stop proximity features ───────────────────────────
         stop_features = self._ckpt_load(ckpt, "03_stop_features.parquet")
+        # Invalidate old checkpoint if it lacks percentile columns
+        if stop_features is not None:
+            has_pct = any(c.startswith("STOPS_MINDIST_P") for c in stop_features.columns)
+            if not has_pct and cfg.stop_quantiles:
+                logger.info("Stop features checkpoint outdated (no percentiles). Recomputing...")
+                stop_features = None
         if stop_features is None:
             if validate_gtfs(cfg):
                 logger.info("Computing stop proximity features...")
@@ -192,6 +198,16 @@ class ModeDetector:
                 logger.info("No GTFS configured — skipping stop features.")
         else:
             logger.info("Loaded stop features from checkpoint.")
+            # Recompute JS selection from cached data
+            stop_pct_cols = [c for c in stop_features.columns if "_P" in c and (
+                c.startswith("STOPS_MINDIST_P") or
+                c.startswith("STOPS_NUM_P") or
+                c.startswith("STOPS_CLOSEST_")
+            )]
+            if stop_pct_cols:
+                self._optimal_stop_percentiles = self._find_optimal_stop_percentiles(
+                    stop_features, stats, cfg, stop_pct_cols,
+                )
 
         # ── Step 4: Route matching features ───────────────────────────
         route_features = self._ckpt_load(ckpt, "04_route_features.parquet")
@@ -644,6 +660,16 @@ class ModeDetector:
         merged = stats.merge(pct_map, on=merge_on, how="left")
 
         if stop_features is not None:
+            # Keep only optimal stop percentiles (if known) + non-percentile stop cols
+            if self._optimal_stop_percentiles:
+                stop_pct_cols = {c for c in stop_features.columns if "_P" in c and (
+                    c.startswith("STOPS_MINDIST_P") or
+                    c.startswith("STOPS_NUM_P") or
+                    c.startswith("STOPS_CLOSEST_")
+                )}
+                keep = set(self._optimal_stop_percentiles)
+                drop = stop_pct_cols - keep
+                stop_features = stop_features.drop(columns=[c for c in drop if c in stop_features.columns])
             merged = merged.merge(stop_features, on=merge_on, how="left")
 
         if route_features is not None:
@@ -703,9 +729,83 @@ class ModeDetector:
 
         stop_feats = compute_stop_features(gps, self._stop_tree, self._stop_df, cfg)
 
-        # TODO: add JS divergence for stop percentile selection
-        # For now, return all stop features
+        # JS divergence to select optimal percentile per stop feature group
+        stop_pct_cols = [c for c in stop_feats.columns if "_P" in c and (
+            c.startswith("STOPS_MINDIST_P") or
+            c.startswith("STOPS_NUM_P") or
+            c.startswith("STOPS_CLOSEST_")
+        )]
+        if stop_pct_cols:
+            logger.info("Selecting optimal stop percentiles via JS divergence (%d candidates)...",
+                        len(stop_pct_cols))
+            self._optimal_stop_percentiles = self._find_optimal_stop_percentiles(
+                stop_feats, stats, cfg, stop_pct_cols,
+            )
+            logger.info("Selected %d stop percentiles: %s",
+                        len(self._optimal_stop_percentiles), self._optimal_stop_percentiles)
+
         return stop_feats
+
+    def _find_optimal_stop_percentiles(
+        self,
+        stop_feats: pd.DataFrame,
+        stats: pd.DataFrame,
+        cfg: ModeDetectConfig,
+        pct_cols: list[str],
+    ) -> list[str]:
+        """Select the best percentile per stop feature group using JS divergence.
+
+        Same algorithm as ``find_optimal_percentiles`` but applied to stop columns.
+        """
+        from itertools import combinations
+        from .features.percentiles import (
+            _histogram_normalised,
+            _jensen_shannon,
+            _make_pooled_edges,
+        )
+
+        mode_col = cfg.col_main_mode
+        df = stop_feats.merge(
+            stats[["trip_key", mode_col]].drop_duplicates(),
+            on="trip_key", how="inner",
+        )
+
+        # Drop rows where all stop percentiles are NaN
+        check_col = next((c for c in pct_cols if "TRAM_P" in c and c.endswith("50")), None)
+        if check_col and check_col in df.columns:
+            df = df.dropna(subset=[check_col])
+
+        modes = df[mode_col].dropna().unique()
+        if len(modes) < 2:
+            return []
+
+        js_records = []
+        for col in pct_cols:
+            vals = df[col].dropna().values
+            edges = _make_pooled_edges(vals)
+            if edges is None:
+                continue
+
+            histograms = {}
+            for m in modes:
+                mv = df.loc[df[mode_col] == m, col].dropna().values
+                if len(mv) == 0:
+                    continue
+                histograms[m] = _histogram_normalised(mv, edges)
+
+            for a, b in combinations(histograms.keys(), 2):
+                js = _jensen_shannon(histograms[a], histograms[b])
+                js_records.append({"col": col, "js": js})
+
+        if not js_records:
+            return []
+
+        import pandas as _pd
+        df_js = _pd.DataFrame(js_records)
+        df_agg = df_js.groupby("col")["js"].mean().reset_index()
+        df_agg["feature"] = df_agg["col"].str.split("_P").str[0]
+        best = df_agg.loc[df_agg.groupby("feature")["js"].idxmax(), "col"].tolist()
+        return best
 
     def _compute_route_features(
         self, gps: pd.DataFrame, cfg: ModeDetectConfig,
