@@ -265,6 +265,7 @@ def compute_stop_features(
     dt_seconds[n_points - 1] = np.nan
 
     # ── BallTree query (or load from cache) ──────────────────────────────
+    has_route_type = "route_type_set" in stops_df.columns
     cache_path = Path(point_cache_path) if point_cache_path is not None else None
 
     if cache_path is not None and cache_path.exists():
@@ -276,8 +277,6 @@ def compute_stop_features(
         mode_has_stop_top5 = {mc: data[f"mhas_top5_{mc}"] for mc in ROUTE_TYPE_NAMES}
         mode_min_dist = {mc: data[f"mdist_all_{mc}"] for mc in ROUTE_TYPE_NAMES}
     else:
-        # Pre-compute mode masks for stops
-        has_route_type = "route_type_set" in stops_df.columns
         mode_mask_arrays = None
         if has_route_type:
             mode_mask_arrays = {}
