@@ -155,8 +155,9 @@ def compute_stop_features(
     if has_route_type:
         rt_values = stops_df["route_type_set"].values
 
-    # Build position index so we can slice batch results per trip
-    gps_positions = np.arange(len(gps_df))
+    # Map original index to positional index for slicing batch results
+    gps_df = gps_df.copy()
+    gps_df["_pos"] = np.arange(len(gps_df))
 
     groups = list(gps_df.groupby(group_cols, sort=False, observed=True))
     rows = []
@@ -169,8 +170,8 @@ def compute_stop_features(
             trip_key = group_key[0]
             seg_id = group_key[1] if len(group_key) > 1 else None
 
-        # Get the row indices for this trip's points in the batch results
-        point_indices = grp.index
+        # Get positional indices for this trip's points in the batch results
+        point_indices = grp["_pos"].values
         n_points = len(point_indices)
 
         row = {"trip_key": trip_key}
