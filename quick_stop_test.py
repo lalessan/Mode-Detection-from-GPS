@@ -25,7 +25,7 @@ config = ModeDetectConfig(
     col_speed_kmh="SPEED",
     col_main_mode="Main_Mode",
     stop_search_radius_m=1000,  # Match student's 1000m
-    n_jobs=4,  # Parallel BallTree queries
+    n_jobs=1,  # Sequential (threading causes hangs with BallTree)
 )
 
 # Load student's 1000m stop features

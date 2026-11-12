@@ -288,36 +288,17 @@ def compute_route_features(
             result[col] = 0.0
             continue
 
-        # ── Chunked BallTree query for this mode (parallel) ─────────
-        from concurrent.futures import ThreadPoolExecutor, as_completed
-        import os
-
+        # ── Chunked BallTree query for this mode ──────────────────────
         logger.info("Batch route query: %s (%d chunks)...", mode_name, n_chunks)
         all_route_ids = [None] * n_points
 
-        n_workers = config.n_jobs if config.n_jobs > 0 else (os.cpu_count() or 1)
-
-        def _query_route_chunk(c):
+        for c in tqdm(range(n_chunks), desc=f"Route query ({mode_name})", unit="chunk"):
             lo = c * CHUNK
             hi = min(lo + CHUNK, n_points)
             ind = rbt.tree.query_radius(gps_rad[lo:hi], r=rad)
-            results = []
             for j in range(hi - lo):
                 if len(ind[j]) > 0:
-                    results.append((lo + j, np.unique(rbt.route_idx[ind[j]])))
-            return results
-
-        if n_workers == 1:
-            for c in tqdm(range(n_chunks), desc=f"Route query ({mode_name})", unit="chunk"):
-                for pos, route_ids in _query_route_chunk(c):
-                    all_route_ids[pos] = route_ids
-        else:
-            with ThreadPoolExecutor(max_workers=n_workers) as pool:
-                futures = {pool.submit(_query_route_chunk, c): c for c in range(n_chunks)}
-                for fut in tqdm(as_completed(futures), total=n_chunks,
-                                desc=f"Route query ({mode_name})", unit="chunk"):
-                    for pos, route_ids in fut.result():
-                        all_route_ids[pos] = route_ids
+                    all_route_ids[lo + j] = np.unique(rbt.route_idx[ind[j]])
 
         # ── Explode to (gps_pos, route_idx) pairs ────────────────────
         gps_pos_list = []

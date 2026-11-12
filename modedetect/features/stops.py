@@ -138,10 +138,8 @@ def compute_stop_features(
     group_cols = [key_col] if segment_col is None else [key_col, segment_col]
     n_points = len(gps_df)
 
-    # ── Chunked BallTree query (parallel, avoids hanging on huge arrays) ──
-    from concurrent.futures import ThreadPoolExecutor, as_completed
+    # ── Chunked BallTree query (avoids hanging on huge arrays) ─────────
     from tqdm import tqdm
-    import os
 
     all_lat = gps_df[config.col_latitude].astype("float64").values
     all_lon = gps_df[config.col_longitude].astype("float64").values
@@ -153,32 +151,15 @@ def compute_stop_features(
     all_idx = [None] * n_points
     all_dist = [None] * n_points
 
-    n_workers = config.n_jobs if config.n_jobs > 0 else (os.cpu_count() or 1)
-
-    def _query_chunk(c):
+    for c in tqdm(range(n_chunks), desc="BallTree query", unit="chunk"):
         lo = c * CHUNK
         hi = min(lo + CHUNK, n_points)
         chunk_idx, chunk_dist = tree.query_radius(
             gps_rad[lo:hi], r=rad, return_distance=True, sort_results=True,
         )
-        return c, lo, hi, chunk_idx, chunk_dist
-
-    if n_workers == 1:
-        for c in tqdm(range(n_chunks), desc="BallTree query", unit="chunk"):
-            _, lo, hi, chunk_idx, chunk_dist = _query_chunk(c)
-            for j in range(hi - lo):
-                all_idx[lo + j] = chunk_idx[j]
-                all_dist[lo + j] = chunk_dist[j]
-    else:
-        logger.info("BallTree query: %d chunks across %d threads", n_chunks, n_workers)
-        with ThreadPoolExecutor(max_workers=n_workers) as pool:
-            futures = {pool.submit(_query_chunk, c): c for c in range(n_chunks)}
-            for fut in tqdm(as_completed(futures), total=n_chunks,
-                            desc="BallTree query", unit="chunk"):
-                _, lo, hi, chunk_idx, chunk_dist = fut.result()
-                for j in range(hi - lo):
-                    all_idx[lo + j] = chunk_idx[j]
-                    all_dist[lo + j] = chunk_dist[j]
+        for j in range(hi - lo):
+            all_idx[lo + j] = chunk_idx[j]
+            all_dist[lo + j] = chunk_dist[j]
 
     logger.info("BallTree query complete. Building flat index...")
 
