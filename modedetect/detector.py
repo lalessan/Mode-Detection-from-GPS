@@ -88,7 +88,12 @@ class ModeDetector:
 
     # ── fit ───────────────────────────────────────────────────────────
 
-    def fit(self, gps_df: pd.DataFrame, trips_df: pd.DataFrame) -> ModeDetector:
+    def fit(
+        self,
+        gps_df: pd.DataFrame,
+        trips_df: pd.DataFrame,
+        checkpoint_dir: str | Path | None = None,
+    ) -> ModeDetector:
         """Train the mode detector from labelled GPS data.
 
         Parameters
@@ -98,77 +103,112 @@ class ModeDetector:
         trips_df : DataFrame
             Trip metadata with ``trip_key`` and ``main_mode``.
             Optionally ``mode_1``, ``mode_2``, ... for multi-modal.
+        checkpoint_dir : optional path
+            If set, intermediate results are saved/loaded as parquet files
+            to avoid recomputing expensive steps on reruns.
         """
         cfg = self.config
         validate_fit_inputs(gps_df, trips_df, cfg)
+
+        ckpt = Path(checkpoint_dir) if checkpoint_dir else None
+        if ckpt:
+            ckpt.mkdir(parents=True, exist_ok=True)
 
         # Auto-detect multi-modal
         self._is_multimodal = detect_multimodal_columns(trips_df, cfg)
         if self._is_multimodal:
             logger.info("Multi-modal labels detected — segmentation will be enabled.")
 
-        # ── Clean GPS data ────────────────────────────────────────────
-        gps = remove_invalid_coordinates(gps_df, cfg)
-        gaps = warn_temporal_gaps(gps, cfg)
-        gps = drop_trips_with_gaps(gps, gaps, cfg)
-        gps = drop_short_trips(gps, cfg.min_gps_points, cfg)
-        gps = drop_brief_trips(gps, cfg.min_trip_duration_s, cfg)
+        # ── Step 1: Clean GPS + motion features + speed filtering ─────
+        gps = self._ckpt_load(ckpt, "01_gps_motion.parquet")
+        if gps is None:
+            gps = remove_invalid_coordinates(gps_df, cfg)
+            gaps = warn_temporal_gaps(gps, cfg)
+            gps = drop_trips_with_gaps(gps, gaps, cfg)
+            gps = drop_short_trips(gps, cfg.min_gps_points, cfg)
+            gps = drop_brief_trips(gps, cfg.min_trip_duration_s, cfg)
 
-        # ── Motion features ───────────────────────────────────────────
-        logger.info("Extracting point-level motion features...")
-        gps = extract_point_features(gps, cfg)
+            logger.info("Extracting point-level motion features...")
+            gps = extract_point_features(gps, cfg)
 
-        # ── Speed outlier filtering (per-mode, needs labels) ──────────
-        # Join labels temporarily for threshold computation
-        mode_map = trips_df.set_index(cfg.col_trip_key)[cfg.col_main_mode].to_dict()
-        gps["_mode_tmp"] = gps[cfg.col_trip_key].map(mode_map)
+            # Speed outlier filtering (per-mode, needs labels)
+            mode_map = trips_df.set_index(cfg.col_trip_key)[cfg.col_main_mode].to_dict()
+            gps["_mode_tmp"] = gps[cfg.col_trip_key].map(mode_map)
+            gps["_mode_tmp"] = gps["_mode_tmp"].replace(cfg.mode_remap)
 
-        # Remap modes on the temp column for threshold computation
-        gps["_mode_tmp"] = gps["_mode_tmp"].replace(cfg.mode_remap)
+            self._speed_thresholds = compute_speed_thresholds(
+                gps.rename(columns={"_mode_tmp": cfg.col_main_mode}), cfg
+            )
+            self._max_speed_ms = max(self._speed_thresholds.values()) if self._speed_thresholds else None
 
-        self._speed_thresholds = compute_speed_thresholds(
-            gps.rename(columns={"_mode_tmp": cfg.col_main_mode}), cfg
-        )
-        self._max_speed_ms = max(self._speed_thresholds.values()) if self._speed_thresholds else None
+            gps = filter_speed_outliers_fit(
+                gps.rename(columns={"_mode_tmp": cfg.col_main_mode}),
+                self._speed_thresholds, cfg,
+            )
+            gps.drop(columns=[cfg.col_main_mode], errors="ignore", inplace=True)
 
-        gps = filter_speed_outliers_fit(
-            gps.rename(columns={"_mode_tmp": cfg.col_main_mode}),
-            self._speed_thresholds, cfg,
-        )
-        gps.drop(columns=[cfg.col_main_mode], errors="ignore", inplace=True)
+            self._ckpt_save(ckpt, "01_gps_motion.parquet", gps)
+        else:
+            logger.info("Loaded GPS + motion features from checkpoint.")
+            # Recompute speed thresholds from cached data
+            mode_map = trips_df.set_index(cfg.col_trip_key)[cfg.col_main_mode].to_dict()
+            gps_tmp = gps.copy()
+            gps_tmp["_mode_tmp"] = gps_tmp[cfg.col_trip_key].map(mode_map)
+            gps_tmp["_mode_tmp"] = gps_tmp["_mode_tmp"].replace(cfg.mode_remap)
+            self._speed_thresholds = compute_speed_thresholds(
+                gps_tmp.rename(columns={"_mode_tmp": cfg.col_main_mode}), cfg
+            )
+            self._max_speed_ms = max(self._speed_thresholds.values()) if self._speed_thresholds else None
+            del gps_tmp
 
-        # ── Trip-level statistics ─────────────────────────────────────
-        logger.info("Computing trip-level statistics...")
-        stats = compute_trip_statistics(gps, cfg, trips_df=trips_df)
+        # ── Step 2: Trip-level statistics + percentile map ────────────
+        stats = self._ckpt_load(ckpt, "02_stats.parquet")
+        pct_map = self._ckpt_load(ckpt, "02_pct_map.parquet")
+        if stats is None or pct_map is None:
+            logger.info("Computing trip-level statistics...")
+            stats = compute_trip_statistics(gps, cfg, trips_df=trips_df)
+            stats = remap_and_drop_modes(stats, cfg)
 
-        # ── Remap/drop modes in stats ─────────────────────────────────
-        stats = remap_and_drop_modes(stats, cfg)
+            logger.info("Computing percentile maps...")
+            pct_map = compute_percentile_map(gps, cfg)
 
-        # ── Percentile map ────────────────────────────────────────────
-        logger.info("Computing percentile maps...")
-        pct_map = compute_percentile_map(gps, cfg)
+            logger.info("Selecting optimal percentiles via JS divergence...")
+            self._optimal_percentiles = find_optimal_percentiles(pct_map, stats, cfg)
 
-        # ── Optimal percentile selection (JS divergence) ──────────────
-        logger.info("Selecting optimal percentiles via JS divergence...")
-        self._optimal_percentiles = find_optimal_percentiles(pct_map, stats, cfg)
+            self._ckpt_save(ckpt, "02_stats.parquet", stats)
+            self._ckpt_save(ckpt, "02_pct_map.parquet", pct_map)
+        else:
+            logger.info("Loaded stats + percentile map from checkpoint.")
+            self._optimal_percentiles = find_optimal_percentiles(pct_map, stats, cfg)
 
-        # ── Stop proximity features ───────────────────────────────────
-        stop_features = None
-        if validate_gtfs(cfg):
-            logger.info("Computing stop proximity features...")
-            stop_features = self._compute_stop_features_fit(gps, stats, cfg)
+        # ── Step 3: Stop proximity features ───────────────────────────
+        stop_features = self._ckpt_load(ckpt, "03_stop_features.parquet")
+        if stop_features is None:
+            if validate_gtfs(cfg):
+                logger.info("Computing stop proximity features...")
+                stop_features = self._compute_stop_features_fit(gps, stats, cfg)
+                self._ckpt_save(ckpt, "03_stop_features.parquet", stop_features)
+            else:
+                logger.info("No GTFS configured — skipping stop features.")
+        else:
+            logger.info("Loaded stop features from checkpoint.")
 
-        # ── Route matching features ───────────────────────────────────
-        route_features = None
-        if validate_osm(cfg):
-            logger.info("Computing route matching features...")
-            route_features = self._compute_route_features(gps, cfg)
+        # ── Step 4: Route matching features ───────────────────────────
+        route_features = self._ckpt_load(ckpt, "04_route_features.parquet")
+        if route_features is None:
+            if validate_osm(cfg):
+                logger.info("Computing route matching features...")
+                route_features = self._compute_route_features(gps, cfg)
+                self._ckpt_save(ckpt, "04_route_features.parquet", route_features)
+            else:
+                logger.info("No OSM configured — skipping route features.")
+        else:
+            logger.info("Loaded route features from checkpoint.")
 
-        # ── Merge all feature sets ────────────────────────────────────
+        # ── Step 5: Merge + train ─────────────────────────────────────
         logger.info("Merging feature sets...")
         merged = self._merge_features(stats, pct_map, stop_features, route_features)
 
-        # ── Train XGBoost ─────────────────────────────────────────────
         logger.info("Training XGBoost classifier...")
         self._train_model(merged, cfg)
 
@@ -604,6 +644,27 @@ class ModeDetector:
         return feat_routes.compute_route_features(gps, self._route_balltrees, cfg)
 
     # ── Checks ────────────────────────────────────────────────────────
+
+    # ── Checkpoint helpers ────────────────────────────────────────────
+
+    @staticmethod
+    def _ckpt_load(ckpt_dir: Path | None, name: str) -> pd.DataFrame | None:
+        """Load a checkpoint parquet if it exists."""
+        if ckpt_dir is None:
+            return None
+        path = ckpt_dir / name
+        if path.exists():
+            return pd.read_parquet(path)
+        return None
+
+    @staticmethod
+    def _ckpt_save(ckpt_dir: Path | None, name: str, df: pd.DataFrame | None) -> None:
+        """Save a DataFrame as a checkpoint parquet."""
+        if ckpt_dir is None or df is None:
+            return
+        path = ckpt_dir / name
+        df.to_parquet(path, index=False)
+        logger.info("Checkpoint saved: %s (%d rows)", name, len(df))
 
     def _check_fitted(self) -> None:
         if not self.is_fitted:

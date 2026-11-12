@@ -404,7 +404,7 @@ def run_modedetect_pipeline(gps_df, trips_df):
     model = ModeDetector(config)
 
     t0 = time.time()
-    model.fit(gps_df, trips_df)
+    model.fit(gps_df, trips_df, checkpoint_dir=CHECKPOINT_DIR / "fit_steps")
     t_fit = time.time() - t0
     print(f"  fit() completed in {t_fit:.1f}s")
 
