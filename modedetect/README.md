@@ -362,18 +362,18 @@ The `.zip` artifact stores everything needed for the classifier itself. However,
 
 ### Path privacy
 
-Local file paths (GTFS directory, OSM directory) are **automatically stripped** from the saved artifact so the `.zip` is safe to share. When loading a model, paths are restored from a per-machine config file at `~/.modedetect.json`.
+Local file paths (GTFS directory, OSM directory) are **automatically stripped** from the saved artifact, so the `.zip` is safe to share. The model loads with `None` paths.
 
-Create this file on each machine where you use the package:
+If you need transit features at prediction time, set the paths on the loaded model before calling `predict()`:
 
-```json
-{
-    "gtfs_dir": "/path/to/your/gtfs",
-    "osm_routes_dir": "/path/to/your/osm_routes"
-}
+```python
+model = ModeDetector.load("model.zip")
+model.config.gtfs_dir = Path("data/gtfs/")
+model.config.osm_routes_dir = Path("data/osm_routes/")
+predictions = model.predict(new_gps_df)
 ```
 
-This file lives in your home directory, is not part of the repository, and is never included in the model artifact. Each machine can have different paths.
+If you don't set them, the model still works — it just predicts using motion features only.
 
 ## Error handling
 

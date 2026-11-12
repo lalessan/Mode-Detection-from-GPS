@@ -11,6 +11,7 @@ Requires:
   - trips_dataset.csv
 """
 
+import os
 import re
 import sys
 import time
@@ -18,28 +19,24 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+from dotenv import load_dotenv
 from sklearn.metrics import classification_report, confusion_matrix, f1_score
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import LabelEncoder
 from xgboost import XGBClassifier
 
 # ─────────────────────────────────────────────────────────────────────
-# CONFIGURATION — Update these paths to match your server layout
+# CONFIGURATION — loaded from .env file (see .env.example)
 # ─────────────────────────────────────────────────────────────────────
 
-# Checkpoint directory for intermediate results
+load_dotenv()
+
 CHECKPOINT_DIR = Path("checkpoints/")
-
-# Pre-generated feature sets from the original pipeline
-DATA_FEATURES = Path("DATA_Feature_sets/")
-
-# Raw data
-GPS_DIR = Path("/home/lauale/netmob2025/data/gps_dataset/")
-TRIPS_PATH = Path("/home/lauale/netmob2025/data/trips_dataset.csv")
-
-# GTFS and OSM
-GTFS_DIR = Path("/home/lauale/ModeDetection/gtfs/")
-OSM_ROUTES_DIR = Path("/home/lauale/ModeDetection/osm_routes/")
+DATA_FEATURES = Path(os.environ.get("DATA_FEATURES_DIR", "DATA_Feature_sets/"))
+GPS_DIR = Path(os.environ["GPS_DIR"])
+TRIPS_PATH = Path(os.environ["TRIPS_PATH"])
+GTFS_DIR = Path(os.environ["GTFS_DIR"]) if os.environ.get("GTFS_DIR") else None
+OSM_ROUTES_DIR = Path(os.environ["OSM_ROUTES_DIR"]) if os.environ.get("OSM_ROUTES_DIR") else None
 
 # ─────────────────────────────────────────────────────────────────────
 # ORIGINAL PIPELINE: Mode filtering and speed thresholds
@@ -385,8 +382,8 @@ def run_modedetect_pipeline(gps_df, trips_df):
         col_trip_key="KEY",
         col_speed_kmh="SPEED",
         col_main_mode="Main_Mode",
-        gtfs_dir=Path(GTFS_DIR) if GTFS_DIR else None,
-        osm_routes_dir=Path(OSM_ROUTES_DIR) if OSM_ROUTES_DIR else None,
+        gtfs_dir=GTFS_DIR,
+        osm_routes_dir=OSM_ROUTES_DIR,
         gap_offset_s=13.0,
         gap_threshold_s=300.0,
         min_trip_duration_s=180,
