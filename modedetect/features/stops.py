@@ -256,8 +256,13 @@ def compute_stop_features(
     trip_boundaries = np.where(trip_keys_arr[1:] != trip_keys_arr[:-1])[0] + 1
     raw_dt = (timestamps[1:] - timestamps[:-1]).astype("timedelta64[ns]").astype(np.float64) / 1e9
     dt_seconds[1:] = raw_dt
+    # Skip first point of each trip (no dt) AND last point (student uses range(1, len-1))
     dt_seconds[0] = np.nan
     dt_seconds[trip_boundaries] = np.nan
+    # Last point of each trip = index before each boundary, plus the very last index
+    trip_last_points = trip_boundaries - 1
+    dt_seconds[trip_last_points] = np.nan
+    dt_seconds[n_points - 1] = np.nan
 
     # ── BallTree query (or load from cache) ──────────────────────────────
     cache_path = Path(point_cache_path) if point_cache_path is not None else None
