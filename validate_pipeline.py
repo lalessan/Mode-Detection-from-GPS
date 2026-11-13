@@ -745,6 +745,185 @@ def level3_compare_confusion(merged_orig, orig_clf, orig_feature_cols,
 
 
 # ─────────────────────────────────────────────────────────────────────
+# LEVEL 4: Multi-modal evaluation
+# ─────────────────────────────────────────────────────────────────────
+
+MULTIMODAL_RESULT_DIR = Path("7_Multi_Modal_Classification")
+
+def _jaccard(pred_set: set, gt_set: set) -> float:
+    """Jaccard similarity between two mode sets."""
+    union = pred_set | gt_set
+    if not union:
+        return 1.0
+    return len(pred_set & gt_set) / len(union)
+
+
+def _jaccard_excl_walking(pred_set: set, gt_set: set) -> float:
+    """Jaccard similarity excluding WALKING from both sets."""
+    pred2 = pred_set - {"WALKING"}
+    gt2 = gt_set - {"WALKING"}
+    union = pred2 | gt2
+    if not union:
+        return 1.0
+    return len(pred2 & gt2) / len(union)
+
+
+def _build_gt_sets(trips_df: pd.DataFrame) -> pd.DataFrame:
+    """Build ground-truth mode sets from trips CSV (Mode_1..Mode_5 columns)."""
+    mode_cols = ["Main_Mode", "Mode_1", "Mode_2", "Mode_3", "Mode_4", "Mode_5"]
+    available = [c for c in mode_cols if c in trips_df.columns]
+
+    # Apply mode remap to all mode columns
+    df = trips_df.copy()
+    for c in available:
+        df[c] = df[c].replace(MODE_REMAP)
+
+    def build_set(row):
+        return {row[c] for c in available if pd.notna(row[c]) and row[c] not in MODE_DROP}
+
+    df["GT_SET"] = df.apply(build_set, axis=1)
+
+    # OOS flag: trips containing modes not in training set
+    oos_modes = {"PLANE", "OTHER"}
+    def check_oos(row):
+        all_modes = {row[c] for c in available if pd.notna(row[c])}
+        return bool(all_modes & oos_modes)
+    df["OOS"] = df.apply(check_oos, axis=1)
+
+    key_col = "KEY" if "KEY" in df.columns else "TRIP_KEY"
+    return df[[key_col, "GT_SET", "OOS"]].rename(columns={key_col: "TRIP_KEY"})
+
+
+def _load_student_results() -> dict[str, pd.DataFrame]:
+    """Load student's multi-modal result CSVs."""
+    results = {}
+    for name, fname in [
+        ("speed_only", "multi-modal-classification-RESULTS-SPEEDONLY.csv"),
+        ("speed_br", "multi-modal-classification-RESULTS-SPEED-BR.csv"),
+        ("route_signal", "multi-modal-classification-RESULTS-ROUTE-SIGNAL.csv"),
+        ("default", "multi-modal-classification-RESULTS.csv"),
+    ]:
+        path = MULTIMODAL_RESULT_DIR / fname
+        if path.exists():
+            results[name] = pd.read_csv(path, index_col=0)
+    return results
+
+
+def level4_multimodal(gps_df, trips_df, model_new):
+    """Multi-modal evaluation: segment trips, predict per segment, compare Jaccard."""
+    import ast
+
+    print()
+    print("=" * 60)
+    print("LEVEL 4: Multi-modal evaluation")
+    print("=" * 60)
+
+    # ── Load student's results ──
+    student_results = _load_student_results()
+    if student_results:
+        print(f"\n  Student result files: {list(student_results.keys())}")
+        for name, df in student_results.items():
+            non_oos = df[~df["OOS"]] if "OOS" in df.columns else df
+            mean_j = non_oos["JACCARD"].mean()
+            exact = (non_oos["JACCARD"] == 1.0).mean() * 100
+            print(f"    {name:>20}: mean Jaccard = {mean_j:.4f}, exact match = {exact:.1f}% ({len(non_oos)} trips)")
+    else:
+        print("  No student result CSVs found.")
+
+    # ── Build ground-truth mode sets ──
+    gt_df = _build_gt_sets(trips_df)
+
+    # Filter for multi-modal trips
+    multi_modal_col = None
+    for c in ["Multi_Modal", "MULTI_MODAL", "multi_modal"]:
+        if c in trips_df.columns:
+            multi_modal_col = c
+            break
+
+    if multi_modal_col:
+        key_col = "KEY" if "KEY" in trips_df.columns else "TRIP_KEY"
+        mm_keys = set(trips_df[trips_df[multi_modal_col] == True][key_col])
+        gt_df = gt_df[gt_df["TRIP_KEY"].isin(mm_keys)]
+        print(f"\n  Multi-modal trips (from {multi_modal_col}): {len(gt_df)}")
+    else:
+        # Fallback: multi-modal = GT_SET has more than 1 mode
+        gt_df = gt_df[gt_df["GT_SET"].apply(len) > 1]
+        print(f"\n  Multi-modal trips (GT_SET > 1 mode): {len(gt_df)}")
+
+    # Filter GPS to multi-modal trips only
+    gps_key = model_new.config.col_trip_key
+    if gps_key not in gps_df.columns and "KEY" in gps_df.columns:
+        gps_key = "KEY"
+
+    mm_gps = gps_df[gps_df[gps_key].isin(gt_df["TRIP_KEY"])].copy()
+    print(f"  GPS points for multi-modal trips: {len(mm_gps):,}")
+
+    if len(mm_gps) == 0:
+        print("  WARNING: No GPS data for multi-modal trips. Skipping.")
+        return
+
+    # ── Run modedetect segmented prediction ──
+    print("\n  Running modedetect segmented prediction...")
+    t0 = time.time()
+    try:
+        seg_preds = model_new.predict(mm_gps, segment=True)
+        print(f"  Segmented prediction done in {time.time() - t0:.1f}s")
+        print(f"  Segments: {len(seg_preds)}, trips: {seg_preds['trip_key'].nunique()}")
+    except Exception as e:
+        print(f"  ERROR in segmented prediction: {e}")
+        return
+
+    # ── Aggregate per-segment predictions to PRED_SET per trip ──
+    pred_sets = (
+        seg_preds.groupby("trip_key")["predicted_mode"]
+        .agg(lambda s: set(s.dropna()))
+        .reset_index(name="PRED_SET")
+        .rename(columns={"trip_key": "TRIP_KEY"})
+    )
+
+    # ── Merge with ground truth ──
+    merged = pred_sets.merge(gt_df, on="TRIP_KEY", how="inner")
+    non_oos = merged[~merged["OOS"]]
+    print(f"  Matched trips: {len(merged)} ({len(non_oos)} non-OOS)")
+
+    if len(non_oos) == 0:
+        print("  WARNING: No matched non-OOS trips. Skipping.")
+        return
+
+    # ── Compute Jaccard ──
+    non_oos = non_oos.copy()
+    non_oos["JACCARD"] = non_oos.apply(
+        lambda r: _jaccard(r["PRED_SET"], r["GT_SET"]), axis=1
+    )
+    non_oos["JACCARD_NO_WALK"] = non_oos.apply(
+        lambda r: _jaccard_excl_walking(r["PRED_SET"], r["GT_SET"]), axis=1
+    )
+
+    mean_j = non_oos["JACCARD"].mean()
+    median_j = non_oos["JACCARD"].median()
+    exact = (non_oos["JACCARD"] == 1.0).mean() * 100
+    mean_j_nw = non_oos["JACCARD_NO_WALK"].mean()
+
+    print(f"\n  --- modedetect Multi-Modal Results ---")
+    print(f"  Mean Jaccard:              {mean_j:.4f}")
+    print(f"  Median Jaccard:            {median_j:.4f}")
+    print(f"  Exact match (Jaccard=1):   {exact:.1f}%")
+    print(f"  Mean Jaccard (excl walk):  {mean_j_nw:.4f}")
+    print(f"  Trips evaluated:           {len(non_oos)}")
+
+    # ── Compare with student (best = route_signal) ──
+    if "route_signal" in student_results:
+        print(f"\n  --- Comparison with student (route_signal, best) ---")
+        st = student_results["route_signal"]
+        st_non_oos = st[~st["OOS"]] if "OOS" in st.columns else st
+        st_mean = st_non_oos["JACCARD"].mean()
+        st_exact = (st_non_oos["JACCARD"] == 1.0).mean() * 100
+        print(f"  Student:    mean Jaccard = {st_mean:.4f}, exact match = {st_exact:.1f}% ({len(st_non_oos)} trips)")
+        print(f"  modedetect: mean Jaccard = {mean_j:.4f}, exact match = {exact:.1f}% ({len(non_oos)} trips)")
+        print(f"  Difference: {mean_j - st_mean:+.4f}")
+
+
+# ─────────────────────────────────────────────────────────────────────
 # MAIN
 # ─────────────────────────────────────────────────────────────────────
 
@@ -847,6 +1026,9 @@ def main():
 
     # ── Level 3: Confusion matrices ──
     level3_compare_confusion(merged_orig, orig_clf, feature_cols, trip_key_col, mode_col)
+
+    # ── Level 4: Multi-modal evaluation ──
+    level4_multimodal(gps_df, trips_df, model_new)
 
     print()
     print("=" * 60)
