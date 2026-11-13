@@ -699,24 +699,29 @@ class ModeDetector:
         remaining = list(feature_cols)
         best_overall = None
 
+        # Use threads for parallel candidate evaluation within each step.
+        # XGBoost releases the GIL during C++ training, so threads work well.
+        # Each XGBoost uses 1 thread; we run n_parallel candidates concurrently.
+        n_parallel = min(cfg.n_jobs if cfg.n_jobs > 0 else (os.cpu_count() or 1), 15)
+        # Force XGBoost to use 1 thread per model so threads don't fight
+        xgb_single = {**xgb_kwargs, "n_jobs": 1}
+
+        def _eval_candidate(candidate):
+            cols = selected + [candidate]
+            clf = XGBClassifier(**xgb_single)
+            fit_kw = {"sample_weight": sw_train} if sw_train is not None else {}
+            clf.fit(X_train[cols], y_train, **fit_kw)
+            y_pred = clf.predict(X_test[cols])
+            return candidate, f1_score(y_test, y_pred, average="macro")
+
         for step in range(len(feature_cols)):
-            best_feature = None
-            best_score = None
+            if n_parallel > 1 and len(remaining) > 1:
+                with _cf.ThreadPoolExecutor(max_workers=n_parallel) as pool:
+                    results = list(pool.map(_eval_candidate, remaining))
+            else:
+                results = [_eval_candidate(c) for c in remaining]
 
-            for candidate in remaining:
-                cols = selected + [candidate]
-                clf = XGBClassifier(**xgb_kwargs)
-                fit_kw = {"sample_weight": sw_train} if sw_train is not None else {}
-                clf.fit(X_train[cols], y_train, **fit_kw)
-                y_pred = clf.predict(X_test[cols])
-                score = f1_score(y_test, y_pred, average="macro")
-
-                if best_score is None or score > best_score:
-                    best_score = score
-                    best_feature = candidate
-
-            if best_feature is None:
-                break
+            best_feature, best_score = max(results, key=lambda x: x[1])
 
             if best_overall is not None and best_score <= best_overall:
                 logger.info(
@@ -729,8 +734,8 @@ class ModeDetector:
             remaining.remove(best_feature)
             best_overall = best_score
             logger.info(
-                "Step %d: +%s → macro F1 = %.4f (%d features)",
-                step + 1, best_feature, best_overall, len(selected),
+                "Step %d: +%s → macro F1 = %.4f (%d features, %d remaining)",
+                step + 1, best_feature, best_overall, len(selected), len(remaining),
             )
 
             if not remaining:
