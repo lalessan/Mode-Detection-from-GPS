@@ -810,30 +810,36 @@ def _load_student_results() -> dict[str, pd.DataFrame]:
 
 
 def level4_multimodal(gps_df, trips_df, model_new):
-    """Multi-modal evaluation: segment trips, predict per segment, compare Jaccard."""
-    import ast
+    """Honest multi-modal evaluation: run segmentation on ALL trips blindly.
 
+    Unlike the student's evaluation (which pre-filtered to multi-modal trips),
+    this runs PELT on every trip — because in deployment you don't know which
+    trips are multi-modal. This measures:
+    - Single-modal trips: false segmentation rate + per-trip accuracy
+    - Multi-modal trips: Jaccard on mode sets
+    - Combined metric across all trips
+    """
     print()
     print("=" * 60)
-    print("LEVEL 4: Multi-modal evaluation")
+    print("LEVEL 4: Multi-modal evaluation (honest — all trips)")
     print("=" * 60)
 
-    # ── Load student's results ──
+    # ── Load student's results (for reference) ──
     student_results = _load_student_results()
     if student_results:
-        print(f"\n  Student result files: {list(student_results.keys())}")
+        print(f"\n  Student result files (multi-modal only): {list(student_results.keys())}")
         for name, df in student_results.items():
             non_oos = df[df["OOS"].astype(str).str.lower() != "true"] if "OOS" in df.columns else df
             mean_j = non_oos["JACCARD"].mean()
             exact = (non_oos["JACCARD"] == 1.0).mean() * 100
             print(f"    {name:>20}: mean Jaccard = {mean_j:.4f}, exact match = {exact:.1f}% ({len(non_oos)} trips)")
-    else:
-        print("  No student result CSVs found.")
+        print("  (Note: student evaluated only pre-filtered multi-modal trips)")
 
-    # ── Build ground-truth mode sets ──
+    # ── Build ground-truth mode sets for ALL trips ──
     gt_df = _build_gt_sets(trips_df)
 
-    # Filter for multi-modal trips
+    # Identify multi-modal vs single-modal
+    key_col_trips = "KEY" if "KEY" in trips_df.columns else "TRIP_KEY"
     multi_modal_col = None
     for c in ["Multi_Modal", "MULTI_MODAL", "multi_modal"]:
         if c in trips_df.columns:
@@ -841,86 +847,119 @@ def level4_multimodal(gps_df, trips_df, model_new):
             break
 
     if multi_modal_col:
-        key_col = "KEY" if "KEY" in trips_df.columns else "TRIP_KEY"
-        mm_keys = set(trips_df[trips_df[multi_modal_col] == True][key_col])
-        gt_df = gt_df[gt_df["TRIP_KEY"].isin(mm_keys)]
-        print(f"\n  Multi-modal trips (from {multi_modal_col}): {len(gt_df)}")
+        mm_keys = set(trips_df[trips_df[multi_modal_col] == True][key_col_trips])
     else:
-        # Fallback: multi-modal = GT_SET has more than 1 mode
-        gt_df = gt_df[gt_df["GT_SET"].apply(len) > 1]
-        print(f"\n  Multi-modal trips (GT_SET > 1 mode): {len(gt_df)}")
+        mm_keys = set(gt_df[gt_df["GT_SET"].apply(len) > 1]["TRIP_KEY"])
 
-    # Filter GPS to multi-modal trips only
+    gt_df["IS_MULTIMODAL"] = gt_df["TRIP_KEY"].isin(mm_keys)
+    n_mm = gt_df["IS_MULTIMODAL"].sum()
+    n_sm = (~gt_df["IS_MULTIMODAL"]).sum()
+    print(f"\n  All labelled trips: {len(gt_df)} ({n_sm} single-modal, {n_mm} multi-modal)")
+
+    # ── Filter GPS to all labelled trips ──
     gps_key = model_new.config.col_trip_key
     if gps_key not in gps_df.columns and "KEY" in gps_df.columns:
         gps_key = "KEY"
 
-    mm_gps = gps_df[gps_df[gps_key].isin(gt_df["TRIP_KEY"])].copy()
-    print(f"  GPS points for multi-modal trips: {len(mm_gps):,}")
+    labelled_keys = set(gt_df["TRIP_KEY"])
+    eval_gps = gps_df[gps_df[gps_key].isin(labelled_keys)].copy()
+    n_trips_in_gps = eval_gps[gps_key].nunique()
+    print(f"  GPS points: {len(eval_gps):,} ({n_trips_in_gps} trips with GPS data)")
 
-    if len(mm_gps) == 0:
-        print("  WARNING: No GPS data for multi-modal trips. Skipping.")
+    if len(eval_gps) == 0:
+        print("  WARNING: No GPS data for labelled trips. Skipping.")
         return
 
-    # ── Run modedetect segmented prediction ──
-    print("\n  Running modedetect segmented prediction...")
-    t0 = time.time()
-    try:
-        seg_preds = model_new.predict(mm_gps, segment=True)
-        print(f"  Segmented prediction done in {time.time() - t0:.1f}s")
-        print(f"  Segments: {len(seg_preds)}, trips: {seg_preds['trip_key'].nunique()}")
-    except Exception as e:
-        print(f"  ERROR in segmented prediction: {e}")
-        return
+    # ── Run segmented prediction on ALL trips (with checkpoint) ──
+    seg_ckpt = CHECKPOINT_DIR / "seg_preds_all.parquet"
+    if seg_ckpt.exists():
+        print(f"\n  Loading segmented predictions from checkpoint: {seg_ckpt}")
+        seg_preds = pd.read_parquet(seg_ckpt)
+    else:
+        print(f"\n  Running PELT segmentation + prediction on ALL {n_trips_in_gps} trips...")
+        print("  (This will take a while — checkpoint saved for reuse)")
+        t0 = time.time()
+        try:
+            seg_preds = model_new.predict(eval_gps, segment=True)
+            elapsed = time.time() - t0
+            print(f"  Done in {elapsed:.1f}s ({elapsed/60:.1f} min)")
+            seg_preds.to_parquet(seg_ckpt, index=False)
+            print(f"  Saved checkpoint: {seg_ckpt}")
+        except Exception as e:
+            print(f"  ERROR in segmented prediction: {e}")
+            import traceback; traceback.print_exc()
+            return
 
-    # ── Aggregate per-segment predictions to PRED_SET per trip ──
-    pred_sets = (
-        seg_preds.groupby("trip_key")["predicted_mode"]
-        .agg(lambda s: set(s.dropna()))
-        .reset_index(name="PRED_SET")
-        .rename(columns={"trip_key": "TRIP_KEY"})
-    )
+    print(f"  Segments: {len(seg_preds)}, trips: {seg_preds['trip_key'].nunique()}")
+
+    # ── Aggregate: per-trip PRED_SET and segment count ──
+    trip_agg = seg_preds.groupby("trip_key").agg(
+        PRED_SET=("predicted_mode", lambda s: set(s.dropna())),
+        n_segments=("segment", "nunique"),
+    ).reset_index().rename(columns={"trip_key": "TRIP_KEY"})
 
     # ── Merge with ground truth ──
-    merged = pred_sets.merge(gt_df, on="TRIP_KEY", how="inner")
-    non_oos = merged[~merged["OOS"]]
+    merged = trip_agg.merge(gt_df, on="TRIP_KEY", how="inner")
+    non_oos = merged[~merged["OOS"]].copy()
     print(f"  Matched trips: {len(merged)} ({len(non_oos)} non-OOS)")
 
-    if len(non_oos) == 0:
-        print("  WARNING: No matched non-OOS trips. Skipping.")
-        return
+    # ── Split into single-modal and multi-modal ──
+    sm = non_oos[~non_oos["IS_MULTIMODAL"]].copy()
+    mm = non_oos[non_oos["IS_MULTIMODAL"]].copy()
+    print(f"  Single-modal: {len(sm)}, Multi-modal: {len(mm)}")
 
-    # ── Compute Jaccard ──
-    non_oos = non_oos.copy()
+    # ── Compute Jaccard for all trips ──
     non_oos["JACCARD"] = non_oos.apply(
         lambda r: _jaccard(r["PRED_SET"], r["GT_SET"]), axis=1
     )
-    non_oos["JACCARD_NO_WALK"] = non_oos.apply(
-        lambda r: _jaccard_excl_walking(r["PRED_SET"], r["GT_SET"]), axis=1
-    )
+    sm["JACCARD"] = sm.apply(lambda r: _jaccard(r["PRED_SET"], r["GT_SET"]), axis=1)
+    mm["JACCARD"] = mm.apply(lambda r: _jaccard(r["PRED_SET"], r["GT_SET"]), axis=1)
 
-    mean_j = non_oos["JACCARD"].mean()
-    median_j = non_oos["JACCARD"].median()
-    exact = (non_oos["JACCARD"] == 1.0).mean() * 100
-    mean_j_nw = non_oos["JACCARD_NO_WALK"].mean()
+    # ── Single-modal analysis ──
+    print(f"\n  --- Single-Modal Trips ({len(sm)}) ---")
+    sm_correct_mode = sm.apply(
+        lambda r: r["PRED_SET"] == r["GT_SET"], axis=1
+    ).mean() * 100
+    sm_falsely_segmented = (sm["n_segments"] > 1).mean() * 100
+    sm_mean_j = sm["JACCARD"].mean()
+    sm_exact = (sm["JACCARD"] == 1.0).mean() * 100
 
-    print(f"\n  --- modedetect Multi-Modal Results ---")
-    print(f"  Mean Jaccard:              {mean_j:.4f}")
-    print(f"  Median Jaccard:            {median_j:.4f}")
-    print(f"  Exact match (Jaccard=1):   {exact:.1f}%")
-    print(f"  Mean Jaccard (excl walk):  {mean_j_nw:.4f}")
-    print(f"  Trips evaluated:           {len(non_oos)}")
+    print(f"  Correct mode set (Jaccard=1):  {sm_exact:.1f}%")
+    print(f"  Mean Jaccard:                  {sm_mean_j:.4f}")
+    print(f"  Falsely segmented (>1 seg):    {sm_falsely_segmented:.1f}%")
+    print(f"  Avg segments per trip:         {sm['n_segments'].mean():.2f}")
 
-    # ── Compare with student (best = route_signal) ──
+    # ── Multi-modal analysis ──
+    print(f"\n  --- Multi-Modal Trips ({len(mm)}) ---")
+    mm_mean_j = mm["JACCARD"].mean()
+    mm_median_j = mm["JACCARD"].median()
+    mm_exact = (mm["JACCARD"] == 1.0).mean() * 100
+    mm_avg_seg = mm["n_segments"].mean()
+
+    print(f"  Mean Jaccard:                  {mm_mean_j:.4f}")
+    print(f"  Median Jaccard:                {mm_median_j:.4f}")
+    print(f"  Exact match (Jaccard=1):       {mm_exact:.1f}%")
+    print(f"  Avg segments per trip:         {mm_avg_seg:.2f}")
+
+    # ── Combined (all trips) ──
+    all_mean_j = non_oos["JACCARD"].mean()
+    all_exact = (non_oos["JACCARD"] == 1.0).mean() * 100
+
+    print(f"\n  --- Combined (All {len(non_oos)} Trips) ---")
+    print(f"  Mean Jaccard:                  {all_mean_j:.4f}")
+    print(f"  Exact match (Jaccard=1):       {all_exact:.1f}%")
+
+    # ── Compare with student ──
     if "route_signal" in student_results:
-        print(f"\n  --- Comparison with student (route_signal, best) ---")
+        print(f"\n  --- Comparison with student (route_signal) ---")
         st = student_results["route_signal"]
-        st_non_oos = st[~st["OOS"]] if "OOS" in st.columns else st
+        st_non_oos = st[st["OOS"].astype(str).str.lower() != "true"] if "OOS" in st.columns else st
         st_mean = st_non_oos["JACCARD"].mean()
         st_exact = (st_non_oos["JACCARD"] == 1.0).mean() * 100
-        print(f"  Student:    mean Jaccard = {st_mean:.4f}, exact match = {st_exact:.1f}% ({len(st_non_oos)} trips)")
-        print(f"  modedetect: mean Jaccard = {mean_j:.4f}, exact match = {exact:.1f}% ({len(non_oos)} trips)")
-        print(f"  Difference: {mean_j - st_mean:+.4f}")
+        print(f"  Student (MM only):  mean Jaccard = {st_mean:.4f}, exact = {st_exact:.1f}% ({len(st_non_oos)} trips)")
+        print(f"  Ours (MM only):     mean Jaccard = {mm_mean_j:.4f}, exact = {mm_exact:.1f}% ({len(mm)} trips)")
+        print(f"  Ours (ALL trips):   mean Jaccard = {all_mean_j:.4f}, exact = {all_exact:.1f}% ({len(non_oos)} trips)")
+        print(f"  Note: Student pre-filtered to multi-modal trips only.")
 
 
 # ─────────────────────────────────────────────────────────────────────
