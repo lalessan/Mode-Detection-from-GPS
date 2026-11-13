@@ -397,7 +397,7 @@ def run_modedetect_pipeline(gps_df, trips_df):
         route_search_radius_m=20,
         route_densify_spacing_m=10,
         n_folds=5,
-        n_jobs=8,
+        n_jobs=15,
         random_state=0,
     )
 
@@ -872,8 +872,8 @@ def level4_multimodal(gps_df, trips_df, model_new):
         return
 
     # ── Run segmented prediction on ALL trips (with checkpoint) ──
-    # Override n_jobs for parallel segmentation
-    n_jobs = max(8, os.cpu_count() or 1)
+    # Override n_jobs for parallel segmentation (cap at 15 to avoid memory blow-up)
+    n_jobs = min(15, os.cpu_count() or 1)
     model_new.config.n_jobs = n_jobs
 
     seg_ckpt = CHECKPOINT_DIR / "seg_preds_all.parquet"
@@ -914,46 +914,43 @@ def level4_multimodal(gps_df, trips_df, model_new):
     mm = non_oos[non_oos["IS_MULTIMODAL"]].copy()
     print(f"  Single-modal: {len(sm)}, Multi-modal: {len(mm)}")
 
-    # ── Compute Jaccard for all trips ──
-    non_oos["JACCARD"] = non_oos.apply(
-        lambda r: _jaccard(r["PRED_SET"], r["GT_SET"]), axis=1
-    )
-    sm["JACCARD"] = sm.apply(lambda r: _jaccard(r["PRED_SET"], r["GT_SET"]), axis=1)
-    mm["JACCARD"] = mm.apply(lambda r: _jaccard(r["PRED_SET"], r["GT_SET"]), axis=1)
+    # ── Compute Jaccard (strict and excl-walking) for all trips ──
+    # Strict: all modes count. Excl-walking: ignore WALKING in both pred and GT.
+    # Rationale: labels often omit walking access/egress legs (e.g. a walk→bus→walk
+    # trip is labeled "BUS"), so predicting WALKING shouldn't be penalised.
+    for subset, label in [(non_oos, "non_oos"), (sm, "sm"), (mm, "mm")]:
+        subset["JACCARD"] = subset.apply(
+            lambda r: _jaccard(r["PRED_SET"], r["GT_SET"]), axis=1
+        )
+        subset["JACCARD_NO_WALK"] = subset.apply(
+            lambda r: _jaccard_excl_walking(r["PRED_SET"], r["GT_SET"]), axis=1
+        )
 
     # ── Single-modal analysis ──
     print(f"\n  --- Single-Modal Trips ({len(sm)}) ---")
-    sm_correct_mode = sm.apply(
-        lambda r: r["PRED_SET"] == r["GT_SET"], axis=1
-    ).mean() * 100
     sm_falsely_segmented = (sm["n_segments"] > 1).mean() * 100
-    sm_mean_j = sm["JACCARD"].mean()
-    sm_exact = (sm["JACCARD"] == 1.0).mean() * 100
 
-    print(f"  Correct mode set (Jaccard=1):  {sm_exact:.1f}%")
-    print(f"  Mean Jaccard:                  {sm_mean_j:.4f}")
+    print(f"  Mean Jaccard (strict):         {sm['JACCARD'].mean():.4f}")
+    print(f"  Mean Jaccard (excl walking):   {sm['JACCARD_NO_WALK'].mean():.4f}")
+    print(f"  Exact match (strict):          {(sm['JACCARD'] == 1.0).mean() * 100:.1f}%")
+    print(f"  Exact match (excl walking):    {(sm['JACCARD_NO_WALK'] == 1.0).mean() * 100:.1f}%")
     print(f"  Falsely segmented (>1 seg):    {sm_falsely_segmented:.1f}%")
     print(f"  Avg segments per trip:         {sm['n_segments'].mean():.2f}")
 
     # ── Multi-modal analysis ──
     print(f"\n  --- Multi-Modal Trips ({len(mm)}) ---")
-    mm_mean_j = mm["JACCARD"].mean()
-    mm_median_j = mm["JACCARD"].median()
-    mm_exact = (mm["JACCARD"] == 1.0).mean() * 100
-    mm_avg_seg = mm["n_segments"].mean()
-
-    print(f"  Mean Jaccard:                  {mm_mean_j:.4f}")
-    print(f"  Median Jaccard:                {mm_median_j:.4f}")
-    print(f"  Exact match (Jaccard=1):       {mm_exact:.1f}%")
-    print(f"  Avg segments per trip:         {mm_avg_seg:.2f}")
+    print(f"  Mean Jaccard (strict):         {mm['JACCARD'].mean():.4f}")
+    print(f"  Mean Jaccard (excl walking):   {mm['JACCARD_NO_WALK'].mean():.4f}")
+    print(f"  Exact match (strict):          {(mm['JACCARD'] == 1.0).mean() * 100:.1f}%")
+    print(f"  Exact match (excl walking):    {(mm['JACCARD_NO_WALK'] == 1.0).mean() * 100:.1f}%")
+    print(f"  Avg segments per trip:         {mm['n_segments'].mean():.2f}")
 
     # ── Combined (all trips) ──
-    all_mean_j = non_oos["JACCARD"].mean()
-    all_exact = (non_oos["JACCARD"] == 1.0).mean() * 100
-
     print(f"\n  --- Combined (All {len(non_oos)} Trips) ---")
-    print(f"  Mean Jaccard:                  {all_mean_j:.4f}")
-    print(f"  Exact match (Jaccard=1):       {all_exact:.1f}%")
+    print(f"  Mean Jaccard (strict):         {non_oos['JACCARD'].mean():.4f}")
+    print(f"  Mean Jaccard (excl walking):   {non_oos['JACCARD_NO_WALK'].mean():.4f}")
+    print(f"  Exact match (strict):          {(non_oos['JACCARD'] == 1.0).mean() * 100:.1f}%")
+    print(f"  Exact match (excl walking):    {(non_oos['JACCARD_NO_WALK'] == 1.0).mean() * 100:.1f}%")
 
     # ── Compare with student ──
     if "route_signal" in student_results:
@@ -963,8 +960,9 @@ def level4_multimodal(gps_df, trips_df, model_new):
         st_mean = st_non_oos["JACCARD"].mean()
         st_exact = (st_non_oos["JACCARD"] == 1.0).mean() * 100
         print(f"  Student (MM only):  mean Jaccard = {st_mean:.4f}, exact = {st_exact:.1f}% ({len(st_non_oos)} trips)")
-        print(f"  Ours (MM only):     mean Jaccard = {mm_mean_j:.4f}, exact = {mm_exact:.1f}% ({len(mm)} trips)")
-        print(f"  Ours (ALL trips):   mean Jaccard = {all_mean_j:.4f}, exact = {all_exact:.1f}% ({len(non_oos)} trips)")
+        print(f"  Ours (MM only, strict):       Jaccard = {mm['JACCARD'].mean():.4f}, exact = {(mm['JACCARD'] == 1.0).mean() * 100:.1f}% ({len(mm)} trips)")
+        print(f"  Ours (MM only, excl walk):    Jaccard = {mm['JACCARD_NO_WALK'].mean():.4f}, exact = {(mm['JACCARD_NO_WALK'] == 1.0).mean() * 100:.1f}%")
+        print(f"  Ours (ALL, excl walk):        Jaccard = {non_oos['JACCARD_NO_WALK'].mean():.4f}, exact = {(non_oos['JACCARD_NO_WALK'] == 1.0).mean() * 100:.1f}% ({len(non_oos)} trips)")
         print(f"  Note: Student pre-filtered to multi-modal trips only.")
 
 
