@@ -823,7 +823,7 @@ def level4_multimodal(gps_df, trips_df, model_new):
     if student_results:
         print(f"\n  Student result files: {list(student_results.keys())}")
         for name, df in student_results.items():
-            non_oos = df[~df["OOS"]] if "OOS" in df.columns else df
+            non_oos = df[df["OOS"].astype(str).str.lower() != "true"] if "OOS" in df.columns else df
             mean_j = non_oos["JACCARD"].mean()
             exact = (non_oos["JACCARD"] == 1.0).mean() * 100
             print(f"    {name:>20}: mean Jaccard = {mean_j:.4f}, exact match = {exact:.1f}% ({len(non_oos)} trips)")
