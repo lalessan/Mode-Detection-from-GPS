@@ -14,8 +14,6 @@ from typing import TYPE_CHECKING
 import numpy as np
 import pandas as pd
 
-from .._geo import haversine_m
-
 if TYPE_CHECKING:
     from ..config import ModeDetectConfig
 
@@ -66,15 +64,12 @@ def compute_trip_statistics(
         if pd.isna(trip_key):
             continue
 
-        total_dist = _safe_sum(grp.get("dist_bp_wgs84"))
-        total_time = _total_time(grp[config.col_timestamp])
-
         row = {
             "trip_key": trip_key,
-            "TOTAL_TIME": total_time,
+            "TOTAL_TIME": _total_time(grp[config.col_timestamp]),
             "AVG_PT_DIST_WGS84": _safe_mean(grp.get("dist_bp_wgs84")),
             "MED_PT_DIST_WGS84": _safe_median(grp.get("dist_bp_wgs84")),
-            "DIST_TOTAL_WGS84": total_dist,
+            "DIST_TOTAL_WGS84": _safe_sum(grp.get("dist_bp_wgs84")),
             "GPS_POINTS": len(grp),
         }
 
@@ -86,43 +81,6 @@ def compute_trip_statistics(
             row[f"{prefix}_AVG"] = _safe_mean(series)
             row[f"{prefix}_MED"] = _safe_median(series)
             row[f"{prefix}_STD"] = _safe_std(series)
-
-        # ── Straightness index: direct distance / total distance ──
-        # Low for walking (meandering), high for car/train (direct routes)
-        lat = grp[config.col_latitude].astype("float64")
-        lon = grp[config.col_longitude].astype("float64")
-        if len(grp) >= 2 and total_dist and total_dist > 0:
-            direct_dist = haversine_m(
-                np.array([lat.iloc[0]]), np.array([lon.iloc[0]]),
-                np.array([lat.iloc[-1]]), np.array([lon.iloc[-1]]),
-            )[0]
-            row["STRAIGHTNESS"] = direct_dist / total_dist if np.isfinite(direct_dist) else np.nan
-        else:
-            row["STRAIGHTNESS"] = np.nan
-
-        # ── GPS signal quality features ──
-        # Helps identify subway (GPS dropouts underground) vs walking
-        ts = pd.to_datetime(grp[config.col_timestamp])
-        if len(ts) >= 2:
-            dt_arr = ts.diff().dt.total_seconds().iloc[1:].values
-            dt_valid = dt_arr[np.isfinite(dt_arr)]
-            if len(dt_valid) > 0:
-                median_dt = np.median(dt_valid)
-                # Gaps: intervals much larger than the median sampling rate
-                gap_threshold = max(median_dt * 3, 30.0)  # at least 30s
-                gaps = dt_valid[dt_valid > gap_threshold]
-                row["GAP_COUNT"] = len(gaps)
-                row["GAP_FRAC"] = len(gaps) / len(dt_valid)
-                row["GAP_DURATION_MEAN"] = float(np.mean(gaps)) if len(gaps) > 0 else 0.0
-                row["GAP_DURATION_TOTAL"] = float(np.sum(gaps)) if len(gaps) > 0 else 0.0
-                row["DT_STD"] = float(np.std(dt_valid))
-                row["SPEED_MAX"] = float(grp["speed_ms"].max()) if "speed_ms" in grp.columns else np.nan
-            else:
-                row.update({"GAP_COUNT": 0, "GAP_FRAC": 0.0, "GAP_DURATION_MEAN": 0.0,
-                            "GAP_DURATION_TOTAL": 0.0, "DT_STD": np.nan, "SPEED_MAX": np.nan})
-        else:
-            row.update({"GAP_COUNT": 0, "GAP_FRAC": 0.0, "GAP_DURATION_MEAN": 0.0,
-                        "GAP_DURATION_TOTAL": 0.0, "DT_STD": np.nan, "SPEED_MAX": np.nan})
 
         rows.append(row)
 
