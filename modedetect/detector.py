@@ -630,6 +630,19 @@ class ModeDetector:
         self._feature_list = feature_cols
         X = merged[feature_cols].values
 
+        # ── Compute sample weights for class balancing ─────────────────
+        sample_weights = None
+        if cfg.class_weight == "balanced":
+            from sklearn.utils.class_weight import compute_sample_weight
+            sample_weights = compute_sample_weight("balanced", y)
+            logger.info("Using balanced class weights (inverse frequency)")
+
+        # ── Hyperparameter tuning (optional) ───────────────────────────
+        if cfg.hyperparam_tuning:
+            tuned = self._tune_hyperparams(X, y, xgb_kwargs, sample_weights, cfg)
+            xgb_kwargs.update(tuned)
+            logger.info("Tuned XGBoost params: %s", tuned)
+
         # ── Stratified K-fold training ────────────────────────────────
         skf = StratifiedKFold(n_splits=cfg.n_folds, shuffle=True, random_state=cfg.random_state)
         best_f1 = -1.0
@@ -637,7 +650,10 @@ class ModeDetector:
 
         for fold, (train_idx, val_idx) in enumerate(skf.split(X, y)):
             clf = XGBClassifier(**xgb_kwargs)
-            clf.fit(X[train_idx], y[train_idx])
+            fit_kwargs = {}
+            if sample_weights is not None:
+                fit_kwargs["sample_weight"] = sample_weights[train_idx]
+            clf.fit(X[train_idx], y[train_idx], **fit_kwargs)
 
             y_pred = clf.predict(X[val_idx])
             f1 = f1_score(y[val_idx], y_pred, average="macro")
@@ -668,9 +684,16 @@ class ModeDetector:
         from sklearn.model_selection import train_test_split
 
         X_all = merged[feature_cols]
-        X_train, X_test, y_train, y_test = train_test_split(
-            X_all, y, test_size=cfg.test_size, stratify=y, random_state=cfg.random_state,
+        indices = np.arange(len(y))
+        X_train, X_test, y_train, y_test, idx_train, _idx_test = train_test_split(
+            X_all, y, indices, test_size=cfg.test_size, stratify=y, random_state=cfg.random_state,
         )
+
+        # Compute sample weights for feature selection too
+        sw_train = None
+        if cfg.class_weight == "balanced":
+            from sklearn.utils.class_weight import compute_sample_weight
+            sw_train = compute_sample_weight("balanced", y_train)
 
         selected = []
         remaining = list(feature_cols)
@@ -683,7 +706,8 @@ class ModeDetector:
             for candidate in remaining:
                 cols = selected + [candidate]
                 clf = XGBClassifier(**xgb_kwargs)
-                clf.fit(X_train[cols], y_train)
+                fit_kw = {"sample_weight": sw_train} if sw_train is not None else {}
+                clf.fit(X_train[cols], y_train, **fit_kw)
                 y_pred = clf.predict(X_test[cols])
                 score = f1_score(y_test, y_pred, average="macro")
 
@@ -713,6 +737,63 @@ class ModeDetector:
                 break
 
         return selected
+
+    def _tune_hyperparams(
+        self,
+        X: np.ndarray,
+        y: np.ndarray,
+        base_kwargs: dict,
+        sample_weights: np.ndarray | None,
+        cfg: ModeDetectConfig,
+    ) -> dict:
+        """Random search over XGBoost hyperparameters using 3-fold CV."""
+        from sklearn.metrics import f1_score
+        from sklearn.model_selection import StratifiedKFold as SKF
+
+        rng = np.random.RandomState(cfg.random_state)
+
+        param_space = {
+            "n_estimators": [100, 200, 300, 500],
+            "max_depth": [3, 4, 5, 6, 8, 10],
+            "learning_rate": [0.01, 0.05, 0.1, 0.2, 0.3],
+            "subsample": [0.7, 0.8, 0.9, 1.0],
+            "colsample_bytree": [0.6, 0.7, 0.8, 0.9, 1.0],
+            "min_child_weight": [1, 3, 5, 10],
+            "gamma": [0, 0.1, 0.5, 1.0],
+        }
+
+        skf = SKF(n_splits=3, shuffle=True, random_state=cfg.random_state)
+        best_score = -1.0
+        best_params = {}
+
+        for i in range(cfg.tuning_n_iter):
+            candidate = {k: rng.choice(v) for k, v in param_space.items()}
+
+            trial_kwargs = {**base_kwargs, **candidate}
+            scores = []
+            for train_idx, val_idx in skf.split(X, y):
+                clf = XGBClassifier(**trial_kwargs)
+                fit_kw = {}
+                if sample_weights is not None:
+                    fit_kw["sample_weight"] = sample_weights[train_idx]
+                clf.fit(X[train_idx], y[train_idx], **fit_kw)
+                y_pred = clf.predict(X[val_idx])
+                scores.append(f1_score(y[val_idx], y_pred, average="macro"))
+
+            mean_f1 = np.mean(scores)
+            logger.info(
+                "Tuning %d/%d — F1=%.4f | n_est=%s depth=%s lr=%s",
+                i + 1, cfg.tuning_n_iter, mean_f1,
+                candidate["n_estimators"], candidate["max_depth"],
+                candidate["learning_rate"],
+            )
+
+            if mean_f1 > best_score:
+                best_score = mean_f1
+                best_params = candidate
+
+        logger.info("Best tuning score: %.4f with %s", best_score, best_params)
+        return best_params
 
     # ── Internal: feature merging ─────────────────────────────────────
 
