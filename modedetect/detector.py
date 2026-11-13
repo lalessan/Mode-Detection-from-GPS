@@ -25,6 +25,9 @@ from sklearn.model_selection import StratifiedKFold
 from sklearn.preprocessing import LabelEncoder
 from xgboost import XGBClassifier
 
+import concurrent.futures as _cf
+import pickle as _pickle
+
 from . import artifacts
 from .config import ModeDetectConfig
 from .features import routes as feat_routes
@@ -55,6 +58,45 @@ from .validation import (
 )
 
 logger = logging.getLogger(__name__)
+
+# ── Module-level helpers for parallel segmentation ────────────────
+
+_SEG_WORKER: dict = {}
+
+
+def _init_seg_worker(rbt_bytes: bytes, cfg_bytes: bytes) -> None:
+    """Initializer for segmentation worker processes."""
+    _SEG_WORKER["rbt"] = _pickle.loads(rbt_bytes)
+    _SEG_WORKER["cfg"] = _pickle.loads(cfg_bytes)
+
+
+def _segment_trip_chunk(gps_chunk: pd.DataFrame) -> pd.DataFrame:
+    """Segment all trips in a GPS chunk (runs in a worker process)."""
+    rbt = _SEG_WORKER["rbt"]
+    cfg = _SEG_WORKER["cfg"]
+
+    results = []
+    for trip_key, trip_df in gps_chunk.groupby(cfg.col_trip_key, sort=False):
+        trip_df = trip_df.sort_values(cfg.col_timestamp)
+
+        route_signals = {}
+        if rbt:
+            lat = trip_df[cfg.col_latitude].astype("float64").values
+            lon = trip_df[cfg.col_longitude].astype("float64").values
+            for mode_name, tree in rbt.items():
+                if mode_name in feat_routes.TRANSIT_MODES:
+                    route_signals[mode_name] = feat_routes.generate_route_signal(
+                        tree, lat, lon, cfg.route_search_radius_m,
+                    )
+
+        if route_signals:
+            breakpoints = feat_seg.segment_trip_signals(trip_df, route_signals, cfg)
+        else:
+            breakpoints = feat_seg.segment_trip_speed(trip_df, cfg)
+
+        results.append(feat_seg.assign_segments(trip_df, breakpoints))
+
+    return pd.concat(results, ignore_index=True) if results else pd.DataFrame()
 
 
 class ModeDetector:
@@ -463,31 +505,56 @@ class ModeDetector:
         # Load route resources for signal-based segmentation
         self._ensure_route_resources(cfg)
 
-        all_gps_segmented = []
-        for trip_key, trip_df in gps.groupby(cfg.col_trip_key, sort=False):
-            trip_df = trip_df.sort_values(cfg.col_timestamp)
+        n_jobs = cfg.n_jobs if cfg.n_jobs > 0 else (os.cpu_count() or 1)
 
-            # Generate route signals if available
-            route_signals = {}
-            if self._route_balltrees:
-                lat = trip_df[cfg.col_latitude].astype("float64").values
-                lon = trip_df[cfg.col_longitude].astype("float64").values
-                for mode_name, rbt in self._route_balltrees.items():
-                    if mode_name in feat_routes.TRANSIT_MODES:
-                        route_signals[mode_name] = feat_routes.generate_route_signal(
-                            rbt, lat, lon, cfg.route_search_radius_m,
-                        )
+        if n_jobs <= 1:
+            # Sequential (original path)
+            all_gps_segmented = []
+            for trip_key, trip_df in gps.groupby(cfg.col_trip_key, sort=False):
+                trip_df = trip_df.sort_values(cfg.col_timestamp)
+                route_signals = {}
+                if self._route_balltrees:
+                    lat = trip_df[cfg.col_latitude].astype("float64").values
+                    lon = trip_df[cfg.col_longitude].astype("float64").values
+                    for mode_name, rbt in self._route_balltrees.items():
+                        if mode_name in feat_routes.TRANSIT_MODES:
+                            route_signals[mode_name] = feat_routes.generate_route_signal(
+                                rbt, lat, lon, cfg.route_search_radius_m,
+                            )
+                if route_signals:
+                    breakpoints = feat_seg.segment_trip_signals(trip_df, route_signals, cfg)
+                else:
+                    breakpoints = feat_seg.segment_trip_speed(trip_df, cfg)
+                all_gps_segmented.append(feat_seg.assign_segments(trip_df, breakpoints))
+            gps_seg = pd.concat(all_gps_segmented, ignore_index=True)
+        else:
+            # Parallel segmentation via ProcessPoolExecutor
+            trip_keys = gps[cfg.col_trip_key].unique()
+            n_chunks = min(n_jobs, len(trip_keys))
+            key_chunks = np.array_split(trip_keys, n_chunks)
 
-            # Choose segmentation strategy
-            if route_signals:
-                breakpoints = feat_seg.segment_trip_signals(trip_df, route_signals, cfg)
-            else:
-                breakpoints = feat_seg.segment_trip_speed(trip_df, cfg)
+            # Build GPS chunks (each worker gets only its trips)
+            gps_chunks = []
+            trip_set_index = gps[cfg.col_trip_key]
+            for chunk_keys in key_chunks:
+                mask = trip_set_index.isin(set(chunk_keys))
+                gps_chunks.append(gps[mask])
 
-            segmented = feat_seg.assign_segments(trip_df, breakpoints)
-            all_gps_segmented.append(segmented)
+            rbt_bytes = _pickle.dumps(self._route_balltrees)
+            cfg_bytes = _pickle.dumps(cfg)
 
-        gps_seg = pd.concat(all_gps_segmented, ignore_index=True)
+            logger.info("Segmenting %d trips across %d workers...", len(trip_keys), n_chunks)
+
+            with _cf.ProcessPoolExecutor(
+                max_workers=n_chunks,
+                initializer=_init_seg_worker,
+                initargs=(rbt_bytes, cfg_bytes),
+            ) as pool:
+                results = list(pool.map(_segment_trip_chunk, gps_chunks))
+
+            gps_seg = pd.concat(
+                [r for r in results if len(r) > 0], ignore_index=True,
+            )
 
         # Extract features at segment level
         stats = compute_trip_statistics(gps_seg, cfg, segment_col="segment")

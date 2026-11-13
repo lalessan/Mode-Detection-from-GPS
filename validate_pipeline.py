@@ -397,6 +397,7 @@ def run_modedetect_pipeline(gps_df, trips_df):
         route_search_radius_m=20,
         route_densify_spacing_m=10,
         n_folds=5,
+        n_jobs=8,
         random_state=0,
     )
 
@@ -871,12 +872,17 @@ def level4_multimodal(gps_df, trips_df, model_new):
         return
 
     # ── Run segmented prediction on ALL trips (with checkpoint) ──
+    # Override n_jobs for parallel segmentation
+    n_jobs = max(8, os.cpu_count() or 1)
+    model_new.config.n_jobs = n_jobs
+
     seg_ckpt = CHECKPOINT_DIR / "seg_preds_all.parquet"
     if seg_ckpt.exists():
         print(f"\n  Loading segmented predictions from checkpoint: {seg_ckpt}")
         seg_preds = pd.read_parquet(seg_ckpt)
     else:
-        print(f"\n  Running PELT segmentation + prediction on ALL {n_trips_in_gps} trips...")
+        print(f"\n  Running PELT segmentation + prediction on ALL {n_trips_in_gps} trips "
+              f"({n_jobs} workers)...")
         print("  (This will take a while — checkpoint saved for reuse)")
         t0 = time.time()
         try:
