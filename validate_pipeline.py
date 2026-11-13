@@ -857,13 +857,22 @@ def level4_multimodal(gps_df, trips_df, model_new):
     n_sm = (~gt_df["IS_MULTIMODAL"]).sum()
     print(f"\n  All labelled trips: {len(gt_df)} ({n_sm} single-modal, {n_mm} multi-modal)")
 
-    # ── Filter GPS to all labelled trips ──
-    gps_key = model_new.config.col_trip_key
-    if gps_key not in gps_df.columns and "KEY" in gps_df.columns:
-        gps_key = "KEY"
+    # ── Load pre-processed GPS from fit checkpoint (skip re-extracting motion features) ──
+    gps_motion_ckpt = CHECKPOINT_DIR / "fit_steps" / "01_gps_motion.parquet"
+    if gps_motion_ckpt.exists():
+        print(f"  Loading pre-processed GPS from fit checkpoint (skips 47M-point reprocessing)")
+        eval_gps = pd.read_parquet(gps_motion_ckpt)
+        gps_key = model_new.config.col_trip_key
+        labelled_keys = set(gt_df["TRIP_KEY"])
+        eval_gps = eval_gps[eval_gps[gps_key].isin(labelled_keys)]
+    else:
+        print("  WARNING: No fit checkpoint found — falling back to raw GPS (slow!)")
+        gps_key = model_new.config.col_trip_key
+        if gps_key not in gps_df.columns and "KEY" in gps_df.columns:
+            gps_key = "KEY"
+        labelled_keys = set(gt_df["TRIP_KEY"])
+        eval_gps = gps_df[gps_df[gps_key].isin(labelled_keys)].copy()
 
-    labelled_keys = set(gt_df["TRIP_KEY"])
-    eval_gps = gps_df[gps_df[gps_key].isin(labelled_keys)].copy()
     n_trips_in_gps = eval_gps[gps_key].nunique()
     print(f"  GPS points: {len(eval_gps):,} ({n_trips_in_gps} trips with GPS data)")
 
@@ -886,7 +895,12 @@ def level4_multimodal(gps_df, trips_df, model_new):
         print("  (This will take a while — checkpoint saved for reuse)")
         t0 = time.time()
         try:
-            seg_preds = model_new.predict(eval_gps, segment=True)
+            # If we loaded from fit checkpoint, GPS already has motion features —
+            # call _predict_segmented directly to skip _prepare_predict_gps.
+            if gps_motion_ckpt.exists():
+                seg_preds = model_new._predict_segmented(eval_gps, model_new.config)
+            else:
+                seg_preds = model_new.predict(eval_gps, segment=True)
             elapsed = time.time() - t0
             print(f"  Done in {elapsed:.1f}s ({elapsed/60:.1f} min)")
             seg_preds.to_parquet(seg_ckpt, index=False)
