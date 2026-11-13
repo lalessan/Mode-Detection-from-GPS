@@ -91,7 +91,7 @@ class ModeDetectConfig:
 
     # ── XGBoost classifier ────────────────────────────────────────────
     xgb_params: dict | None = None  # extra kwargs passed to XGBClassifier
-    feature_selection: bool = True   # forward feature selection before training
+    feature_selection: bool = False  # forward feature selection before training
     class_weight: str | None = "balanced"  # "balanced" = inverse freq, None = uniform
     hyperparam_tuning: bool = False  # random search over XGBoost params before K-fold
     tuning_n_iter: int = 30          # number of random combos to try
