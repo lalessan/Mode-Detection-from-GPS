@@ -529,8 +529,11 @@ class ModeDetector:
             gps_seg = pd.concat(all_gps_segmented, ignore_index=True)
         else:
             # Parallel segmentation via ProcessPoolExecutor
+            from tqdm import tqdm
+
             trip_keys = gps[cfg.col_trip_key].unique()
-            n_chunks = min(n_jobs, len(trip_keys))
+            # Use many small chunks for granular progress, but only n_jobs workers
+            n_chunks = min(max(n_jobs * 20, 200), len(trip_keys))
             key_chunks = np.array_split(trip_keys, n_chunks)
 
             # Build GPS chunks (each worker gets only its trips)
@@ -543,14 +546,19 @@ class ModeDetector:
             rbt_bytes = _pickle.dumps(self._route_balltrees)
             cfg_bytes = _pickle.dumps(cfg)
 
-            logger.info("Segmenting %d trips across %d workers...", len(trip_keys), n_chunks)
+            logger.info("Segmenting %d trips across %d workers...", len(trip_keys), n_jobs)
 
             with _cf.ProcessPoolExecutor(
-                max_workers=n_chunks,
+                max_workers=n_jobs,
                 initializer=_init_seg_worker,
                 initargs=(rbt_bytes, cfg_bytes),
             ) as pool:
-                results = list(pool.map(_segment_trip_chunk, gps_chunks))
+                results = list(tqdm(
+                    pool.map(_segment_trip_chunk, gps_chunks),
+                    total=n_chunks,
+                    desc="Segmenting trips",
+                    unit="chunk",
+                ))
 
             gps_seg = pd.concat(
                 [r for r in results if len(r) > 0], ignore_index=True,
