@@ -79,6 +79,12 @@ def compute_trip_statistics(
         row["SPEED_MAX"] = _safe_max(grp.get("speed_ms"))
         _add_gap_features(row, grp[config.col_timestamp])
 
+        # Paper-inspired features: stop fraction, brief stops, velocity entropy, time/day
+        speed_series = grp.get("speed_ms")
+        _add_stop_features(row, speed_series, grp[config.col_timestamp])
+        row["VELOCITY_ENTROPY"] = _velocity_entropy(speed_series)
+        _add_time_features(row, grp[config.col_timestamp])
+
         if seg_id is not None:
             row["segment"] = seg_id
 
@@ -135,6 +141,79 @@ def _add_gap_features(row: dict, ts: pd.Series) -> None:
     row["GAP_MAX"] = float(dt.max()) if not dt.empty else np.nan
     row["GAP_MEAN"] = float(dt.mean()) if not dt.empty else np.nan
     row["DT_STD"] = float(dt.std()) if not dt.empty else np.nan
+
+
+def _add_stop_features(row: dict, speed: pd.Series | None, ts: pd.Series) -> None:
+    """Add STOP_FRACTION and BRIEF_STOP_RATE."""
+    if speed is None or speed.empty:
+        row["STOP_FRACTION"] = np.nan
+        row["BRIEF_STOP_RATE"] = np.nan
+        return
+    speed = pd.to_numeric(speed, errors="coerce")
+    # Stop fraction: % of points with speed < 1 m/s
+    row["STOP_FRACTION"] = float((speed < 1.0).sum()) / len(speed)
+
+    # Brief stop rate: fraction of stops lasting 30-120 seconds
+    # A "stop" is a contiguous run of points with speed < 1 m/s
+    ts = pd.to_datetime(ts)
+    is_stopped = (speed < 1.0).values
+    if not is_stopped.any() or len(ts) < 2:
+        row["BRIEF_STOP_RATE"] = 0.0
+        return
+    # Find contiguous stop runs
+    n_stops = 0
+    n_brief = 0
+    in_stop = False
+    stop_start = 0
+    ts_vals = ts.values
+    for i in range(len(is_stopped)):
+        if is_stopped[i] and not in_stop:
+            in_stop = True
+            stop_start = i
+        elif not is_stopped[i] and in_stop:
+            in_stop = False
+            n_stops += 1
+            dur = (ts_vals[i - 1] - ts_vals[stop_start]) / np.timedelta64(1, "s")
+            if 30 <= dur <= 120:
+                n_brief += 1
+    if in_stop:
+        n_stops += 1
+        dur = (ts_vals[-1] - ts_vals[stop_start]) / np.timedelta64(1, "s")
+        if 30 <= dur <= 120:
+            n_brief += 1
+    row["BRIEF_STOP_RATE"] = float(n_brief) / max(n_stops, 1)
+
+
+def _velocity_entropy(speed: pd.Series | None, n_bins: int = 10) -> float:
+    """Shannon entropy of the speed distribution (binned)."""
+    if speed is None or speed.empty:
+        return np.nan
+    speed = pd.to_numeric(speed, errors="coerce").dropna()
+    if len(speed) < 2:
+        return np.nan
+    counts, _ = np.histogram(speed, bins=n_bins, range=(0, speed.max() + 1e-9))
+    probs = counts / counts.sum()
+    probs = probs[probs > 0]
+    return float(-np.sum(probs * np.log2(probs)))
+
+
+def _add_time_features(row: dict, ts: pd.Series) -> None:
+    """Add sin/cos encoded time-of-day and day-of-week."""
+    ts = pd.to_datetime(ts)
+    if ts.empty:
+        row["TOD_SIN"] = np.nan
+        row["TOD_COS"] = np.nan
+        row["DOW_SIN"] = np.nan
+        row["DOW_COS"] = np.nan
+        return
+    # Use midpoint of the trip
+    mid_ts = ts.iloc[len(ts) // 2]
+    hour_frac = mid_ts.hour + mid_ts.minute / 60.0
+    row["TOD_SIN"] = float(np.sin(2 * np.pi * hour_frac / 24.0))
+    row["TOD_COS"] = float(np.cos(2 * np.pi * hour_frac / 24.0))
+    dow = mid_ts.dayofweek  # 0=Monday
+    row["DOW_SIN"] = float(np.sin(2 * np.pi * dow / 7.0))
+    row["DOW_COS"] = float(np.cos(2 * np.pi * dow / 7.0))
 
 
 def _safe_mean(s: pd.Series | None) -> float:
