@@ -83,9 +83,9 @@ class ModeDetectConfig:
     route_densify_spacing_m: int = 10
 
     # ── Segmentation (PELT) ───────────────────────────────────────────
-    pelt_model: str = "rbf"
+    pelt_model: str = "l2"
     pelt_min_size: int = 30
-    pelt_jump: int = 10
+    pelt_jump: int = 20
     pelt_penalty: int = 20
     pelt_fallback_penalties: list[int] = field(default_factory=lambda: [15, 10, 5])
     speed_only_segmentation: bool = False  # True = skip route signals in PELT (much faster)
