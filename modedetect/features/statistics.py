@@ -73,6 +73,12 @@ def compute_trip_statistics(
             "GPS_POINTS": len(grp),
         }
 
+        # Extra features: straightness, gaps, speed max, dt std
+        dist_total = row["DIST_TOTAL_WGS84"]
+        row["STRAIGHTNESS"] = _straightness(grp, config, dist_total)
+        row["SPEED_MAX"] = _safe_max(grp.get("speed_ms"))
+        _add_gap_features(row, grp[config.col_timestamp])
+
         if seg_id is not None:
             row["segment"] = seg_id
 
@@ -95,6 +101,40 @@ def compute_trip_statistics(
 
 
 # ── Helpers ──────────────────────────────────────────────────────────
+
+
+def _straightness(grp: pd.DataFrame, config, dist_total: float) -> float:
+    """Ratio of straight-line distance to total distance travelled."""
+    if dist_total <= 0 or len(grp) < 2 or np.isnan(dist_total):
+        return np.nan
+    lat = grp[config.col_latitude].astype("float64")
+    lon = grp[config.col_longitude].astype("float64")
+    from .._geo import haversine_m
+    straight = haversine_m(
+        lat.iloc[0], lon.iloc[0], lat.iloc[-1], lon.iloc[-1],
+    )
+    return float(min(straight / dist_total, 1.0))
+
+
+def _safe_max(s: pd.Series | None) -> float:
+    if s is None:
+        return np.nan
+    s = pd.to_numeric(s, errors="coerce")
+    return float(s.max()) if not s.empty and not s.isna().all() else np.nan
+
+
+def _add_gap_features(row: dict, ts: pd.Series) -> None:
+    """Add GAP_MAX, GAP_MEAN, DT_STD to row dict."""
+    ts = pd.to_datetime(ts)
+    if len(ts) < 2:
+        row["GAP_MAX"] = np.nan
+        row["GAP_MEAN"] = np.nan
+        row["DT_STD"] = np.nan
+        return
+    dt = ts.sort_values().diff().dt.total_seconds().iloc[1:]
+    row["GAP_MAX"] = float(dt.max()) if not dt.empty else np.nan
+    row["GAP_MEAN"] = float(dt.mean()) if not dt.empty else np.nan
+    row["DT_STD"] = float(dt.std()) if not dt.empty else np.nan
 
 
 def _safe_mean(s: pd.Series | None) -> float:
