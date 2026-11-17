@@ -349,3 +349,82 @@ def compute_route_features(
 
     logger.info("Route feature aggregation complete: %d trips", len(result))
     return result
+
+
+def batch_route_signals(
+    gps_df: pd.DataFrame,
+    route_balltrees: dict[str, RouteBallTree],
+    config: ModeDetectConfig,
+) -> pd.DataFrame:
+    """Compute per-point binary route signals for all GPS points at once.
+
+    Uses the same batch BallTree approach as compute_route_features.
+    Returns the input DataFrame with added columns: _rsig_bus, _rsig_tram, etc.
+    """
+    from tqdm import tqdm
+
+    gps_df = gps_df.copy()
+    all_lat = gps_df[config.col_latitude].astype("float64").values
+    all_lon = gps_df[config.col_longitude].astype("float64").values
+    gps_rad = np.radians(np.column_stack([all_lat, all_lon]))
+    rad = config.route_search_radius_m / EARTH_RADIUS_M
+    n_points = len(gps_df)
+    trip_keys = gps_df[config.col_trip_key].values
+
+    CHUNK = 500_000
+    n_chunks = (n_points + CHUNK - 1) // CHUNK
+
+    for mode_name in TRANSIT_MODES:
+        col = f"_rsig_{mode_name}"
+        rbt = route_balltrees.get(mode_name)
+
+        if rbt is None or rbt.is_empty:
+            gps_df[col] = np.int8(0)
+            continue
+
+        # ── Batch BallTree query ──
+        logger.info("Batch route signal: %s (%d chunks)...", mode_name, n_chunks)
+        all_route_ids = [None] * n_points
+
+        for c in tqdm(range(n_chunks), desc=f"Route signal ({mode_name})", unit="chunk"):
+            lo = c * CHUNK
+            hi = min(lo + CHUNK, n_points)
+            ind = rbt.tree.query_radius(gps_rad[lo:hi], r=rad)
+            for j in range(hi - lo):
+                if len(ind[j]) > 0:
+                    all_route_ids[lo + j] = np.unique(rbt.route_idx[ind[j]])
+
+        # ── Per-trip best route → binary signal ──
+        signal = np.zeros(n_points, dtype=np.int8)
+
+        # Group by trip to find the best route per trip
+        trip_start = {}
+        trip_end = {}
+        for i in range(n_points):
+            tk = trip_keys[i]
+            if tk not in trip_start:
+                trip_start[tk] = i
+            trip_end[tk] = i + 1
+
+        for tk, lo in trip_start.items():
+            hi = trip_end[tk]
+            # Count hits per route for this trip
+            route_counts: dict[int, int] = {}
+            for i in range(lo, hi):
+                if all_route_ids[i] is not None:
+                    for rid in all_route_ids[i]:
+                        route_counts[rid] = route_counts.get(rid, 0) + 1
+
+            if not route_counts:
+                continue
+
+            # Best route = most hits
+            best_route = max(route_counts, key=route_counts.get)
+            for i in range(lo, hi):
+                if all_route_ids[i] is not None and best_route in all_route_ids[i]:
+                    signal[i] = 1
+
+        gps_df[col] = signal
+
+    logger.info("Batch route signals computed for %d points", n_points)
+    return gps_df

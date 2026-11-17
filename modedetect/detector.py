@@ -79,7 +79,15 @@ def _segment_trip_chunk(gps_chunk: pd.DataFrame) -> pd.DataFrame:
     for trip_key, trip_df in gps_chunk.groupby(cfg.col_trip_key, sort=False):
         trip_df = trip_df.sort_values(cfg.col_timestamp)
 
-        if cfg.speed_only_segmentation:
+        # Check for pre-computed route signal columns
+        rsig_cols = [c for c in trip_df.columns if c.startswith("_rsig_")]
+        if rsig_cols:
+            route_signals = {}
+            for c in rsig_cols:
+                mode_name = c.replace("_rsig_", "")
+                route_signals[mode_name] = trip_df[c].values
+            breakpoints = feat_seg.segment_trip_signals(trip_df, route_signals, cfg)
+        elif cfg.speed_only_segmentation:
             breakpoints = feat_seg.segment_trip_speed(trip_df, cfg)
         else:
             route_signals = {}
@@ -264,6 +272,27 @@ class ModeDetector:
                 logger.info("No OSM configured — skipping route features.")
         else:
             logger.info("Loaded route features from checkpoint.")
+
+        # ── Step 4b: Pre-compute per-point route signals (for segmentation) ──
+        rsig_col = "_rsig_bus"  # check if signals already exist in gps
+        if rsig_col not in gps.columns and self._route_balltrees:
+            rsig_ckpt = self._ckpt_load(ckpt, "04_route_signals.parquet")
+            if rsig_ckpt is not None:
+                # Merge cached signal columns into gps
+                sig_cols = [c for c in rsig_ckpt.columns if c.startswith("_rsig_")]
+                idx_col = "__idx__"
+                rsig_ckpt[idx_col] = rsig_ckpt.index
+                gps = gps.reset_index(drop=True)
+                for c in sig_cols:
+                    gps[c] = rsig_ckpt[c].values
+                logger.info("Loaded per-point route signals from checkpoint.")
+            else:
+                logger.info("Computing per-point route signals (batch)...")
+                gps = feat_routes.batch_route_signals(gps, self._route_balltrees, cfg)
+                sig_cols = [c for c in gps.columns if c.startswith("_rsig_")]
+                self._ckpt_save(ckpt, "04_route_signals.parquet", gps[sig_cols])
+        # Store gps with signals for segmentation
+        self._gps_with_signals = gps
 
         # ── Step 5: Merge + train ─────────────────────────────────────
         logger.info("Merging feature sets...")
@@ -514,7 +543,11 @@ class ModeDetector:
             all_gps_segmented = []
             for trip_key, trip_df in gps.groupby(cfg.col_trip_key, sort=False):
                 trip_df = trip_df.sort_values(cfg.col_timestamp)
-                if cfg.speed_only_segmentation:
+                rsig_cols = [c for c in trip_df.columns if c.startswith("_rsig_")]
+                if rsig_cols:
+                    route_signals = {c.replace("_rsig_", ""): trip_df[c].values for c in rsig_cols}
+                    breakpoints = feat_seg.segment_trip_signals(trip_df, route_signals, cfg)
+                elif cfg.speed_only_segmentation:
                     breakpoints = feat_seg.segment_trip_speed(trip_df, cfg)
                 else:
                     route_signals = {}

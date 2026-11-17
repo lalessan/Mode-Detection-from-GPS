@@ -860,12 +860,28 @@ def level4_multimodal(gps_df, trips_df, model_new):
         print("  WARNING: No GPS data for labelled trips. Skipping.")
         return
 
+    # ── Load pre-computed route signals if available (avoids re-querying BallTrees) ──
+    rsig_ckpt = CHECKPOINT_DIR / "fit_steps" / "04_route_signals.parquet"
+    if rsig_ckpt.exists() and "_rsig_bus" not in eval_gps.columns:
+        print(f"  Loading pre-computed route signals from checkpoint...")
+        rsig_df = pd.read_parquet(rsig_ckpt)
+        # Signals are aligned by row position with the GPS checkpoint
+        if len(rsig_df) == len(pd.read_parquet(gps_motion_ckpt)):
+            # Reload full GPS to get correct indices, then filter
+            full_gps = pd.read_parquet(gps_motion_ckpt)
+            sig_cols = [c for c in rsig_df.columns if c.startswith("_rsig_")]
+            for c in sig_cols:
+                full_gps[c] = rsig_df[c].values
+            eval_gps = full_gps[full_gps[gps_key].isin(labelled_keys)]
+            del full_gps
+            print(f"  Route signals loaded: {sig_cols}")
+        else:
+            print(f"  WARNING: Route signal checkpoint size mismatch — skipping")
+
     # ── Run segmented prediction on ALL trips (with checkpoint) ──
     # Override n_jobs for parallel segmentation (cap at 15 to avoid memory blow-up)
     n_jobs = min(15, os.cpu_count() or 1)
     model_new.config.n_jobs = n_jobs
-    # Speed-only PELT skips 132M route BallTree lookups → ~10x faster
-    model_new.config.speed_only_segmentation = True
 
     seg_ckpt = CHECKPOINT_DIR / "seg_preds_all.parquet"
     if seg_ckpt.exists():
