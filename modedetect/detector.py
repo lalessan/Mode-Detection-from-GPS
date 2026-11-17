@@ -79,20 +79,22 @@ def _segment_trip_chunk(gps_chunk: pd.DataFrame) -> pd.DataFrame:
     for trip_key, trip_df in gps_chunk.groupby(cfg.col_trip_key, sort=False):
         trip_df = trip_df.sort_values(cfg.col_timestamp)
 
-        route_signals = {}
-        if rbt:
-            lat = trip_df[cfg.col_latitude].astype("float64").values
-            lon = trip_df[cfg.col_longitude].astype("float64").values
-            for mode_name, tree in rbt.items():
-                if mode_name in feat_routes.TRANSIT_MODES:
-                    route_signals[mode_name] = feat_routes.generate_route_signal(
-                        tree, lat, lon, cfg.route_search_radius_m,
-                    )
-
-        if route_signals:
-            breakpoints = feat_seg.segment_trip_signals(trip_df, route_signals, cfg)
-        else:
+        if cfg.speed_only_segmentation:
             breakpoints = feat_seg.segment_trip_speed(trip_df, cfg)
+        else:
+            route_signals = {}
+            if rbt:
+                lat = trip_df[cfg.col_latitude].astype("float64").values
+                lon = trip_df[cfg.col_longitude].astype("float64").values
+                for mode_name, tree in rbt.items():
+                    if mode_name in feat_routes.TRANSIT_MODES:
+                        route_signals[mode_name] = feat_routes.generate_route_signal(
+                            tree, lat, lon, cfg.route_search_radius_m,
+                        )
+            if route_signals:
+                breakpoints = feat_seg.segment_trip_signals(trip_df, route_signals, cfg)
+            else:
+                breakpoints = feat_seg.segment_trip_speed(trip_df, cfg)
 
         results.append(feat_seg.assign_segments(trip_df, breakpoints))
 
@@ -512,19 +514,22 @@ class ModeDetector:
             all_gps_segmented = []
             for trip_key, trip_df in gps.groupby(cfg.col_trip_key, sort=False):
                 trip_df = trip_df.sort_values(cfg.col_timestamp)
-                route_signals = {}
-                if self._route_balltrees:
-                    lat = trip_df[cfg.col_latitude].astype("float64").values
-                    lon = trip_df[cfg.col_longitude].astype("float64").values
-                    for mode_name, rbt in self._route_balltrees.items():
-                        if mode_name in feat_routes.TRANSIT_MODES:
-                            route_signals[mode_name] = feat_routes.generate_route_signal(
-                                rbt, lat, lon, cfg.route_search_radius_m,
-                            )
-                if route_signals:
-                    breakpoints = feat_seg.segment_trip_signals(trip_df, route_signals, cfg)
-                else:
+                if cfg.speed_only_segmentation:
                     breakpoints = feat_seg.segment_trip_speed(trip_df, cfg)
+                else:
+                    route_signals = {}
+                    if self._route_balltrees:
+                        lat = trip_df[cfg.col_latitude].astype("float64").values
+                        lon = trip_df[cfg.col_longitude].astype("float64").values
+                        for mode_name, rbt in self._route_balltrees.items():
+                            if mode_name in feat_routes.TRANSIT_MODES:
+                                route_signals[mode_name] = feat_routes.generate_route_signal(
+                                    rbt, lat, lon, cfg.route_search_radius_m,
+                                )
+                    if route_signals:
+                        breakpoints = feat_seg.segment_trip_signals(trip_df, route_signals, cfg)
+                    else:
+                        breakpoints = feat_seg.segment_trip_speed(trip_df, cfg)
                 all_gps_segmented.append(feat_seg.assign_segments(trip_df, breakpoints))
             gps_seg = pd.concat(all_gps_segmented, ignore_index=True)
         else:

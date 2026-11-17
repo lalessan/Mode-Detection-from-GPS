@@ -88,6 +88,7 @@ class ModeDetectConfig:
     pelt_jump: int = 10
     pelt_penalty: int = 20
     pelt_fallback_penalties: list[int] = field(default_factory=lambda: [15, 10, 5])
+    speed_only_segmentation: bool = False  # True = skip route signals in PELT (much faster)
 
     # ── XGBoost classifier ────────────────────────────────────────────
     xgb_params: dict | None = None  # extra kwargs passed to XGBClassifier
