@@ -275,6 +275,7 @@ class ModeDetector:
 
         # ── Step 4b: Pre-compute per-point route signals (for segmentation) ──
         rsig_col = "_rsig_bus"  # check if signals already exist in gps
+        self._ensure_route_resources(cfg)  # ensure BallTrees are loaded
         if rsig_col not in gps.columns and self._route_balltrees:
             rsig_ckpt = self._ckpt_load(ckpt, "04_route_signals.parquet")
             if rsig_ckpt is not None:
