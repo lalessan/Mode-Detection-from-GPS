@@ -96,12 +96,6 @@ def load_original_features():
 
     print(f"  stats: {df_stats.shape}, pct: {df_pct.shape}, stops: {df_stops.shape}, routes: {df_routes.shape}")
 
-    # Print column names for debugging
-    print(f"\n  stats columns: {list(df_stats.columns[:10])}...")
-    print(f"  pct columns: {list(df_pct.columns[:10])}...")
-    print(f"  stops columns: {list(df_stops.columns[:10])}...")
-    print(f"  routes columns: {list(df_routes.columns[:10])}...")
-
     # Identify key column name (TRIP_KEY or KEY)
     trip_key_col = "TRIP_KEY" if "TRIP_KEY" in df_stats.columns else "KEY"
     mode_col = "MAIN_MODE" if "MAIN_MODE" in df_stats.columns else "main_mode"
@@ -225,8 +219,8 @@ def build_original_feature_matrix(df_stats, df_pct, df_stops_250m, df_stops_1000
         print(f"  {n_any_nan} rows have NaN in some feature columns — filling with 0")
         merged[fill_cols] = merged[fill_cols].fillna(0)
 
-    print(f"  Final merged shape: {merged.shape}")
-    print(f"  Feature columns: {[c for c in merged.columns if c not in [trip_key_col, mode_col]]}")
+    feat_cols = [c for c in merged.columns if c not in [trip_key_col, mode_col]]
+    print(f"  Final merged shape: {merged.shape} ({len(feat_cols)} features)")
     return merged
 
 
@@ -401,8 +395,7 @@ def run_modedetect_pipeline(gps_df, trips_df):
         random_state=0,
     )
 
-    print(f"  GPS shape: {gps_df.shape}, columns: {list(gps_df.columns)}")
-    print(f"  Trips shape: {trips_df.shape}")
+    print(f"  GPS: {gps_df.shape}, Trips: {trips_df.shape}")
 
     model = ModeDetector(config)
 
@@ -421,21 +414,41 @@ def run_modedetect_pipeline(gps_df, trips_df):
 # LEVEL 1: Feature comparison
 # ─────────────────────────────────────────────────────────────────────
 
-def _compare_table(orig_sub, new_sub, col_mapping, label="Feature"):
-    """Print a comparison table for aligned DataFrames."""
-    print(f"\n  {label:<30} {'Max Diff':>12} {'Mean Diff':>12} {'Correlation':>12}")
-    print("  " + "-" * 68)
+def _compare_table(orig_sub, new_sub, col_mapping, label="Feature", compact=False):
+    """Print a comparison table for aligned DataFrames.
+
+    If compact=True, only print a summary line (count, worst/avg correlation)
+    instead of one row per feature.
+    """
+    results = []
     for orig_col, new_col in col_mapping.items():
         if orig_col in orig_sub.columns and new_col in new_sub.columns:
             aligned = orig_sub[[orig_col]].join(new_sub[[new_col]], how="inner",
                                                   lsuffix="_orig", rsuffix="_new")
             diff = (aligned.iloc[:, 0] - aligned.iloc[:, 1]).abs()
             corr = aligned.iloc[:, 0].corr(aligned.iloc[:, 1])
-            print(f"  {orig_col:<30} {diff.max():>12.4f} {diff.mean():>12.4f} {corr:>12.4f}")
-        elif orig_col in orig_sub.columns:
-            print(f"  {orig_col:<30}  (missing in modedetect as '{new_col}')")
-        elif new_col in new_sub.columns:
-            print(f"  {orig_col:<30}  (missing in original)")
+            results.append((orig_col, diff.max(), diff.mean(), corr))
+
+    if not results:
+        print(f"  No comparable columns found.")
+        return
+
+    if compact:
+        corrs = [r[3] for r in results]
+        worst = min(corrs)
+        avg = np.mean(corrs)
+        n_low = sum(1 for c in corrs if c < 0.95)
+        print(f"  {label}: {len(results)} features compared — "
+              f"avg corr={avg:.4f}, worst={worst:.4f}, {n_low} below 0.95")
+        if n_low > 0:
+            low = [(r[0], r[3]) for r in results if r[3] < 0.95]
+            for name, c in sorted(low, key=lambda x: x[1]):
+                print(f"    {name:<30} corr={c:.4f}")
+    else:
+        print(f"\n  {label:<30} {'Max Diff':>12} {'Mean Diff':>12} {'Correlation':>12}")
+        print("  " + "-" * 68)
+        for orig_col, max_d, mean_d, corr in results:
+            print(f"  {orig_col:<30} {max_d:>12.4f} {mean_d:>12.4f} {corr:>12.4f}")
 
 
 def level1_compare_features(gps_df, trips_df, df_stats_orig, df_pct_orig,
@@ -545,17 +558,7 @@ def level1_compare_features(gps_df, trips_df, df_stats_orig, df_pct_orig,
             orig_pct_sub = df_pct_orig[df_pct_orig[trip_key_col].isin(common_pct_keys)].set_index(trip_key_col)
             new_pct_sub = new_pct[new_pct[trip_key_col].isin(common_pct_keys)].set_index(trip_key_col)
             pct_mapping = {c: c for c in pct_cols}
-            _compare_table(orig_pct_sub, new_pct_sub, pct_mapping, label="Percentile")
-
-            # Show columns only in original or only in modedetect
-            orig_only = sorted(c for c in df_pct_orig.columns
-                               if re.search(r"_P\d+$", c) and c not in new_pct.columns)
-            new_only = sorted(c for c in new_pct.columns
-                              if re.search(r"_P\d+$", c) and c not in df_pct_orig.columns)
-            if orig_only:
-                print(f"\n  Percentile cols only in original ({len(orig_only)}): {orig_only[:10]}...")
-            if new_only:
-                print(f"  Percentile cols only in modedetect ({len(new_only)}): {new_only[:10]}...")
+            _compare_table(orig_pct_sub, new_pct_sub, pct_mapping, label="Percentiles", compact=True)
 
     # ── 1C: Stop Proximity Features ───────────────────────────────────
     print("\n  --- 1C: Stop Proximity Features ---")
@@ -597,17 +600,7 @@ def level1_compare_features(gps_df, trips_df, df_stats_orig, df_pct_orig,
                 if re.search(r"_P\d+$", col) and col in new_stop_sub.columns:
                     stop_compare[col] = col
 
-            _compare_table(orig_stop_sub, new_stop_sub, stop_compare, label="Stop Feature")
-
-            # Show columns only in one side
-            orig_stop_only = sorted(c for c in orig_stop_sub.select_dtypes("number").columns
-                                    if c not in new_stop_sub.columns)
-            new_stop_only = sorted(c for c in new_stop_sub.select_dtypes("number").columns
-                                   if c not in orig_stop_sub.columns)
-            if orig_stop_only:
-                print(f"\n  Stop cols only in original ({len(orig_stop_only)}): {orig_stop_only[:15]}")
-            if new_stop_only:
-                print(f"  Stop cols only in modedetect ({len(new_stop_only)}): {new_stop_only[:15]}")
+            _compare_table(orig_stop_sub, new_stop_sub, stop_compare, label="Stop features", compact=True)
     else:
         print("  Skipped (checkpoint not available)")
 
@@ -628,15 +621,6 @@ def level1_compare_features(gps_df, trips_df, df_stats_orig, df_pct_orig,
                     route_compare[col] = col
 
             _compare_table(orig_route_sub, new_route_sub, route_compare, label="Route Feature")
-
-            orig_route_only = sorted(c for c in orig_route_sub.select_dtypes("number").columns
-                                     if c not in new_route_sub.columns)
-            new_route_only = sorted(c for c in new_route_sub.select_dtypes("number").columns
-                                    if c not in orig_route_sub.columns)
-            if orig_route_only:
-                print(f"\n  Route cols only in original: {orig_route_only}")
-            if new_route_only:
-                print(f"  Route cols only in modedetect: {new_route_only}")
     else:
         print("  Skipped (checkpoint not available)")
 
@@ -688,10 +672,6 @@ def level2_compare_classification(merged_orig, orig_clf, orig_le, orig_feature_c
         only_new = new_set - orig_set
         print(f"\n  Feature overlap: {len(common)} common, "
               f"{len(only_orig)} only in original, {len(only_new)} only in modedetect")
-        if only_orig:
-            print(f"  Only in original: {sorted(only_orig)}")
-        if only_new:
-            print(f"  Only in modedetect: {sorted(only_new)}")
     else:
         print("  WARNING: modedetect model not trained (no _model attribute)")
 
