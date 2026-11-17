@@ -882,6 +882,8 @@ def level4_multimodal(gps_df, trips_df, model_new):
     # Override n_jobs for parallel segmentation (cap at 15 to avoid memory blow-up)
     n_jobs = min(15, os.cpu_count() or 1)
     model_new.config.n_jobs = n_jobs
+    model_new.config.pelt_model = "l2"
+    model_new.config.pelt_jump = 20
 
     seg_ckpt = CHECKPOINT_DIR / "seg_preds_all.parquet"
     if seg_ckpt.exists():
