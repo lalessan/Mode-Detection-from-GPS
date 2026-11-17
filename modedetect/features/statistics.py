@@ -52,8 +52,11 @@ def compute_trip_statistics(
     key_col = config.col_trip_key
     group_cols = [key_col] if segment_col is None else [key_col, segment_col]
 
+    from tqdm import tqdm
+
+    groups = gps_df.groupby(group_cols, sort=False, observed=True)
     rows = []
-    for group_key, grp in gps_df.groupby(group_cols, sort=False, observed=True):
+    for group_key, grp in tqdm(groups, desc="Trip statistics", unit="trip"):
         if isinstance(group_key, str):
             trip_key = group_key
             seg_id = None
