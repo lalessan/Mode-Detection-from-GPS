@@ -537,8 +537,10 @@ class ModeDetector:
 
     def _extract_segmented_features(self, gps: pd.DataFrame, cfg: ModeDetectConfig) -> pd.DataFrame:
         """Segment each trip, then extract per-segment features."""
-        # Load route resources for signal-based segmentation
-        self._ensure_route_resources(cfg)
+        # Only load BallTrees if binary route signals aren't already in the data
+        rsig_cols = [c for c in gps.columns if c.startswith("_rsig_")]
+        if not rsig_cols:
+            self._ensure_route_resources(cfg)
 
         n_jobs = cfg.n_jobs if cfg.n_jobs > 0 else (os.cpu_count() or 1)
 
