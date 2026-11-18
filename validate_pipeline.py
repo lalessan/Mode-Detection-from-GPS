@@ -632,8 +632,8 @@ def level1_compare_features(gps_df, trips_df, df_stats_orig, df_pct_orig,
 def _build_modedetect_features(model_new, trip_key_col, mode_col):
     """Build the modedetect feature matrix from fit checkpoints."""
     ckpt_dir = CHECKPOINT_DIR / "fit_steps"
-    stats = pd.read_parquet(ckpt_dir / "02_trip_statistics.parquet")
-    pct = pd.read_parquet(ckpt_dir / "02_percentile_map.parquet")
+    stats = pd.read_parquet(ckpt_dir / "02_stats.parquet")
+    pct = pd.read_parquet(ckpt_dir / "02_pct_map.parquet")
 
     stats = stats.rename(columns={"trip_key": trip_key_col})
     pct = pct.rename(columns={"trip_key": trip_key_col})
