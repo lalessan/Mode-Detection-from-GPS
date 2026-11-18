@@ -629,6 +629,30 @@ def level1_compare_features(gps_df, trips_df, df_stats_orig, df_pct_orig,
 # LEVEL 2: Classification comparison
 # ─────────────────────────────────────────────────────────────────────
 
+def _build_modedetect_features(model_new, trip_key_col, mode_col):
+    """Build the modedetect feature matrix from fit checkpoints."""
+    ckpt_dir = CHECKPOINT_DIR / "fit_steps"
+    stats = pd.read_parquet(ckpt_dir / "02_trip_statistics.parquet")
+    pct = pd.read_parquet(ckpt_dir / "02_percentile_map.parquet")
+
+    stats = stats.rename(columns={"trip_key": trip_key_col})
+    pct = pct.rename(columns={"trip_key": trip_key_col})
+
+    merged = stats.merge(pct, on=trip_key_col, how="inner")
+
+    stop_ckpt = ckpt_dir / "03_stop_features.parquet"
+    if stop_ckpt.exists():
+        stops = pd.read_parquet(stop_ckpt).rename(columns={"trip_key": trip_key_col})
+        merged = merged.merge(stops, on=trip_key_col, how="left")
+
+    route_ckpt = ckpt_dir / "04_route_features.parquet"
+    if route_ckpt.exists():
+        routes = pd.read_parquet(route_ckpt).rename(columns={"trip_key": trip_key_col})
+        merged = merged.merge(routes, on=trip_key_col, how="left")
+
+    return merged
+
+
 def level2_compare_classification(merged_orig, orig_clf, orig_le, orig_feature_cols,
                                   trip_key_col, mode_col, model_new):
     """Compare classification performance: original-style vs modedetect."""
@@ -637,7 +661,7 @@ def level2_compare_classification(merged_orig, orig_clf, orig_le, orig_feature_c
     print("LEVEL 2: Classification comparison")
     print("=" * 60)
 
-    # Original model: evaluate on its own test split
+    # ── Original model: 80/20 split ──
     X_orig = merged_orig[orig_feature_cols]
     y_true = merged_orig[mode_col].values
     le = LabelEncoder()
@@ -646,50 +670,64 @@ def level2_compare_classification(merged_orig, orig_clf, orig_le, orig_feature_c
     X_train, X_test, y_train, y_test = train_test_split(
         X_orig, y_encoded, test_size=0.2, stratify=y_encoded, random_state=0
     )
-    y_test_labels = le.inverse_transform(y_test)
+    test_trip_keys = merged_orig.iloc[X_test.index][trip_key_col].values
 
     y_pred_orig = orig_clf.predict(X_test.values)
-    y_pred_orig_labels = le.inverse_transform(y_pred_orig)
     f1_orig = f1_score(y_test, y_pred_orig, average="macro")
 
-    # modedetect model: use its internal encoder and feature list
-    # Note: modedetect was trained on the SAME raw data but with its own
-    # feature extraction and K-fold CV, so exact numbers will differ.
-    print(f"\n  Original-style model (80/20 split): macro F1 = {f1_orig:.4f}")
-    print(f"  modedetect model was trained with K-fold CV on raw GPS data")
-    print(f"  (Different training methodology → expect some difference)")
-
+    # ── Modedetect model: predict on same test trips ──
+    f1_new = None
     if hasattr(model_new, '_model') and model_new._model is not None:
-        print(f"\n  modedetect model classes: {list(model_new._encoder.classes_)}")
-        print(f"  modedetect features: {len(model_new._feature_list)}")
-        print(f"  Original features: {len(orig_feature_cols)}")
+        md_merged = _build_modedetect_features(model_new, trip_key_col, mode_col)
 
-        # Show feature overlap
+        # Align to test trips that have labels
+        test_set = set(test_trip_keys)
+        md_test = md_merged[md_merged[trip_key_col].isin(test_set)].copy()
+
+        if mode_col in md_test.columns:
+            md_test = md_test.dropna(subset=[mode_col])
+        else:
+            # Join labels from original
+            label_map = dict(zip(merged_orig[trip_key_col], merged_orig[mode_col]))
+            md_test[mode_col] = md_test[trip_key_col].map(label_map)
+            md_test = md_test.dropna(subset=[mode_col])
+
+        if len(md_test) > 0:
+            X_md = md_test.reindex(columns=model_new._feature_list, fill_value=0)
+            y_md_true = model_new._encoder.transform(md_test[mode_col].values)
+            y_md_pred = model_new._model.predict(X_md)
+            f1_new = f1_score(y_md_true, y_md_pred, average="macro")
+
+    print(f"\n  Original model (80/20 split):    macro F1 = {f1_orig:.4f}  ({len(orig_feature_cols)} features)")
+    if f1_new is not None:
+        print(f"  Modedetect model (on same test): macro F1 = {f1_new:.4f}  ({len(model_new._feature_list)} features)")
+        print(f"  Note: modedetect was trained with K-fold CV, so test trips may overlap its training data.")
+    else:
+        print(f"  Modedetect model: could not evaluate (missing features or model)")
+
+    # Feature overlap
+    if hasattr(model_new, '_feature_list') and model_new._feature_list:
         orig_set = set(orig_feature_cols)
         new_set = set(model_new._feature_list)
-        common = orig_set & new_set
-        only_orig = orig_set - new_set
-        only_new = new_set - orig_set
-        print(f"\n  Feature overlap: {len(common)} common, "
-              f"{len(only_orig)} only in original, {len(only_new)} only in modedetect")
-    else:
-        print("  WARNING: modedetect model not trained (no _model attribute)")
+        print(f"\n  Feature overlap: {len(orig_set & new_set)} common, "
+              f"{len(orig_set - new_set)} only in original, {len(new_set - orig_set)} only in modedetect")
 
     return f1_orig
 
 
 # ─────────────────────────────────────────────────────────────────────
-# LEVEL 3: Confusion matrix comparison
+# LEVEL 3: Per-class F1 comparison
 # ─────────────────────────────────────────────────────────────────────
 
 def level3_compare_confusion(merged_orig, orig_clf, orig_feature_cols,
-                             trip_key_col, mode_col):
-    """Show confusion matrix and per-class F1 for the original-style model."""
+                             trip_key_col, mode_col, model_new=None):
+    """Show side-by-side per-class F1 for original and modedetect models."""
     print()
     print("=" * 60)
     print("LEVEL 3: Per-class F1 and confusion matrix")
     print("=" * 60)
 
+    # ── Original model ──
     X = merged_orig[orig_feature_cols]
     y_true = merged_orig[mode_col].values
     le = LabelEncoder()
@@ -698,31 +736,77 @@ def level3_compare_confusion(merged_orig, orig_clf, orig_feature_cols,
     X_train, X_test, y_train, y_test = train_test_split(
         X, y_encoded, test_size=0.2, stratify=y_encoded, random_state=0
     )
+    test_trip_keys = merged_orig.iloc[X_test.index][trip_key_col].values
     y_test_labels = le.inverse_transform(y_test)
     modes = sorted(le.classes_)
 
-    # Original-style model
-    y_pred = orig_clf.predict(X_test.values)
-    y_pred_labels = le.inverse_transform(y_pred)
-    f1 = f1_score(y_test, y_pred, average="macro")
+    y_pred_orig = orig_clf.predict(X_test.values)
+    y_pred_orig_labels = le.inverse_transform(y_pred_orig)
+    f1_orig = f1_score(y_test, y_pred_orig, average="macro")
+    report_orig = classification_report(y_test_labels, y_pred_orig_labels, output_dict=True)
 
-    print(f"\n  Original-style model: macro F1 = {f1:.4f}")
+    # ── Modedetect model on same test trips ──
+    report_new = None
+    f1_new = None
+    if model_new is not None and hasattr(model_new, '_model') and model_new._model is not None:
+        md_merged = _build_modedetect_features(model_new, trip_key_col, mode_col)
+        test_set = set(test_trip_keys)
+        md_test = md_merged[md_merged[trip_key_col].isin(test_set)].copy()
 
-    # Per-class F1
-    report = classification_report(y_test_labels, y_pred_labels, output_dict=True)
-    print(f"\n  {'Mode':<12} {'F1':>8} {'Precision':>10} {'Recall':>8} {'Support':>8}")
-    print("  " + "-" * 48)
-    for mode in modes:
-        r = report.get(mode, {})
-        print(f"  {mode:<12} {r.get('f1-score', 0):>8.4f} {r.get('precision', 0):>10.4f} "
-              f"{r.get('recall', 0):>8.4f} {int(r.get('support', 0)):>8}")
+        if mode_col not in md_test.columns:
+            label_map = dict(zip(merged_orig[trip_key_col], merged_orig[mode_col]))
+            md_test[mode_col] = md_test[trip_key_col].map(label_map)
+        md_test = md_test.dropna(subset=[mode_col])
 
-    # Confusion matrix
-    print(f"\n  --- Confusion Matrix ---")
-    cm = confusion_matrix(y_test_labels, y_pred_labels, labels=modes)
+        if len(md_test) > 0:
+            X_md = md_test.reindex(columns=model_new._feature_list, fill_value=0)
+            y_md_true_labels = md_test[mode_col].values
+            y_md_pred = model_new._model.predict(X_md)
+            y_md_pred_labels = model_new._encoder.inverse_transform(y_md_pred)
+            f1_new = f1_score(
+                model_new._encoder.transform(y_md_true_labels),
+                y_md_pred, average="macro"
+            )
+            report_new = classification_report(y_md_true_labels, y_md_pred_labels, output_dict=True)
+
+    # ── Print side-by-side ──
+    if report_new is not None:
+        print(f"\n  {'Mode':<12} {'Orig F1':>8} {'MD F1':>8} {'Diff':>8}   {'Orig P':>7} {'MD P':>7}   {'Orig R':>7} {'MD R':>7}  {'Support':>8}")
+        print("  " + "-" * 86)
+        for mode in modes:
+            ro = report_orig.get(mode, {})
+            rn = report_new.get(mode, {})
+            f1_o = ro.get('f1-score', 0)
+            f1_n = rn.get('f1-score', 0)
+            diff = f1_n - f1_o
+            sign = "+" if diff >= 0 else ""
+            print(f"  {mode:<12} {f1_o:>8.4f} {f1_n:>8.4f} {sign}{diff:>7.4f}"
+                  f"   {ro.get('precision', 0):>7.4f} {rn.get('precision', 0):>7.4f}"
+                  f"   {ro.get('recall', 0):>7.4f} {rn.get('recall', 0):>7.4f}"
+                  f"  {int(ro.get('support', 0)):>8}")
+        print("  " + "-" * 86)
+        print(f"  {'MACRO':>12} {f1_orig:>8.4f} {f1_new:>8.4f} {'+' if f1_new - f1_orig >= 0 else ''}{f1_new - f1_orig:>7.4f}")
+    else:
+        print(f"\n  Original-style model: macro F1 = {f1_orig:.4f}")
+        report = classification_report(y_test_labels, y_pred_orig_labels, output_dict=True)
+        print(f"\n  {'Mode':<12} {'F1':>8} {'Precision':>10} {'Recall':>8} {'Support':>8}")
+        print("  " + "-" * 48)
+        for mode in modes:
+            r = report.get(mode, {})
+            print(f"  {mode:<12} {r.get('f1-score', 0):>8.4f} {r.get('precision', 0):>10.4f} "
+                  f"{r.get('recall', 0):>8.4f} {int(r.get('support', 0)):>8}")
+
+    # Confusion matrix (original only — keep output manageable)
+    print(f"\n  --- Confusion Matrix (Original) ---")
+    cm = confusion_matrix(y_test_labels, y_pred_orig_labels, labels=modes)
     _print_cm(cm, modes)
 
-    return f1
+    if report_new is not None:
+        print(f"\n  --- Confusion Matrix (Modedetect) ---")
+        cm_new = confusion_matrix(y_md_true_labels, y_md_pred_labels, labels=modes)
+        _print_cm(cm_new, modes)
+
+    return f1_orig
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -1087,7 +1171,7 @@ def main():
                                   trip_key_col, mode_col, model_new)
 
     # ── Level 3: Confusion matrices ──
-    level3_compare_confusion(merged_orig, orig_clf, feature_cols, trip_key_col, mode_col)
+    level3_compare_confusion(merged_orig, orig_clf, feature_cols, trip_key_col, mode_col, model_new)
 
     # ── Level 4: Multi-modal evaluation ──
     level4_multimodal(gps_df, trips_df, model_new)
