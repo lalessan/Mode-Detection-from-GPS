@@ -70,12 +70,16 @@ def _remap_and_drop(df, mode_col="MAIN_MODE"):
 
 
 def _print_cm(cm, labels, signed=False):
-    """Pretty-print a confusion matrix."""
-    fmt = "{:>+6d}" if signed else "{:>6d}"
+    """Pretty-print a confusion matrix as row-normalized percentages."""
     header = "  " + " " * 12 + "".join(f"{l:>9s}" for l in labels)
     print(header)
     for i, label in enumerate(labels):
-        row = f"  {label:<12}" + "".join(fmt.format(int(v)) for v in cm[i])
+        row_sum = cm[i].sum()
+        if row_sum > 0:
+            pcts = cm[i] / row_sum * 100
+            row = f"  {label:<12}" + "".join(f"{v:>8.1f}%" for v in pcts)
+        else:
+            row = f"  {label:<12}" + "".join(f"{'0.0%':>9s}" for _ in labels)
         print(row)
 
 
