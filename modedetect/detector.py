@@ -302,6 +302,10 @@ class ModeDetector:
         logger.info("Training XGBoost classifier...")
         self._train_model(merged, cfg)
 
+        # Save OOF predictions checkpoint if available
+        if ckpt is not None and self._oof_predictions is not None:
+            self._ckpt_save(ckpt, "05_oof_predictions.parquet", self._oof_predictions)
+
         logger.info(
             "Training complete: %d features, %d classes (%s)",
             len(self._feature_list),
@@ -695,6 +699,10 @@ class ModeDetector:
         best_f1 = -1.0
         best_model = None
 
+        # Collect out-of-fold predictions for honest evaluation
+        oof_preds = np.full(len(y), -1, dtype=int)
+        trip_keys = merged["trip_key"].values if "trip_key" in merged.columns else merged[cfg.col_trip_key].values
+
         for fold, (train_idx, val_idx) in enumerate(skf.split(X, y)):
             clf = XGBClassifier(**xgb_kwargs)
             fit_kwargs = {}
@@ -703,6 +711,7 @@ class ModeDetector:
             clf.fit(X[train_idx], y[train_idx], **fit_kwargs)
 
             y_pred = clf.predict(X[val_idx])
+            oof_preds[val_idx] = y_pred
             f1 = f1_score(y[val_idx], y_pred, average="macro")
 
             logger.info("Fold %d/%d — macro F1: %.4f", fold + 1, cfg.n_folds, f1)
@@ -712,7 +721,13 @@ class ModeDetector:
                 best_model = clf
 
         self._model = best_model
-        logger.info("Best fold macro F1: %.4f", best_f1)
+        self._oof_predictions = pd.DataFrame({
+            "trip_key": trip_keys,
+            "true_label": self._encoder.inverse_transform(y),
+            "pred_label": self._encoder.inverse_transform(oof_preds),
+        })
+        oof_f1 = f1_score(y, oof_preds, average="macro")
+        logger.info("Best fold macro F1: %.4f, OOF macro F1: %.4f", best_f1, oof_f1)
 
     def _forward_feature_selection(
         self,
