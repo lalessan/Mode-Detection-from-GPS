@@ -581,11 +581,15 @@ class ModeDetector:
             key_chunks = np.array_split(trip_keys, n_chunks)
 
             # Build GPS chunks (each worker gets only its trips)
-            gps_chunks = []
-            trip_set_index = gps[cfg.col_trip_key]
-            for chunk_keys in key_chunks:
-                mask = trip_set_index.isin(set(chunk_keys))
-                gps_chunks.append(gps[mask])
+            # Use groupby for O(n) chunking instead of repeated .isin() scans
+            key_to_chunk = {}
+            for i, chunk_keys in enumerate(key_chunks):
+                for k in chunk_keys:
+                    key_to_chunk[k] = i
+            chunk_ids = gps[cfg.col_trip_key].map(key_to_chunk)
+            gps_chunks = [group for _, group in gps.assign(_chunk=chunk_ids).groupby("_chunk", sort=True, observed=True)]
+            # Drop temp column
+            gps_chunks = [c.drop(columns=["_chunk"]) for c in gps_chunks]
 
             # Only serialize BallTrees if signals aren't pre-computed
             rsig_in_data = any(c.startswith("_rsig_") for c in gps.columns)
