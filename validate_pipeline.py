@@ -1068,6 +1068,9 @@ def main():
         print(f"\n  Loading modedetect model from checkpoint: {model_ckpt}")
         from modedetect import ModeDetector
         model_new = ModeDetector.load(model_ckpt)
+        # Restore local paths stripped during save
+        model_new.config.gtfs_dir = GTFS_DIR
+        model_new.config.osm_routes_dir = OSM_ROUTES_DIR
     else:
         model_new = run_modedetect_pipeline(gps_df, trips_df)
         import shutil
