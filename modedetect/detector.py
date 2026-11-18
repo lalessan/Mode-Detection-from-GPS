@@ -275,8 +275,7 @@ class ModeDetector:
 
         # ── Step 4b: Pre-compute per-point route signals (for segmentation) ──
         rsig_col = "_rsig_bus"  # check if signals already exist in gps
-        self._ensure_route_resources(cfg)  # ensure BallTrees are loaded
-        if rsig_col not in gps.columns and self._route_balltrees:
+        if rsig_col not in gps.columns:
             rsig_ckpt = self._ckpt_load(ckpt, "04_route_signals.parquet")
             if rsig_ckpt is not None:
                 # Merge cached signal columns into gps
@@ -287,7 +286,7 @@ class ModeDetector:
                 for c in sig_cols:
                     gps[c] = rsig_ckpt[c].values
                 logger.info("Loaded per-point route signals from checkpoint.")
-            else:
+            elif self._ensure_route_resources(cfg):
                 logger.info("Computing per-point route signals (batch)...")
                 gps = feat_routes.batch_route_signals(gps, self._route_balltrees, cfg)
                 sig_cols = [c for c in gps.columns if c.startswith("_rsig_")]
