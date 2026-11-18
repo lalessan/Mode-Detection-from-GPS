@@ -587,7 +587,9 @@ class ModeDetector:
                 mask = trip_set_index.isin(set(chunk_keys))
                 gps_chunks.append(gps[mask])
 
-            rbt_bytes = _pickle.dumps(self._route_balltrees)
+            # Only serialize BallTrees if signals aren't pre-computed
+            rsig_in_data = any(c.startswith("_rsig_") for c in gps.columns)
+            rbt_bytes = _pickle.dumps({} if rsig_in_data else self._route_balltrees)
             cfg_bytes = _pickle.dumps(cfg)
 
             logger.info("Segmenting %d trips across %d workers...", len(trip_keys), n_jobs)
