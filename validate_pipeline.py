@@ -884,6 +884,8 @@ def level4_multimodal(gps_df, trips_df, model_new):
     model_new.config.n_jobs = n_jobs
     model_new.config.pelt_model = "l2"
     model_new.config.pelt_jump = 20
+    model_new.config.pelt_penalty = 100
+    model_new.config.pelt_fallback_penalties = [50, 20, 10]
 
     seg_ckpt = CHECKPOINT_DIR / "seg_preds_all.parquet"
     if seg_ckpt.exists():
