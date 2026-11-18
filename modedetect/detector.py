@@ -615,7 +615,15 @@ class ModeDetector:
             )
 
         route_features = None
-        if self._route_balltrees:
+        rsig_cols = [c for c in gps_seg.columns if c.startswith("_rsig_")]
+        if rsig_cols:
+            # Compute route match % directly from binary signals — no BallTree needed
+            key_col = cfg.col_trip_key
+            group_cols = [key_col, "segment"]
+            route_features = gps_seg.groupby(group_cols, sort=False, observed=True)[rsig_cols].mean()
+            route_features.columns = [c.replace("_rsig_", "") + "_match_pct" for c in rsig_cols]
+            route_features = route_features.reset_index().rename(columns={key_col: "trip_key"})
+        elif self._route_balltrees:
             route_features = feat_routes.compute_route_features(
                 gps_seg, self._route_balltrees, cfg, segment_col="segment",
             )
