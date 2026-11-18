@@ -680,6 +680,10 @@ def level2_compare_classification(merged_orig, orig_clf, orig_le, orig_feature_c
         new_set = set(model_new._feature_list)
         print(f"\n  Feature overlap: {len(orig_set & new_set)} common, "
               f"{len(orig_set - new_set)} only in original, {len(new_set - orig_set)} only in modedetect")
+        if orig_set - new_set:
+            print(f"    Only original:  {sorted(orig_set - new_set)}")
+        if new_set - orig_set:
+            print(f"    Only modedetect: {sorted(new_set - orig_set)}")
 
     return f1_orig
 
