@@ -163,6 +163,7 @@ class ModeDetector:
         validate_fit_inputs(gps_df, trips_df, cfg)
 
         ckpt = Path(checkpoint_dir) if checkpoint_dir else None
+        self._ckpt_dir = ckpt
         if ckpt:
             ckpt.mkdir(parents=True, exist_ok=True)
 
@@ -619,7 +620,22 @@ class ModeDetector:
         pct_map = compute_percentile_map(gps_seg, cfg, segment_col="segment")
 
         stop_features = None
-        if self._ensure_stop_resources(cfg):
+        # Use cached per-point stop data to avoid BallTree reload
+        stop_cache = None
+        if hasattr(self, '_ckpt_dir') and self._ckpt_dir is not None:
+            stop_cache = self._ckpt_dir / "03_stop_point_cache.npz"
+        if stop_cache is not None and stop_cache.exists():
+            # Re-aggregate from cached per-point data using segment labels
+            # The cache was saved from gps sorted by trip_key + timestamp,
+            # and gps_seg has the same points with segment labels added.
+            # Sort gps_seg the same way to align with cache indices.
+            from .features.stops import compute_stop_features
+            gps_seg_sorted = gps_seg.sort_values([cfg.col_trip_key, cfg.col_timestamp]).reset_index(drop=True)
+            stop_features = compute_stop_features(
+                gps_seg_sorted, None, None, cfg, segment_col="segment",
+                point_cache_path=stop_cache,
+            )
+        elif self._ensure_stop_resources(cfg):
             from .features.stops import compute_stop_features
             stop_features = compute_stop_features(
                 gps_seg, self._stop_tree, self._stop_df, cfg, segment_col="segment",
@@ -957,7 +973,13 @@ class ModeDetector:
 
         from .features.stops import compute_stop_features
 
-        stop_feats = compute_stop_features(gps, self._stop_tree, self._stop_df, cfg)
+        # Sort GPS consistently so per-point cache aligns with segment-level reuse
+        gps = gps.sort_values([cfg.col_trip_key, cfg.col_timestamp]).reset_index(drop=True)
+        cache_path = ckpt / "03_stop_point_cache.npz" if ckpt else None
+        stop_feats = compute_stop_features(
+            gps, self._stop_tree, self._stop_df, cfg,
+            point_cache_path=cache_path,
+        )
 
         # JS divergence to select optimal percentile per stop feature group
         stop_pct_cols = [c for c in stop_feats.columns if "_P" in c and (
