@@ -994,7 +994,9 @@ def level4_multimodal(gps_df, trips_df, model_new):
     print(f"  Exact match (strict):          {(sm['JACCARD'] == 1.0).mean() * 100:.1f}%")
     print(f"  Exact match (excl walking):    {(sm['JACCARD_NO_WALK'] == 1.0).mean() * 100:.1f}%")
     print(f"  Falsely segmented (>1 seg):    {sm_falsely_segmented:.1f}%")
-    print(f"  Avg segments per trip:         {sm['n_segments'].mean():.2f}")
+    print(f"  Avg GT modes per trip:         {sm['GT_SET'].apply(len).mean():.2f}")
+    print(f"  Avg predicted segments:        {sm['n_segments'].mean():.2f}")
+    print(f"  Avg predicted modes:           {sm['PRED_SET'].apply(len).mean():.2f}")
 
     # ── Multi-modal analysis ──
     print(f"\n  --- Multi-Modal Trips ({len(mm)}) ---")
@@ -1002,7 +1004,9 @@ def level4_multimodal(gps_df, trips_df, model_new):
     print(f"  Mean Jaccard (excl walking):   {mm['JACCARD_NO_WALK'].mean():.4f}")
     print(f"  Exact match (strict):          {(mm['JACCARD'] == 1.0).mean() * 100:.1f}%")
     print(f"  Exact match (excl walking):    {(mm['JACCARD_NO_WALK'] == 1.0).mean() * 100:.1f}%")
-    print(f"  Avg segments per trip:         {mm['n_segments'].mean():.2f}")
+    print(f"  Avg GT modes per trip:         {mm['GT_SET'].apply(len).mean():.2f}")
+    print(f"  Avg predicted segments:        {mm['n_segments'].mean():.2f}")
+    print(f"  Avg predicted modes:           {mm['PRED_SET'].apply(len).mean():.2f}")
 
     # ── Combined (all trips) ──
     print(f"\n  --- Combined (All {len(non_oos)} Trips) ---")
