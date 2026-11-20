@@ -273,6 +273,7 @@ class ModeDetector:
                 logger.info("Computing bus route sequence features...")
                 bus_seq_features = compute_bus_route_sequence_features(
                     gps, self._stop_tree, self._stop_df, cfg,
+                    radius_m=cfg.bus_seq_radius_m,
                 )
                 if bus_seq_features is not None:
                     self._ckpt_save(ckpt, "03b_bus_seq_features.parquet", bus_seq_features)
@@ -561,6 +562,7 @@ class ModeDetector:
             from .features.stops import compute_bus_route_sequence_features
             bus_seq_features = compute_bus_route_sequence_features(
                 gps, self._stop_tree, self._stop_df, cfg,
+                radius_m=cfg.bus_seq_radius_m,
             )
 
         route_features = None
@@ -695,7 +697,7 @@ class ModeDetector:
             from .features.stops import compute_bus_route_sequence_features
             bus_seq_features = compute_bus_route_sequence_features(
                 gps_seg, self._stop_tree, self._stop_df, cfg,
-                segment_col="segment",
+                segment_col="segment", radius_m=cfg.bus_seq_radius_m,
             )
 
         return self._merge_features(stats, pct_map, stop_features, route_features,

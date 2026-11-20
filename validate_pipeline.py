@@ -391,7 +391,7 @@ def run_modedetect_pipeline(gps_df, trips_df):
         gap_threshold_s=300.0,
         min_trip_duration_s=180,
         min_gps_points=10,
-        stop_search_radius_m=1000,
+        stop_search_radius_m=50,
         route_search_radius_m=20,
         route_densify_spacing_m=10,
         n_folds=5,

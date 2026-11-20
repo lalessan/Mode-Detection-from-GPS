@@ -73,7 +73,8 @@ class ModeDetectConfig:
 
     # ── Stop proximity (GTFS) ─────────────────────────────────────────
     gtfs_dir: Path | None = None
-    stop_search_radius_m: int = 250
+    stop_search_radius_m: int = 50
+    bus_seq_radius_m: int = 30  # tighter radius for bus route sequence feature
     stop_quantiles: tuple[int, ...] = field(default_factory=_default_stop_quantiles)
 
     # ── Route matching (OSM) ──────────────────────────────────────────
