@@ -1025,6 +1025,7 @@ class ModeDetector:
 
         # Sort GPS consistently so per-point cache aligns with segment-level reuse
         gps = gps.sort_values([cfg.col_trip_key, cfg.col_timestamp]).reset_index(drop=True)
+        ckpt = getattr(self, '_ckpt_dir', None)
         cache_path = ckpt / "03_stop_point_cache.npz" if ckpt else None
         stop_feats = compute_stop_features(
             gps, self._stop_tree, self._stop_df, cfg,
