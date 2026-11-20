@@ -1015,36 +1015,35 @@ def level4_multimodal(gps_df, trips_df, model_new):
     print(f"  Exact match (strict):          {(non_oos['JACCARD'] == 1.0).mean() * 100:.1f}%")
     print(f"  Exact match (excl walking):    {(non_oos['JACCARD_NO_WALK'] == 1.0).mean() * 100:.1f}%")
 
-    # ── Mode presence analysis (set-level "confusion") ──
-    # For each GT mode: how often detected, missed, or extra modes predicted.
-    # Works on mode *sets* since we don't have per-segment GT labels.
-    all_modes = sorted({m for s in non_oos["GT_SET"] for m in s} |
-                       {m for s in non_oos["PRED_SET"] for m in s})
-    if all_modes:
-        print(f"\n  --- Mode Presence Matrix (all {len(non_oos)} trips, row-%) ---")
-        print(f"  Rows = GT mode present in trip, Cols = predicted mode present in trip")
-        print(f"  Read as: 'Of trips containing GT mode X, what % also predicted mode Y?'\n")
+    # ── Mode-set confusion: GT combo → predicted combo distribution ──
+    # For each common GT mode combination, show top predicted combinations.
+    def _fmt_set(s):
+        return "+".join(sorted(s)) if s else "(empty)"
 
-        # Build binary presence matrices
-        gt_binary = {m: non_oos["GT_SET"].apply(lambda s, m=m: m in s) for m in all_modes}
-        pred_binary = {m: non_oos["PRED_SET"].apply(lambda s, m=m: m in s) for m in all_modes}
+    non_oos["_gt_key"] = non_oos["GT_SET"].apply(_fmt_set)
+    non_oos["_pred_key"] = non_oos["PRED_SET"].apply(_fmt_set)
 
-        # Header
-        col_w = 7
-        header = "  " + "".rjust(10) + "".join(m[:col_w].rjust(col_w) for m in all_modes) + "   Count"
-        print(header)
+    # Show top GT combos (by frequency)
+    gt_counts = non_oos["_gt_key"].value_counts()
+    top_n_gt = 15  # show top GT combos
+    top_n_pred = 5  # show top predicted combos per GT
 
-        for gt_mode in all_modes:
-            mask = gt_binary[gt_mode]
-            n_gt = mask.sum()
-            if n_gt == 0:
-                continue
-            row = f"  {gt_mode:>10}"
-            for pred_mode in all_modes:
-                pct = pred_binary[pred_mode][mask].mean() * 100
-                row += f"{pct:>{col_w}.1f}"
-            row += f"   {n_gt:>5}"
-            print(row)
+    print(f"\n  --- Mode-Set Confusion (top {top_n_gt} GT combos) ---")
+    print(f"  GT mode set → top predicted mode sets (% of trips with that GT)\n")
+
+    for gt_key in gt_counts.head(top_n_gt).index:
+        n = gt_counts[gt_key]
+        subset = non_oos[non_oos["_gt_key"] == gt_key]
+        pred_dist = subset["_pred_key"].value_counts(normalize=True).head(top_n_pred)
+        print(f"  GT: {gt_key}  (n={n})")
+        for pred_key, frac in pred_dist.items():
+            marker = " <--" if pred_key == gt_key else ""
+            print(f"      → {pred_key:40s} {frac*100:5.1f}%{marker}")
+        # Show what % is exact match (excl walking)
+        gt_set = subset["GT_SET"].iloc[0]
+        exact_strict = (subset["_pred_key"] == gt_key).mean() * 100
+        print(f"      Exact match: {exact_strict:.1f}%")
+        print()
 
     # ── Compare with student ──
     if "route_signal" in student_results:
