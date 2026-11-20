@@ -1018,7 +1018,8 @@ def level4_multimodal(gps_df, trips_df, model_new):
     # ── Mode-set confusion: GT combo → predicted combo distribution ──
     # For each common GT mode combination, show top predicted combinations.
     def _fmt_set(s):
-        return "+".join(sorted(s)) if s else "(empty)"
+        s = {m for m in s if m != "WALKING"}
+        return "+".join(sorted(s)) if s else "(walk-only)"
 
     non_oos["_gt_key"] = non_oos["GT_SET"].apply(_fmt_set)
     non_oos["_pred_key"] = non_oos["PRED_SET"].apply(_fmt_set)
