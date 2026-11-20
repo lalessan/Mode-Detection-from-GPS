@@ -462,6 +462,137 @@ def compute_stop_features(
     return basic
 
 
+# ── Bus route sequence features ──────────────────────────────────────
+
+
+def compute_bus_route_sequence_features(
+    gps_df: pd.DataFrame,
+    tree: BallTree | None,
+    stops_df: pd.DataFrame | None,
+    config: ModeDetectConfig,
+    segment_col: str | None = None,
+    cache_path: Path | str | None = None,
+) -> pd.DataFrame | None:
+    """Count how many unique stops from the same bus route each trip/segment visits.
+
+    A bus passenger passes many stops of the same route in sequence;
+    a car driver passes near random stops from many different routes.
+
+    Returns DataFrame with ``trip_key`` (and optional ``segment``) plus:
+
+    - ``BUS_SEQ_STOPS``: max unique stops from a single bus route
+    - ``BUS_SEQ_ROUTES``: number of bus routes with ≥2 stops visited
+    """
+    key_col = config.col_trip_key
+    group_cols = [key_col] if segment_col is None else [key_col, segment_col]
+    n_points = len(gps_df)
+
+    # ── Load or compute per-point bus stop hits ───────────────────────
+    # Cache stores list of list-of-tuples: [(stop_idx, [route_ids]), ...] per point
+    _cache_path = Path(cache_path) if cache_path is not None else None
+    per_point_hits = None  # list[list[tuple[int, list[str]]]]
+
+    if _cache_path is not None and _cache_path.exists():
+        import pickle
+        logger.info("Loading bus route sequence cache from %s", _cache_path)
+        with open(_cache_path, "rb") as f:
+            cached = pickle.load(f)
+        if len(cached) == n_points:
+            per_point_hits = cached
+        else:
+            logger.warning("Bus route cache size mismatch (%d vs %d) — recomputing.",
+                           len(cached), n_points)
+
+    if per_point_hits is None:
+        if tree is None or stops_df is None or "bus_route_id_set" not in stops_df.columns:
+            return None
+
+        bus_route_ids = stops_df["bus_route_id_set"].values
+        has_any_bus = any(len(r) > 0 for r in bus_route_ids if isinstance(r, (list, set)))
+        if not has_any_bus:
+            return None
+
+        logger.info("Computing bus route sequence features (BallTree query)...")
+        all_lat = gps_df[config.col_latitude].astype("float64").values
+        all_lon = gps_df[config.col_longitude].astype("float64").values
+        gps_rad = np.radians(np.column_stack([all_lat, all_lon]))
+        rad = config.stop_search_radius_m / EARTH_RADIUS_M
+
+        idx_arrays = tree.query_radius(gps_rad, r=rad)
+
+        # For each GPS point, collect (stop_index, bus_route_ids) for bus stops
+        per_point_hits = []
+        for idx_arr in idx_arrays:
+            hits = []
+            for si in idx_arr:
+                br = bus_route_ids[si]
+                if isinstance(br, (list, set)) and br:
+                    hits.append((int(si), list(br)))
+            per_point_hits.append(hits)
+
+        if _cache_path is not None:
+            import pickle
+            _cache_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(_cache_path, "wb") as f:
+                pickle.dump(per_point_hits, f)
+            logger.info("Saved bus route sequence cache to %s", _cache_path)
+
+    # ── Aggregate per group: route_id → set of unique stop indices ────
+    from collections import defaultdict
+
+    # Build composite group key per point
+    if len(group_cols) == 1:
+        group_key_arr = gps_df[group_cols[0]].values
+    else:
+        group_key_arr = gps_df[group_cols[0]].astype(str).values
+        for gc in group_cols[1:]:
+            seg_arr = gps_df[gc].astype(str).values
+            group_key_arr = np.char.add(np.char.add(group_key_arr, "|||"), seg_arr)
+
+    group_route_stops = defaultdict(lambda: defaultdict(set))
+
+    for i, hits in enumerate(per_point_hits):
+        if not hits:
+            continue
+        gk = group_key_arr[i]
+        for stop_idx, route_ids in hits:
+            for rid in route_ids:
+                group_route_stops[gk][rid].add(stop_idx)
+
+    # Build output aligned to groupby order
+    group_keys_ordered = gps_df.groupby(group_cols, sort=False, observed=True).first().index
+    bus_seq_stops = []
+    bus_seq_routes = []
+
+    for gk_tuple in group_keys_ordered:
+        if len(group_cols) == 1:
+            gk = gk_tuple
+        else:
+            gk = "|||".join(str(x) for x in gk_tuple)
+        route_stops = group_route_stops.get(gk, {})
+        if route_stops:
+            counts = [len(sids) for sids in route_stops.values()]
+            bus_seq_stops.append(max(counts))
+            bus_seq_routes.append(sum(1 for c in counts if c >= 2))
+        else:
+            bus_seq_stops.append(0)
+            bus_seq_routes.append(0)
+
+    result = gps_df.groupby(group_cols, sort=False, observed=True).size().reset_index(name="_n")
+    result = result.drop(columns=["_n"])
+    result["BUS_SEQ_STOPS"] = bus_seq_stops
+    result["BUS_SEQ_ROUTES"] = bus_seq_routes
+
+    if key_col != "trip_key" and key_col in result.columns:
+        result = result.rename(columns={key_col: "trip_key"})
+    if segment_col is not None and segment_col in result.columns and segment_col != "segment":
+        result = result.rename(columns={segment_col: "segment"})
+
+    logger.info("Bus route sequence features: %d groups, max BUS_SEQ_STOPS=%d",
+                len(result), result["BUS_SEQ_STOPS"].max() if len(result) > 0 else 0)
+    return result
+
+
 # ── GTFS loading helpers ─────────────────────────────────────────────
 
 
@@ -469,7 +600,7 @@ def load_gtfs_stops(gtfs_dir: Path) -> pd.DataFrame:
     """Load and merge stop data from GTFS zip files in a directory.
 
     Returns a DataFrame with ``stop_id``, ``stop_lat``, ``stop_lon``,
-    and ``route_type_set`` columns.
+    ``route_type_set``, and ``bus_route_id_set`` columns.
     """
     import zipfile
 
@@ -503,7 +634,7 @@ def load_gtfs_stops(gtfs_dir: Path) -> pd.DataFrame:
 
     stops = pd.concat(all_stops, ignore_index=True).drop_duplicates(subset=["stop_id"])
 
-    # Build stop → route_type mapping if possible
+    # Build stop → route_type and stop → bus_route_id mappings
     if all_stop_times and all_routes and all_trips:
         st = pd.concat(all_stop_times, ignore_index=True).drop_duplicates()
         routes = pd.concat(all_routes, ignore_index=True).drop_duplicates(subset=["route_id"])
@@ -519,11 +650,26 @@ def load_gtfs_stops(gtfs_dir: Path) -> pd.DataFrame:
         stops["route_type_set"] = stops["route_type_set"].apply(
             lambda x: x if isinstance(x, list) else []
         )
+
+        # Bus route IDs per stop (route_type == 3)
+        bus_routes = stop_routes[stop_routes["route_type"] == 3]
+        if not bus_routes.empty:
+            bus_route_sets = bus_routes.groupby("stop_id")["route_id"].apply(
+                lambda x: list(set(x.astype(str)))
+            ).reset_index()
+            bus_route_sets.columns = ["stop_id", "bus_route_id_set"]
+            stops = stops.merge(bus_route_sets, on="stop_id", how="left")
+        else:
+            stops["bus_route_id_set"] = np.nan
+        stops["bus_route_id_set"] = stops["bus_route_id_set"].apply(
+            lambda x: x if isinstance(x, list) else []
+        )
     else:
         stops["route_type_set"] = [[] for _ in range(len(stops))]
+        stops["bus_route_id_set"] = [[] for _ in range(len(stops))]
 
     required = {"stop_id", "stop_lat", "stop_lon"}
     if not required.issubset(stops.columns):
         raise ValueError(f"GTFS stops missing columns: {required - set(stops.columns)}")
 
-    return stops[["stop_id", "stop_lat", "stop_lon", "route_type_set"]]
+    return stops[["stop_id", "stop_lat", "stop_lon", "route_type_set", "bus_route_id_set"]]

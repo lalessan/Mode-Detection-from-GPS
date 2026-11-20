@@ -100,5 +100,8 @@ class ModeDetectConfig:
     random_state: int = 0
     n_folds: int = 5
 
+    # ── Post-processing ────────────────────────────────────────────────
+    postprocess_enabled: bool = True  # apply heuristic fixes after segment classification
+
     # ── Parallelism ───────────────────────────────────────────────────
     n_jobs: int = 1  # 1 = single-process; -1 = all cores

@@ -262,6 +262,24 @@ class ModeDetector:
                     stop_features, stats, cfg, stop_pct_cols,
                 )
 
+        # ── Step 3b: Bus route sequence features ────────────────────────
+        bus_seq_features = self._ckpt_load(ckpt, "03b_bus_seq_features.parquet")
+        if bus_seq_features is None:
+            if self._stop_tree is not None and self._stop_df is not None:
+                from .features.stops import compute_bus_route_sequence_features
+                bus_seq_cache = ckpt / "03b_bus_route_cache.pkl" if ckpt else None
+                logger.info("Computing bus route sequence features...")
+                bus_seq_features = compute_bus_route_sequence_features(
+                    gps, self._stop_tree, self._stop_df, cfg,
+                    cache_path=bus_seq_cache,
+                )
+                if bus_seq_features is not None:
+                    self._ckpt_save(ckpt, "03b_bus_seq_features.parquet", bus_seq_features)
+            else:
+                logger.info("No GTFS BallTree — skipping bus route sequence features.")
+        else:
+            logger.info("Loaded bus route sequence features from checkpoint.")
+
         # ── Step 4: Route matching features ───────────────────────────
         route_features = self._ckpt_load(ckpt, "04_route_features.parquet")
         if route_features is None:
@@ -297,7 +315,8 @@ class ModeDetector:
 
         # ── Step 5: Merge + train ─────────────────────────────────────
         logger.info("Merging feature sets...")
-        merged = self._merge_features(stats, pct_map, stop_features, route_features)
+        merged = self._merge_features(stats, pct_map, stop_features, route_features,
+                                      bus_seq_features=bus_seq_features)
 
         logger.info("Training XGBoost classifier...")
         self._train_model(merged, cfg)
@@ -512,11 +531,17 @@ class ModeDetector:
         y_pred = self._model.predict(X)
         labels = self._encoder.inverse_transform(y_pred)
 
-        return pd.DataFrame({
+        result = pd.DataFrame({
             "trip_key": features_df["trip_key"].values,
             "segment": features_df["segment"].values,
             "predicted_mode": labels,
         })
+
+        if cfg.postprocess_enabled:
+            from .postprocessing import postprocess_segments
+            result = postprocess_segments(result, features_df, cfg)
+
+        return result
 
     # ── Internal: feature extraction ──────────────────────────────────
 
@@ -530,11 +555,19 @@ class ModeDetector:
             from .features.stops import compute_stop_features
             stop_features = compute_stop_features(gps, self._stop_tree, self._stop_df, cfg)
 
+        bus_seq_features = None
+        if self._stop_tree is not None and self._stop_df is not None:
+            from .features.stops import compute_bus_route_sequence_features
+            bus_seq_features = compute_bus_route_sequence_features(
+                gps, self._stop_tree, self._stop_df, cfg,
+            )
+
         route_features = None
         if self._ensure_route_resources(cfg):
             route_features = feat_routes.compute_route_features(gps, self._route_balltrees, cfg)
 
-        return self._merge_features(stats, pct_map, stop_features, route_features)
+        return self._merge_features(stats, pct_map, stop_features, route_features,
+                                    bus_seq_features=bus_seq_features)
 
     def _extract_segmented_features(self, gps: pd.DataFrame, cfg: ModeDetectConfig) -> pd.DataFrame:
         """Segment each trip, then extract per-segment features."""
@@ -655,7 +688,30 @@ class ModeDetector:
                 gps_seg, self._route_balltrees, cfg, segment_col="segment",
             )
 
-        return self._merge_features(stats, pct_map, stop_features, route_features)
+        # Bus route sequence features at segment level
+        bus_seq_features = None
+        bus_seq_cache = None
+        if hasattr(self, '_ckpt_dir') and self._ckpt_dir is not None:
+            bus_seq_cache = self._ckpt_dir / "03b_bus_route_cache.pkl"
+        if bus_seq_cache is not None and bus_seq_cache.exists():
+            # Re-aggregate from cached per-point hits using segment labels.
+            # Cache was saved with GPS sorted by trip_key + timestamp, so sort
+            # gps_seg the same way to align point indices.
+            from .features.stops import compute_bus_route_sequence_features
+            gps_seg_sorted = gps_seg.sort_values([cfg.col_trip_key, cfg.col_timestamp]).reset_index(drop=True)
+            bus_seq_features = compute_bus_route_sequence_features(
+                gps_seg_sorted, None, None, cfg,
+                segment_col="segment", cache_path=bus_seq_cache,
+            )
+        elif self._stop_tree is not None and self._stop_df is not None:
+            from .features.stops import compute_bus_route_sequence_features
+            bus_seq_features = compute_bus_route_sequence_features(
+                gps_seg, self._stop_tree, self._stop_df, cfg,
+                segment_col="segment",
+            )
+
+        return self._merge_features(stats, pct_map, stop_features, route_features,
+                                    bus_seq_features=bus_seq_features)
 
     # ── Internal: training ────────────────────────────────────────────
 
@@ -893,6 +949,7 @@ class ModeDetector:
         pct_map: pd.DataFrame,
         stop_features: pd.DataFrame | None,
         route_features: pd.DataFrame | None,
+        bus_seq_features: pd.DataFrame | None = None,
     ) -> pd.DataFrame:
         """Merge all feature DataFrames on trip_key (+ segment if present)."""
         has_segment = "segment" in stats.columns
@@ -920,6 +977,9 @@ class ModeDetector:
 
         if route_features is not None:
             merged = merged.merge(route_features, on=merge_on, how="left")
+
+        if bus_seq_features is not None:
+            merged = merged.merge(bus_seq_features, on=merge_on, how="left")
 
         return merged
 
