@@ -267,7 +267,7 @@ class ModeDetector:
         if bus_seq_features is None:
             if self._stop_tree is not None and self._stop_df is not None:
                 from .features.stops import compute_bus_route_sequence_features
-                bus_seq_cache = ckpt / "03b_bus_route_cache.pkl" if ckpt else None
+                bus_seq_cache = ckpt / "03b_bus_route_cache.npz" if ckpt else None
                 logger.info("Computing bus route sequence features...")
                 bus_seq_features = compute_bus_route_sequence_features(
                     gps, self._stop_tree, self._stop_df, cfg,
@@ -692,7 +692,7 @@ class ModeDetector:
         bus_seq_features = None
         bus_seq_cache = None
         if hasattr(self, '_ckpt_dir') and self._ckpt_dir is not None:
-            bus_seq_cache = self._ckpt_dir / "03b_bus_route_cache.pkl"
+            bus_seq_cache = self._ckpt_dir / "03b_bus_route_cache.npz"
         if bus_seq_cache is not None and bus_seq_cache.exists():
             # Re-aggregate from cached per-point hits using segment labels.
             # Cache was saved with GPS sorted by trip_key + timestamp, so sort
