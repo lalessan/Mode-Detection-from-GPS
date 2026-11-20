@@ -270,11 +270,9 @@ class ModeDetector:
                 self._ensure_stop_resources(cfg)
             if self._stop_tree is not None and self._stop_df is not None:
                 from .features.stops import compute_bus_route_sequence_features
-                bus_seq_cache = ckpt / "03b_bus_route_cache.npz" if ckpt else None
                 logger.info("Computing bus route sequence features...")
                 bus_seq_features = compute_bus_route_sequence_features(
                     gps, self._stop_tree, self._stop_df, cfg,
-                    cache_path=bus_seq_cache,
                 )
                 if bus_seq_features is not None:
                     self._ckpt_save(ckpt, "03b_bus_seq_features.parquet", bus_seq_features)
@@ -693,20 +691,7 @@ class ModeDetector:
 
         # Bus route sequence features at segment level
         bus_seq_features = None
-        bus_seq_cache = None
-        if hasattr(self, '_ckpt_dir') and self._ckpt_dir is not None:
-            bus_seq_cache = self._ckpt_dir / "03b_bus_route_cache.npz"
-        if bus_seq_cache is not None and bus_seq_cache.exists():
-            # Re-aggregate from cached per-point hits using segment labels.
-            # Cache was saved with GPS sorted by trip_key + timestamp, so sort
-            # gps_seg the same way to align point indices.
-            from .features.stops import compute_bus_route_sequence_features
-            gps_seg_sorted = gps_seg.sort_values([cfg.col_trip_key, cfg.col_timestamp]).reset_index(drop=True)
-            bus_seq_features = compute_bus_route_sequence_features(
-                gps_seg_sorted, None, None, cfg,
-                segment_col="segment", cache_path=bus_seq_cache,
-            )
-        elif self._stop_tree is not None and self._stop_df is not None:
+        if self._stop_tree is not None and self._stop_df is not None:
             from .features.stops import compute_bus_route_sequence_features
             bus_seq_features = compute_bus_route_sequence_features(
                 gps_seg, self._stop_tree, self._stop_df, cfg,

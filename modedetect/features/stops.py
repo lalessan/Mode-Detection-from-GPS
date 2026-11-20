@@ -471,7 +471,6 @@ def compute_bus_route_sequence_features(
     stops_df: pd.DataFrame | None,
     config: ModeDetectConfig,
     segment_col: str | None = None,
-    cache_path: Path | str | None = None,
 ) -> pd.DataFrame | None:
     """Count how many unique stops from the same bus route each trip/segment visits.
 
@@ -490,81 +489,56 @@ def compute_bus_route_sequence_features(
     group_cols = [key_col] if segment_col is None else [key_col, segment_col]
     n_points = len(gps_df)
 
-    # ── Load or compute flat COO arrays of (point_idx, stop_idx) ──────
-    # Cache stores two int arrays in .npz format for fast load.
-    _cache_path = Path(cache_path) if cache_path is not None else None
-    hit_point_idx = None  # int array: which GPS point
-    hit_stop_idx = None   # int array: which stop (index into stops_df)
+    # ── Compute flat COO arrays of (point_idx, stop_idx) ──────────────
+    if tree is None or stops_df is None or "bus_route_id_set" not in stops_df.columns:
+        return None
 
-    if _cache_path is not None and _cache_path.exists():
-        logger.info("Loading bus route sequence cache from %s", _cache_path)
-        data = np.load(_cache_path, allow_pickle=False)
-        if int(data["n_points"]) == n_points:
-            hit_point_idx = data["hit_point_idx"]
-            hit_stop_idx = data["hit_stop_idx"]
-        else:
-            logger.warning("Bus route cache size mismatch (%d vs %d) — recomputing.",
-                           int(data["n_points"]), n_points)
+    # Build bus stop mask (stops that serve at least one bus route)
+    bus_route_ids_arr = stops_df["bus_route_id_set"].values
+    is_bus_stop = np.array([
+        bool(r) if isinstance(r, (list, set)) else False
+        for r in bus_route_ids_arr
+    ])
+    if not is_bus_stop.any():
+        return None
 
-    if hit_point_idx is None:
-        if tree is None or stops_df is None or "bus_route_id_set" not in stops_df.columns:
-            return None
+    logger.info("Computing bus route sequence features (BallTree query on %d points)...",
+                n_points)
+    all_lat = gps_df[config.col_latitude].astype("float64").values
+    all_lon = gps_df[config.col_longitude].astype("float64").values
+    gps_rad = np.radians(np.column_stack([all_lat, all_lon]))
+    rad = config.stop_search_radius_m / EARTH_RADIUS_M
 
-        # Build bus stop mask (stops that serve at least one bus route)
-        bus_route_ids_arr = stops_df["bus_route_id_set"].values
-        is_bus_stop = np.array([
-            bool(r) if isinstance(r, (list, set)) else False
-            for r in bus_route_ids_arr
-        ])
-        if not is_bus_stop.any():
-            return None
+    # Chunked BallTree query with progress bar
+    from tqdm import tqdm
+    chunk_size = 500_000
+    point_indices = []
+    stop_indices = []
+    n_chunks = (n_points + chunk_size - 1) // chunk_size
 
-        logger.info("Computing bus route sequence features (BallTree query on %d points)...",
-                    n_points)
-        all_lat = gps_df[config.col_latitude].astype("float64").values
-        all_lon = gps_df[config.col_longitude].astype("float64").values
-        gps_rad = np.radians(np.column_stack([all_lat, all_lon]))
-        rad = config.stop_search_radius_m / EARTH_RADIUS_M
+    for chunk_i in tqdm(range(n_chunks), desc="Bus route seq (BallTree)",
+                        unit="chunk"):
+        start = chunk_i * chunk_size
+        end = min(start + chunk_size, n_points)
+        chunk_rad = gps_rad[start:end]
 
-        # Chunked BallTree query with progress bar
-        from tqdm import tqdm
-        chunk_size = 500_000
-        point_indices = []
-        stop_indices = []
-        offset = 0
-        n_chunks = (n_points + chunk_size - 1) // chunk_size
+        idx_arrays = tree.query_radius(chunk_rad, r=rad)
 
-        for chunk_i in tqdm(range(n_chunks), desc="Bus route seq (BallTree)",
-                            unit="chunk"):
-            start = chunk_i * chunk_size
-            end = min(start + chunk_size, n_points)
-            chunk_rad = gps_rad[start:end]
+        for j, idx_arr in enumerate(idx_arrays):
+            if len(idx_arr) == 0:
+                continue
+            bus_mask = is_bus_stop[idx_arr]
+            if bus_mask.any():
+                bus_hits = idx_arr[bus_mask]
+                point_indices.append(np.full(len(bus_hits), start + j, dtype=np.int32))
+                stop_indices.append(bus_hits.astype(np.int32))
 
-            idx_arrays = tree.query_radius(chunk_rad, r=rad)
-
-            for j, idx_arr in enumerate(idx_arrays):
-                if len(idx_arr) == 0:
-                    continue
-                bus_mask = is_bus_stop[idx_arr]
-                if bus_mask.any():
-                    bus_hits = idx_arr[bus_mask]
-                    point_indices.append(np.full(len(bus_hits), start + j, dtype=np.int32))
-                    stop_indices.append(bus_hits.astype(np.int32))
-
-        if point_indices:
-            hit_point_idx = np.concatenate(point_indices)
-            hit_stop_idx = np.concatenate(stop_indices)
-        else:
-            hit_point_idx = np.array([], dtype=np.int32)
-            hit_stop_idx = np.array([], dtype=np.int32)
-
-        if _cache_path is not None:
-            _cache_path = Path(_cache_path)
-            _cache_path.parent.mkdir(parents=True, exist_ok=True)
-            np.savez(_cache_path, hit_point_idx=hit_point_idx,
-                     hit_stop_idx=hit_stop_idx, n_points=np.array(n_points))
-            logger.info("Saved bus route sequence cache to %s (%d hits)",
-                        _cache_path, len(hit_point_idx))
+    if point_indices:
+        hit_point_idx = np.concatenate(point_indices)
+        hit_stop_idx = np.concatenate(stop_indices)
+    else:
+        hit_point_idx = np.array([], dtype=np.int32)
+        hit_stop_idx = np.array([], dtype=np.int32)
 
     if len(hit_point_idx) == 0:
         # No bus stop hits at all — return zeros
