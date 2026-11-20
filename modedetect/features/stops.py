@@ -607,41 +607,46 @@ def compute_bus_route_sequence_features(
         if isinstance(br, (list, set)) and br:
             stop_route_codes[si] = [route_id_to_code[r] for r in br]
 
-    # Explode: (point_idx, stop_idx) → (point_idx, stop_idx, route_code)
-    exp_points = []
-    exp_stops = []
-    exp_routes = []
-    # Vectorize by grouping consecutive same-stop hits
-    for si in unique_stops_in_hits:
-        codes = stop_route_codes.get(si)
+    # ── Sort hits by stop index for fast O(1) slicing per stop ────────
+    sort_order = np.argsort(hit_stop_idx)
+    sorted_stop_idx = hit_stop_idx[sort_order]
+    sorted_point_idx = hit_point_idx[sort_order]
+
+    # Map point → group once
+    group_ids = gps_df.groupby(group_cols, sort=False, observed=True).ngroup().values
+
+    # For each stop: find unique groups that visited it, then expand by routes.
+    # This deduplicates at group level BEFORE exploding by route, reducing
+    # ~1.6B hit rows to ~millions of (group, route, stop) triples.
+    rows_group = []
+    rows_route = []
+    rows_stop = []
+
+    for si in tqdm(unique_stops_in_hits, desc="Bus route seq (aggregate)",
+                   disable=len(unique_stops_in_hits) < 100):
+        codes = stop_route_codes.get(int(si))
         if not codes:
             continue
-        mask = hit_stop_idx == si
-        pts = hit_point_idx[mask]
+        left = np.searchsorted(sorted_stop_idx, si, side="left")
+        right = np.searchsorted(sorted_stop_idx, si, side="right")
+        pts = sorted_point_idx[left:right]
+        unique_groups = np.unique(group_ids[pts])
+        n_g = len(unique_groups)
         for rc in codes:
-            exp_points.append(pts)
-            exp_stops.append(np.full(len(pts), si, dtype=np.int32))
-            exp_routes.append(np.full(len(pts), rc, dtype=np.int32))
+            rows_group.append(unique_groups)
+            rows_route.append(np.full(n_g, rc, dtype=np.int32))
+            rows_stop.append(np.full(n_g, int(si), dtype=np.int32))
 
-    exp_point_idx = np.concatenate(exp_points)
-    exp_stop_idx = np.concatenate(exp_stops)
-    exp_route_code = np.concatenate(exp_routes)
+    agg_df = pd.DataFrame({
+        "group_id": np.concatenate(rows_group),
+        "route_code": np.concatenate(rows_route),
+        "stop_idx": np.concatenate(rows_stop),
+    })
 
-    logger.info("Bus route sequence: %d exploded rows from %d hits, %d routes",
-                len(exp_point_idx), len(hit_point_idx), len(route_id_to_code))
-
-    # ── Map point indices to group IDs ────────────────────────────────
-    group_ids = gps_df.groupby(group_cols, sort=False, observed=True).ngroup().values
-    exp_group_id = group_ids[exp_point_idx]
+    logger.info("Bus route sequence: %d aggregation rows from %d hits, %d routes",
+                len(agg_df), len(hit_point_idx), len(route_id_to_code))
 
     # ── Aggregate: per (group, route), count unique stops ─────────────
-    # Use pandas for the groupby-nunique, which is fast in C
-    agg_df = pd.DataFrame({
-        "group_id": exp_group_id,
-        "route_code": exp_route_code,
-        "stop_idx": exp_stop_idx,
-    })
-    # Count unique stops per (group, route)
     route_stop_counts = agg_df.groupby(["group_id", "route_code"])["stop_idx"].nunique()
 
     # Per group: max stops from any single route, and count of routes with ≥2 stops
