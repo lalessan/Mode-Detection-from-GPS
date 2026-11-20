@@ -1,11 +1,10 @@
-"""Quick test: check bus route sequence feature values by mode.
+"""Quick test: check bus route sequence feature values by mode at different radii.
 
 Usage:
     python test_bus_seq.py [--sample FRAC]
 
 Example:
-    python test_bus_seq.py --sample 0.1   # 10% of trips (~3min instead of 14)
-    python test_bus_seq.py                 # all trips
+    python test_bus_seq.py --sample 0.1   # 10% of trips
 """
 import argparse
 import time
@@ -27,7 +26,7 @@ GTFS_DIR = next(
 )
 
 parser = argparse.ArgumentParser()
-parser.add_argument("--sample", type=float, default=1.0, help="Fraction of trips to use (0.0-1.0)")
+parser.add_argument("--sample", type=float, default=1.0, help="Fraction of trips (0.0-1.0)")
 args = parser.parse_args()
 
 cfg = ModeDetectConfig(
@@ -53,20 +52,29 @@ if args.sample < 1.0:
 else:
     print(f"Using all trips ({len(gps)} GPS points)")
 
-print("Computing bus route sequence features...")
-t0 = time.time()
-f = compute_bus_route_sequence_features(gps, tree, stops_df, cfg)
-print(f"Done in {time.time() - t0:.1f}s")
-
-print(f"\n{f.describe()}\n")
-
 trips_meta = pd.read_parquet(
     "checkpoints/fit_steps/02_stats.parquet",
     columns=["trip_key", "Main_Mode"],
 ).drop_duplicates("trip_key")
-m = f.merge(trips_meta, on="trip_key")
 
-print("Mean by mode:")
-print(m.groupby("Main_Mode")[["BUS_SEQ_STOPS", "BUS_SEQ_ROUTES"]].mean().round(2))
-print("\nMedian by mode:")
-print(m.groupby("Main_Mode")[["BUS_SEQ_STOPS", "BUS_SEQ_ROUTES"]].median())
+RADII = [20, 30, 50, 75, 100, 150]
+
+for radius in RADII:
+    print(f"\n{'='*60}")
+    print(f"  RADIUS = {radius}m")
+    print(f"{'='*60}")
+    t0 = time.time()
+    f = compute_bus_route_sequence_features(gps, tree, stops_df, cfg, radius_m=radius)
+    elapsed = time.time() - t0
+
+    if f is None:
+        print("  No results")
+        continue
+
+    m = f.merge(trips_meta, on="trip_key")
+    means = m.groupby("Main_Mode")["BUS_SEQ_STOPS"].mean()
+    bus_car_ratio = means.get("BUS", 0) / max(means.get("CAR", 1), 0.01)
+
+    print(f"  Time: {elapsed:.1f}s | BUS/CAR ratio: {bus_car_ratio:.2f}x")
+    print(f"  Mean BUS_SEQ_STOPS by mode:")
+    print(m.groupby("Main_Mode")[["BUS_SEQ_STOPS", "BUS_SEQ_ROUTES"]].mean().round(2).to_string(indent=4))
