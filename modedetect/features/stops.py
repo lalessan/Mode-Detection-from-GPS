@@ -519,25 +519,37 @@ def compute_bus_route_sequence_features(
         if not is_bus_stop.any():
             return None
 
-        logger.info("Computing bus route sequence features (BallTree query)...")
+        logger.info("Computing bus route sequence features (BallTree query on %d points)...",
+                    n_points)
         all_lat = gps_df[config.col_latitude].astype("float64").values
         all_lon = gps_df[config.col_longitude].astype("float64").values
         gps_rad = np.radians(np.column_stack([all_lat, all_lon]))
         rad = config.stop_search_radius_m / EARTH_RADIUS_M
 
-        idx_arrays = tree.query_radius(gps_rad, r=rad)
-
-        # Flatten to COO format, filtering to bus stops only
+        # Chunked BallTree query with progress bar
+        from tqdm import tqdm
+        chunk_size = 500_000
         point_indices = []
         stop_indices = []
-        for i, idx_arr in enumerate(idx_arrays):
-            if len(idx_arr) == 0:
-                continue
-            bus_mask = is_bus_stop[idx_arr]
-            if bus_mask.any():
-                bus_hits = idx_arr[bus_mask]
-                point_indices.append(np.full(len(bus_hits), i, dtype=np.int32))
-                stop_indices.append(bus_hits.astype(np.int32))
+        offset = 0
+        n_chunks = (n_points + chunk_size - 1) // chunk_size
+
+        for chunk_i in tqdm(range(n_chunks), desc="Bus route seq (BallTree)",
+                            unit="chunk"):
+            start = chunk_i * chunk_size
+            end = min(start + chunk_size, n_points)
+            chunk_rad = gps_rad[start:end]
+
+            idx_arrays = tree.query_radius(chunk_rad, r=rad)
+
+            for j, idx_arr in enumerate(idx_arrays):
+                if len(idx_arr) == 0:
+                    continue
+                bus_mask = is_bus_stop[idx_arr]
+                if bus_mask.any():
+                    bus_hits = idx_arr[bus_mask]
+                    point_indices.append(np.full(len(bus_hits), start + j, dtype=np.int32))
+                    stop_indices.append(bus_hits.astype(np.int32))
 
         if point_indices:
             hit_point_idx = np.concatenate(point_indices)
