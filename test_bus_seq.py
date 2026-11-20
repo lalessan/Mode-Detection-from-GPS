@@ -96,7 +96,7 @@ for r in summary_rows:
 
 # ── Part 2: General stop features at different radii ────────────────
 
-STOP_RADII = [100, 250, 500, 1000]
+STOP_RADII = [30, 50, 75, 100, 150, 250]
 KEY_FEATURES = ["MIN_DIST_BUS", "DURATION_BUS", "MIN_DIST_RAIL", "DURATION_RAIL",
                 "MIN_DIST_METRO", "DURATION_METRO", "MIN_DIST_TRAM", "DURATION_TRAM"]
 
