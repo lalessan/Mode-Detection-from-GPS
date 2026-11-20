@@ -764,6 +764,36 @@ def level3_compare_confusion(merged_orig, orig_clf, orig_feature_cols,
         cm_new = confusion_matrix(oof["true_label"], oof["pred_label"], labels=modes)
         _print_cm(cm_new, modes)
 
+    # ── Feature importance (modedetect) ──
+    if model_new is not None and hasattr(model_new, "_model") and model_new._model is not None:
+        print(f"\n  --- XGBoost Feature Importance (top 30, by gain) ---")
+        booster = model_new._model.get_booster()
+        importance = booster.get_score(importance_type="gain")
+        # Map feature names (f0, f1, ...) to actual names
+        fnames = model_new._feature_list
+        named_imp = {}
+        for k, v in importance.items():
+            idx = int(k[1:]) if k.startswith("f") else None
+            if idx is not None and idx < len(fnames):
+                named_imp[fnames[idx]] = v
+            else:
+                named_imp[k] = v
+        sorted_imp = sorted(named_imp.items(), key=lambda x: x[1], reverse=True)
+        for i, (feat, gain) in enumerate(sorted_imp[:30]):
+            print(f"    {i+1:>2}. {feat:<40s} {gain:>10.1f}")
+
+        # Show stop-related features specifically
+        stop_feats = [(f, g) for f, g in sorted_imp if any(
+            kw in f.upper() for kw in ["STOP", "DIST_BUS", "DIST_TRAM", "DIST_METRO", "DIST_RAIL",
+                                        "DURATION_BUS", "DURATION_TRAM", "DURATION_METRO", "DURATION_RAIL",
+                                        "CLOSEST_BUS", "CLOSEST_METRO", "CLOSEST_TRAM", "CLOSEST_RAIL"]
+        )]
+        if stop_feats:
+            print(f"\n  --- Stop-Related Features (all {len(stop_feats)}) ---")
+            for feat, gain in stop_feats:
+                rank = next(i+1 for i, (f, _) in enumerate(sorted_imp) if f == feat)
+                print(f"    #{rank:>2}  {feat:<40s} {gain:>10.1f}")
+
     return f1_orig
 
 
