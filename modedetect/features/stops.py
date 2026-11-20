@@ -504,12 +504,16 @@ def compute_bus_route_sequence_features(
     if not is_bus_stop.any():
         return None
 
-    logger.info("Computing bus route sequence features (BallTree query on %d points)...",
-                n_points)
+    # Use a tight radius (50m) — at 250m every trip in Paris passes ~30 stops
+    # of the same route regardless of mode. At 50m only points very close to
+    # the stop count, which is discriminative for buses vs cars.
+    bus_seq_radius_m = 50
+    logger.info("Computing bus route sequence features (BallTree query on %d points, radius=%dm)...",
+                n_points, bus_seq_radius_m)
     all_lat = gps_df[config.col_latitude].astype("float64").values
     all_lon = gps_df[config.col_longitude].astype("float64").values
     gps_rad = np.radians(np.column_stack([all_lat, all_lon]))
-    rad = config.stop_search_radius_m / EARTH_RADIUS_M
+    rad = bus_seq_radius_m / EARTH_RADIUS_M
 
     # Chunked BallTree query with progress bar
     chunk_size = 500_000
