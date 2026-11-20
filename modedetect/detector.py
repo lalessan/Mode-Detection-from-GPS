@@ -265,6 +265,9 @@ class ModeDetector:
         # ── Step 3b: Bus route sequence features ────────────────────────
         bus_seq_features = self._ckpt_load(ckpt, "03b_bus_seq_features.parquet")
         if bus_seq_features is None:
+            # Ensure BallTree is loaded (may not be if stop features came from cache)
+            if self._stop_tree is None:
+                self._ensure_stop_resources(cfg)
             if self._stop_tree is not None and self._stop_df is not None:
                 from .features.stops import compute_bus_route_sequence_features
                 bus_seq_cache = ckpt / "03b_bus_route_cache.npz" if ckpt else None
@@ -276,7 +279,7 @@ class ModeDetector:
                 if bus_seq_features is not None:
                     self._ckpt_save(ckpt, "03b_bus_seq_features.parquet", bus_seq_features)
             else:
-                logger.info("No GTFS BallTree — skipping bus route sequence features.")
+                logger.info("No GTFS configured — skipping bus route sequence features.")
         else:
             logger.info("Loaded bus route sequence features from checkpoint.")
 
