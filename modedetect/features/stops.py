@@ -485,6 +485,8 @@ def compute_bus_route_sequence_features(
     - ``BUS_SEQ_STOPS``: max unique stops from a single bus route
     - ``BUS_SEQ_ROUTES``: number of bus routes with ≥2 stops visited
     """
+    from tqdm import tqdm
+
     key_col = config.col_trip_key
     group_cols = [key_col] if segment_col is None else [key_col, segment_col]
     n_points = len(gps_df)
@@ -510,7 +512,6 @@ def compute_bus_route_sequence_features(
     rad = config.stop_search_radius_m / EARTH_RADIUS_M
 
     # Chunked BallTree query with progress bar
-    from tqdm import tqdm
     chunk_size = 500_000
     point_indices = []
     stop_indices = []
