@@ -112,14 +112,37 @@ SUBWAY's poor discrimination (best ratio only 1.91) explains why it's hard to cl
 
 ---
 
-## Next run: Empirically optimized per-mode radii
+## Run 2026-11-21c: Empirically optimized radii (bus=250m, metro=750m)
 
-Applying bus=250m, metro=750m, rail=50m, tram=50m. Expecting SUBWAY to recover (from F1 0.37 → hopefully closer to baseline 0.66).
+**Changes vs 21b**: bus 50m→250m, metro 250m→750m. Rail and tram stay at 50m.
 
-```bash
-git pull fork main
-python validate_pipeline.py --clean 2>&1 | tee run_output.txt
-```
+**Level 3 OOF:**
+
+| Mode | Baseline | Run 21b | This run (21c) | Delta vs 21b |
+|------|----------|---------|----------------|--------------|
+| BIKE | 0.8199 | 0.8005 | 0.8051 | +0.0046 |
+| BUS | 0.6636 | 0.6841 | 0.6865 | +0.0024 |
+| CAR | 0.9363 | 0.9320 | 0.9326 | +0.0006 |
+| SUBWAY | 0.6574 | 0.3670 | 0.3756 | +0.0086 |
+| TRAIN | 0.8111 | 0.8252 | 0.8262 | +0.0010 |
+| TRAMWAY | 0.6740 | 0.7464 | 0.7437 | -0.0027 |
+| WALKING | 0.8799 | 0.8698 | 0.8706 | +0.0008 |
+| **MACRO** | **0.7775** | **0.7464** | **0.7486** | **+0.0022** |
+
+**Level 4:**
+
+| Metric | Baseline | Run 21b | This run (21c) | Delta vs 21b |
+|--------|----------|---------|----------------|--------------|
+| ALL excl walk Jaccard | 0.7683 | **0.7740** | 0.7716 | -0.0024 |
+| ALL excl walk exact | 70.7% | **71.2%** | 70.9% | -0.3% |
+| SUBWAY→SUBWAY | — | 39.3% | **46.0%** | +6.7% |
+| CAR→CAR | 69.9% | 83.2% | **83.8%** | +0.6% |
+
+**Feature importance:** STOPS_CLOSEST_METRO_P95 ranked #9 (18.9) — up from METRO_P70 at #10 (16.6). BUS_SEQ_STOPS up to #12 (11.2) from #16 (8.2).
+
+**Verdict:** Marginal. OOF macro F1 slightly better (+0.002), SUBWAY improved (+6.7% Level 4), but overall Jaccard slightly worse (-0.002). Wider bus radius may add noise. The two runs are essentially equivalent — SUBWAY is fundamentally hard (best discriminability ratio only 1.91).
+
+**Current best remains Run 21b** (Jaccard 0.7740, exact 71.2%).
 
 ---
 
