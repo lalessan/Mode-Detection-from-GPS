@@ -315,44 +315,13 @@ class ModeDetector:
         # Store gps with signals for segmentation
         self._gps_with_signals = gps
 
-        # ── Step 5: Segment training trips + relabel walking ──────────
-        # Train on segments rather than whole trips so the classifier
-        # learns pure mode features (without walking access/egress dilution).
-        logger.info("Segmenting training trips for segment-level training...")
-        seg_features = self._extract_segmented_features(gps, cfg)
-
-        # Assign trip-level labels to all segments, then relabel
-        # start/end low-speed segments as WALKING.
-        mode_map = stats.set_index("trip_key")[cfg.col_main_mode].to_dict()
-        seg_features[cfg.col_main_mode] = seg_features["trip_key"].map(mode_map)
-
-        # Relabel: for each trip, if the first or last segment has
-        # SPEED_AVG < 2 m/s, label it WALKING (access/egress leg).
-        walking_speed_threshold = 2.0  # m/s
-        n_relabeled = 0
-        for trip_key, grp in seg_features.groupby("trip_key", sort=False):
-            if len(grp) < 2:
-                continue  # single segment — keep trip label
-            idx = grp.index
-            segs = grp["segment"].values
-            speeds = grp["SPEED_AVG"].values
-
-            # First segment
-            if speeds[0] < walking_speed_threshold and segs[0] == segs.min():
-                seg_features.loc[idx[0], cfg.col_main_mode] = "WALKING"
-                n_relabeled += 1
-            # Last segment
-            if speeds[-1] < walking_speed_threshold and segs[-1] == segs.max():
-                seg_features.loc[idx[-1], cfg.col_main_mode] = "WALKING"
-                n_relabeled += 1
-
-        logger.info("Relabeled %d start/end segments as WALKING (speed < %.1f m/s)",
-                     n_relabeled, walking_speed_threshold)
-        logger.info("Training on %d segments (from %d trips)...",
-                     len(seg_features), seg_features["trip_key"].nunique())
+        # ── Step 5: Merge + train ─────────────────────────────────────
+        logger.info("Merging feature sets...")
+        merged = self._merge_features(stats, pct_map, stop_features, route_features,
+                                      bus_seq_features=bus_seq_features)
 
         logger.info("Training XGBoost classifier...")
-        self._train_model(seg_features, cfg)
+        self._train_model(merged, cfg)
 
         # Save OOF predictions checkpoint if available
         if ckpt is not None and self._oof_predictions is not None:
