@@ -61,8 +61,8 @@ def make_trip_map(trip_gps, trip_key, true_mode, pred_mode, stats_row=None):
 
     m = folium.Map(
         location=[center_lat, center_lon], zoom_start=14,
-        tiles="https://tile.openstreetmap.org/{z}/{x}/{y}.png",
-        attr="&copy; OpenStreetMap contributors",
+        tiles="https://server.arcgisonline.com/ArcGIS/rest/services/World_Street_Map/MapServer/tile/{z}/{y}/{x}",
+        attr="Esri, HERE, Garmin, USGS, NGA",
     )
 
     # Color by speed: blue=slow, red=fast
