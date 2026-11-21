@@ -19,7 +19,9 @@ oof = pd.read_parquet(CHECKPOINT_DIR / "fit_steps" / "05_oof_predictions.parquet
 print(f"  {len(oof)} trips, columns: {list(oof.columns)}")
 
 # Identify true and predicted mode columns
-if "true_mode" in oof.columns and "predicted_mode" in oof.columns:
+if "true_label" in oof.columns and "pred_label" in oof.columns:
+    true_col, pred_col = "true_label", "pred_label"
+elif "true_mode" in oof.columns and "predicted_mode" in oof.columns:
     true_col, pred_col = "true_mode", "predicted_mode"
 elif "Main_Mode" in oof.columns and "predicted_mode" in oof.columns:
     true_col, pred_col = "Main_Mode", "predicted_mode"
