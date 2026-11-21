@@ -10,6 +10,7 @@ Usage:
 import numpy as np
 import pandas as pd
 import folium
+from folium.plugins import TimestampedGeoJson
 from pathlib import Path
 
 CHECKPOINT_DIR = Path("checkpoints/")
@@ -60,17 +61,17 @@ def make_trip_map(trip_gps, trip_key, true_mode, pred_mode, stats_row=None):
 
     m = folium.Map(
         location=[center_lat, center_lon], zoom_start=14,
-        tiles="CartoDB positron",
+        tiles="https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png",
+        attr="&copy; OpenStreetMap contributors &copy; CARTO",
     )
 
     # Color by speed: blue=slow, red=fast
     max_speed = max(speeds.max(), 1)
     coords = list(zip(lats, lons))
 
-    # Draw line segments colored by speed
+    # Static trace (faded background)
     for i in range(len(coords) - 1):
         speed = speeds[i]
-        # Normalize: 0=blue, >5 m/s = red
         t = min(speed / 5.0, 1.0)
         r = int(255 * t)
         g = 0
@@ -79,8 +80,76 @@ def make_trip_map(trip_gps, trip_key, true_mode, pred_mode, stats_row=None):
 
         folium.PolyLine(
             [coords[i], coords[i + 1]],
-            color=color, weight=3, opacity=0.8,
+            color=color, weight=2, opacity=0.3,
         ).add_to(m)
+
+    # Animated playback using TimestampedGeoJson
+    timestamps = trip_gps["timestamp"].values
+    # Convert to ISO strings for the plugin
+    time_strs = pd.to_datetime(timestamps).strftime("%Y-%m-%dT%H:%M:%S").tolist()
+
+    # Build GeoJSON features: one point per GPS fix (animated marker)
+    features = []
+    for i in range(len(lats)):
+        speed = speeds[i]
+        t = min(speed / 5.0, 1.0)
+        r = int(255 * t)
+        b = int(255 * (1 - t))
+        color = f"#{r:02x}00{b:02x}"
+
+        features.append({
+            "type": "Feature",
+            "geometry": {
+                "type": "Point",
+                "coordinates": [float(lons[i]), float(lats[i])],
+            },
+            "properties": {
+                "time": time_strs[i],
+                "style": {"color": color},
+                "icon": "circle",
+                "iconstyle": {
+                    "fillColor": color,
+                    "fillOpacity": 0.8,
+                    "stroke": "true",
+                    "radius": 6,
+                },
+                "popup": f"Speed: {speed:.1f} m/s",
+            },
+        })
+
+    # Add animated line segments too (trail builds up over time)
+    for i in range(len(lats) - 1):
+        speed = speeds[i]
+        t = min(speed / 5.0, 1.0)
+        r = int(255 * t)
+        b = int(255 * (1 - t))
+        color = f"#{r:02x}00{b:02x}"
+
+        features.append({
+            "type": "Feature",
+            "geometry": {
+                "type": "LineString",
+                "coordinates": [
+                    [float(lons[i]), float(lats[i])],
+                    [float(lons[i + 1]), float(lats[i + 1])],
+                ],
+            },
+            "properties": {
+                "time": time_strs[i],
+                "style": {"color": color, "weight": 4, "opacity": 0.8},
+            },
+        })
+
+    TimestampedGeoJson(
+        {"type": "FeatureCollection", "features": features},
+        period="PT10S",         # step every 10 seconds of trip time
+        add_last_point=True,
+        auto_play=False,
+        loop=False,
+        max_speed=10,
+        loop_button=True,
+        time_slider_drag_update=True,
+    ).add_to(m)
 
     # Start/end markers
     folium.Marker(coords[0], popup="START", icon=folium.Icon(color="green")).add_to(m)
