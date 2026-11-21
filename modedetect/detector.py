@@ -234,6 +234,20 @@ class ModeDetector:
             logger.info("Loaded stats + percentile map from checkpoint.")
             self._optimal_percentiles = find_optimal_percentiles(pct_map, stats, cfg)
 
+        # ── Filter: remove stationary / near-zero-distance trips ──────
+        if cfg.min_trip_distance_m > 0 and "DIST_TOTAL_WGS84" in stats.columns:
+            short_mask = stats["DIST_TOTAL_WGS84"] < cfg.min_trip_distance_m
+            n_short = short_mask.sum()
+            if n_short > 0:
+                short_keys = set(stats.loc[short_mask, "trip_key"])
+                logger.info(
+                    "Dropping %d trips with total distance < %.0f m",
+                    n_short, cfg.min_trip_distance_m,
+                )
+                stats = stats[~short_mask].reset_index(drop=True)
+                pct_map = pct_map[~pct_map["trip_key"].isin(short_keys)].reset_index(drop=True)
+                gps = gps[~gps[cfg.col_trip_key].isin(short_keys)].reset_index(drop=True)
+
         # ── Step 3: Stop proximity features ───────────────────────────
         stop_features = self._ckpt_load(ckpt, "03_stop_features.parquet")
         # Invalidate old checkpoint if it lacks percentile columns
