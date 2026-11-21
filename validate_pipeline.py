@@ -1095,11 +1095,33 @@ def level4_multimodal(gps_df, trips_df, model_new):
 # ─────────────────────────────────────────────────────────────────────
 
 def main():
+    import argparse
     import logging
     import pickle
+
+    parser = argparse.ArgumentParser(description="Validate modedetect pipeline")
+    parser.add_argument("--clean", action="store_true",
+                        help="Delete model/prediction checkpoints to force retraining")
+    args = parser.parse_args()
+
     logging.basicConfig(level=logging.INFO, format="%(name)s — %(message)s")
 
     CHECKPOINT_DIR.mkdir(exist_ok=True)
+
+    if args.clean:
+        stale = [
+            CHECKPOINT_DIR / "modedetect_model.zip",
+            CHECKPOINT_DIR / "seg_preds_all.parquet",
+            CHECKPOINT_DIR / "fit_steps" / "05_oof_predictions.parquet",
+            CHECKPOINT_DIR / "fit_steps" / "03_stop_point_cache.npz",
+            CHECKPOINT_DIR / "fit_steps" / "03_stop_features.parquet",
+            CHECKPOINT_DIR / "fit_steps" / "03_bus_route_features.parquet",
+        ]
+        for p in stale:
+            if p.exists():
+                p.unlink()
+                print(f"  Deleted stale checkpoint: {p}")
+        print()
 
     print("=" * 60)
     print("MODEDETECT VALIDATION PIPELINE")

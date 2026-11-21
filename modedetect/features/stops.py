@@ -114,8 +114,17 @@ def _process_chunk(
     tree: BallTree,
     rad: float,
     mode_mask_arrays: dict[int, np.ndarray] | None,
+    mode_radius_m: dict[int, float] | None = None,
+    default_radius_m: float | None = None,
 ) -> tuple[np.ndarray, np.ndarray, dict, dict, dict]:
     """Process a single chunk of GPS points against the BallTree.
+
+    Parameters
+    ----------
+    mode_radius_m : optional dict mapping route_type code → radius in metres.
+        When set, per-mode features only count stops within that mode's radius.
+        The BallTree query uses ``rad`` (the max radius) to get all candidates.
+    default_radius_m : fallback radius for the overall count/min_dist.
 
     Returns per-point summaries for the chunk.
     """
@@ -135,18 +144,35 @@ def _process_chunk(
             continue
 
         dist_m = chunk_dist[j] * EARTH_RADIUS_M
-        counts[j] = len(idx_arr)
-        min_dist[j] = dist_m.min()
+
+        # Overall stats use the default (tighter) radius
+        if default_radius_m is not None:
+            within = dist_m <= default_radius_m
+            counts[j] = within.sum()
+            if counts[j] > 0:
+                min_dist[j] = dist_m[within].min()
+        else:
+            counts[j] = len(idx_arr)
+            min_dist[j] = dist_m.min()
 
         if mode_mask_arrays is not None:
-            top5_idx = idx_arr[:5]
-            top5_dist = dist_m[:5]
-
             for mode_code in ROUTE_TYPE_NAMES:
-                all_mode_hits = mode_mask_arrays[mode_code][idx_arr]
-                if all_mode_hits.any():
-                    mode_min_dist[mode_code][j] = dist_m[all_mode_hits].min()
+                # Apply per-mode radius cutoff
+                if mode_radius_m is not None and mode_code in mode_radius_m:
+                    cutoff = mode_radius_m[mode_code]
+                    within_mode = dist_m <= cutoff
+                    mode_idx = idx_arr[within_mode]
+                    mode_dist = dist_m[within_mode]
+                else:
+                    mode_idx = idx_arr
+                    mode_dist = dist_m
 
+                all_mode_hits = mode_mask_arrays[mode_code][mode_idx]
+                if all_mode_hits.any():
+                    mode_min_dist[mode_code][j] = mode_dist[all_mode_hits].min()
+
+                top5_idx = mode_idx[:5]
+                top5_dist = mode_dist[:5]
                 top5_mode_hits = mode_mask_arrays[mode_code][top5_idx]
                 if top5_mode_hits.any():
                     mode_has_stop_top5[mode_code][j] = True
@@ -162,8 +188,16 @@ def _query_balltree_parallel(
     mode_mask_arrays: dict[int, np.ndarray] | None,
     n_jobs: int = 1,
     chunk_size: int = 500_000,
+    mode_radius_m: dict[int, float] | None = None,
+    default_radius_m: float | None = None,
 ) -> tuple[np.ndarray, np.ndarray, dict, dict, dict]:
-    """Run chunked BallTree queries, optionally in parallel with multiprocessing."""
+    """Run chunked BallTree queries, optionally in parallel with multiprocessing.
+
+    Parameters
+    ----------
+    mode_radius_m : optional per-mode radius dict (route_type → metres).
+    default_radius_m : radius for overall count/min_dist (tighter than BallTree rad).
+    """
     from tqdm import tqdm
 
     n_points = len(gps_rad)
@@ -190,6 +224,7 @@ def _query_balltree_parallel(
         for lo, hi in tqdm(chunks, desc="BallTree query", unit="chunk"):
             c_counts, c_min, c_top5, c_has, c_all = _process_chunk(
                 gps_rad[lo:hi], tree, rad, mode_mask_arrays,
+                mode_radius_m=mode_radius_m, default_radius_m=default_radius_m,
             )
             counts[lo:hi] = c_counts
             min_dist[lo:hi] = c_min
@@ -207,6 +242,7 @@ def _query_balltree_parallel(
             for lo, hi in chunks:
                 fut = pool.submit(
                     _process_chunk, gps_rad[lo:hi], tree, rad, mode_mask_arrays,
+                    mode_radius_m, default_radius_m,
                 )
                 futures[fut] = (lo, hi)
 
@@ -268,11 +304,19 @@ def compute_stop_features(
     has_route_type = stops_df is not None and "route_type_set" in stops_df.columns
     cache_path = Path(point_cache_path) if point_cache_path is not None else None
 
+    # Per-mode radii make old caches invalid — check config hash
+    metro_r = getattr(config, "metro_stop_radius_m", config.stop_search_radius_m)
+    cache_config_key = f"r{config.stop_search_radius_m}_m{metro_r}"
+
     cache_loaded = False
     if cache_path is not None and cache_path.exists():
         logger.info("Loading per-point BallTree cache from %s", cache_path)
         data = np.load(cache_path, allow_pickle=False)
-        if len(data["counts"]) == n_points:
+        stored_key = str(data["config_key"]) if "config_key" in data else ""
+        if stored_key != cache_config_key:
+            logger.warning("Cache radius config mismatch (%s vs %s) — recomputing.",
+                          stored_key, cache_config_key)
+        elif len(data["counts"]) == n_points:
             counts = data["counts"]
             min_dist = data["min_dist"]
             mode_min_dist_top5 = {mc: data[f"mdist_top5_{mc}"] for mc in ROUTE_TYPE_NAMES}
@@ -302,18 +346,38 @@ def compute_stop_features(
         all_lat = gps_df[config.col_latitude].astype("float64").values
         all_lon = gps_df[config.col_longitude].astype("float64").values
         gps_rad = np.radians(np.column_stack([all_lat, all_lon]))
-        rad = config.stop_search_radius_m / EARTH_RADIUS_M
+
+        # Per-mode radii: query BallTree at max radius, filter per mode
+        default_r = config.stop_search_radius_m
+        metro_r = getattr(config, "metro_stop_radius_m", default_r)
+        mode_radius_m = {
+            0: float(default_r),   # tram
+            1: float(metro_r),     # metro — wider for underground GPS noise
+            2: float(default_r),   # rail
+            3: float(default_r),   # bus
+        }
+        query_radius_m = max(mode_radius_m.values())
+        rad = query_radius_m / EARTH_RADIUS_M
+
+        logger.info("BallTree query radius: %dm (per-mode: tram=%dm, metro=%dm, rail=%dm, bus=%dm)",
+                     int(query_radius_m), int(mode_radius_m[0]), int(mode_radius_m[1]),
+                     int(mode_radius_m[2]), int(mode_radius_m[3]))
 
         counts, min_dist, mode_min_dist_top5, mode_has_stop_top5, mode_min_dist = \
             _query_balltree_parallel(
                 gps_rad, tree, rad, mode_mask_arrays,
                 n_jobs=config.n_jobs, chunk_size=500_000,
+                mode_radius_m=mode_radius_m,
+                default_radius_m=float(default_r),
             )
 
         # Save cache
         if cache_path is not None:
             cache_path.parent.mkdir(parents=True, exist_ok=True)
-            save_dict = {"counts": counts, "min_dist": min_dist}
+            save_dict = {
+                "counts": counts, "min_dist": min_dist,
+                "config_key": np.array(cache_config_key),
+            }
             for mc in ROUTE_TYPE_NAMES:
                 save_dict[f"mdist_top5_{mc}"] = mode_min_dist_top5[mc]
                 save_dict[f"mhas_top5_{mc}"] = mode_has_stop_top5[mc]
