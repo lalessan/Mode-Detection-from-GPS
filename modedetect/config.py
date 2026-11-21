@@ -73,8 +73,12 @@ class ModeDetectConfig:
 
     # ── Stop proximity (GTFS) ─────────────────────────────────────────
     gtfs_dir: Path | None = None
-    stop_search_radius_m: int = 50       # default for tram(0), rail(2), bus(3)
-    metro_stop_radius_m: int = 250       # wider for metro(1) — underground GPS noise
+    stop_search_radius_m: int = 50       # default / fallback for overall stats
+    # Per-mode radii (empirically optimized via test_stop_radii.py):
+    bus_stop_radius_m: int = 250         # bus(3) — MIN_DIST best at 250m
+    metro_stop_radius_m: int = 750       # metro(1) — underground GPS noise
+    rail_stop_radius_m: int = 50         # rail(2) — DURATION dominates at 50m
+    tram_stop_radius_m: int = 50         # tram(0) — DURATION dominates at 50m
     bus_seq_radius_m: int = 30           # tighter radius for bus route sequence feature
     stop_quantiles: tuple[int, ...] = field(default_factory=_default_stop_quantiles)
 

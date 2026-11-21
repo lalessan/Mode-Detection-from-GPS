@@ -305,8 +305,13 @@ def compute_stop_features(
     cache_path = Path(point_cache_path) if point_cache_path is not None else None
 
     # Per-mode radii make old caches invalid — check config hash
-    metro_r = getattr(config, "metro_stop_radius_m", config.stop_search_radius_m)
-    cache_config_key = f"r{config.stop_search_radius_m}_m{metro_r}"
+    _dr = config.stop_search_radius_m
+    cache_config_key = (
+        f"t{getattr(config, 'tram_stop_radius_m', _dr)}"
+        f"_m{getattr(config, 'metro_stop_radius_m', _dr)}"
+        f"_r{getattr(config, 'rail_stop_radius_m', _dr)}"
+        f"_b{getattr(config, 'bus_stop_radius_m', _dr)}"
+    )
 
     cache_loaded = False
     if cache_path is not None and cache_path.exists():
@@ -349,12 +354,11 @@ def compute_stop_features(
 
         # Per-mode radii: query BallTree at max radius, filter per mode
         default_r = config.stop_search_radius_m
-        metro_r = getattr(config, "metro_stop_radius_m", default_r)
         mode_radius_m = {
-            0: float(default_r),   # tram
-            1: float(metro_r),     # metro — wider for underground GPS noise
-            2: float(default_r),   # rail
-            3: float(default_r),   # bus
+            0: float(getattr(config, "tram_stop_radius_m", default_r)),   # tram
+            1: float(getattr(config, "metro_stop_radius_m", default_r)),  # metro
+            2: float(getattr(config, "rail_stop_radius_m", default_r)),   # rail
+            3: float(getattr(config, "bus_stop_radius_m", default_r)),    # bus
         }
         query_radius_m = max(mode_radius_m.values())
         rad = query_radius_m / EARTH_RADIUS_M

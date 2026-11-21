@@ -94,13 +94,37 @@ Source: validate_pipeline.py Level 3 + Level 4 output from original code.
 
 ---
 
+## Radius test 2026-11-21: Optimal per-mode stop radii (test_stop_radii.py)
+
+Tested radii 50, 100, 250, 500, 750, 1000m on 10% sample. Measured discriminability ratio (how well each feature separates its target mode from others).
+
+| Stop type | Best radius | Avg ratio | Key insight |
+|-----------|-------------|-----------|-------------|
+| BUS (bus) | **250m** | 2.25 | MIN_DIST best at 250m (3.17), DURATION best at 50m (2.07) |
+| SUBWAY (metro) | **750m** | 1.91 | MIN_DIST best at 750m (1.26), DURATION best at 100m (2.65). Flat 500-1000m. |
+| TRAIN (rail) | **50m** | 24.96 | DURATION dominates (46.26 at 50m), MIN_DIST best at 1000m (7.36) |
+| TRAMWAY (tram) | **50m** | 15.43 | DURATION dominates (26.71 at 50m), MIN_DIST best at 1000m (10.27) |
+
+**Previous config**: bus=50m, metro=250m, rail=50m, tram=50m
+**New config**: bus=250m, metro=750m, rail=50m, tram=50m
+
+SUBWAY's poor discrimination (best ratio only 1.91) explains why it's hard to classify — metro stops just aren't very discriminative even at optimal radius.
+
+---
+
+## Next run: Empirically optimized per-mode radii
+
+Applying bus=250m, metro=750m, rail=50m, tram=50m. Expecting SUBWAY to recover (from F1 0.37 → hopefully closer to baseline 0.66).
+
+```bash
+git pull fork main
+python validate_pipeline.py --clean 2>&1 | tee run_output.txt
+```
+
+---
+
 ## Open issues
 
-1. **SUBWAY**: OOF F1 0.37, Level 4 exact 39.3%. 38% misclassified as WALKING. Underground GPS noise makes stop proximity unreliable. May need:
-   - Even wider metro radius (500m?)
-   - subway_match_pct is only ranked #26 — route matching may also be weak for metro
-   - Dedicated subway features (e.g. speed pattern: fast underground, stops at stations)
+1. **BUS Level 4**: Trip-level exact dropped from 71.2% to 23.1%. Segments within BUS trips get classified as CAR (BUS+CAR = 22.7%). The classifier knows BUS at trip level (OOF F1 0.68) but short segments lose the discriminative pattern.
 
-2. **BUS Level 4**: Trip-level exact dropped from 71.2% to 23.1%. Segments within BUS trips get classified as CAR (BUS+CAR = 22.7%). The classifier knows BUS at trip level (OOF F1 0.68) but short segments lose the discriminative pattern.
-
-3. **Note on Level 3 comparison**: Original uses 80/20 split (10,637 test trips), modedetect uses OOF on 50,378 trips. OOF is a harder evaluation — every trip is tested on a fold that didn't see it. The comparison is not perfectly apples-to-apples.
+2. **Note on Level 3 comparison**: Original uses 80/20 split (10,637 test trips), modedetect uses OOF on 50,378 trips. OOF is a harder evaluation — every trip is tested on a fold that didn't see it. The comparison is not perfectly apples-to-apples.
