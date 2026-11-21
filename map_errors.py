@@ -58,7 +58,10 @@ def make_trip_map(trip_gps, trip_key, true_mode, pred_mode, stats_row=None):
     center_lat = np.median(lats)
     center_lon = np.median(lons)
 
-    m = folium.Map(location=[center_lat, center_lon], zoom_start=14)
+    m = folium.Map(
+        location=[center_lat, center_lon], zoom_start=14,
+        tiles="CartoDB positron",
+    )
 
     # Color by speed: blue=slow, red=fast
     max_speed = max(speeds.max(), 1)
