@@ -224,6 +224,69 @@ if "subway_match_pct" in oof_feats.columns:
         print(f"    {label:<20s}: P10={vals.quantile(0.1):.3f}, P50={vals.median():.3f}, "
               f"P75={vals.quantile(0.75):.3f}, P90={vals.quantile(0.9):.3f}")
 
+# ── CAR → WALKING deep dive ──────────────────────────────────────
+
+print(f"\n{'='*70}")
+print("CAR → WALKING DEEP DIVE")
+print(f"{'='*70}")
+
+car_trips = oof_feats[oof_feats[true_col] == "CAR"]
+car_correct = car_trips[car_trips[pred_col] == "CAR"]
+car_as_walk = car_trips[car_trips[pred_col] == "WALKING"]
+walk_correct = oof_feats[(oof_feats[true_col] == "WALKING") & (oof_feats[pred_col] == "WALKING")]
+
+print(f"\n  Total CAR trips: {len(car_trips)}")
+print(f"  Correctly classified: {len(car_correct)} ({len(car_correct)/len(car_trips):.1%})")
+print(f"  Misclassified as WALKING: {len(car_as_walk)} ({len(car_as_walk)/len(car_trips):.1%})")
+
+print(f"\n  Feature comparison (median):")
+print(f"  {'Feature':<25s} {'Correct CAR':>12s} {'CAR→WALK':>12s} {'True WALK':>12s}")
+print(f"  {'─'*65}")
+
+for feat in KEY_FEATURES:
+    v1 = car_correct[feat].median()
+    v2 = car_as_walk[feat].median() if len(car_as_walk) > 0 else float("nan")
+    v3 = walk_correct[feat].median()
+    print(f"  {feat:<25s} {v1:>12.1f} {v2:>12.1f} {v3:>12.1f}")
+
+for feat_name, feat_col in [("SPEED_AVG (m/s)", "SPEED_AVG"),
+                             ("DIST_TOTAL_WGS84 (m)", "DIST_TOTAL_WGS84"),
+                             ("TOTAL_TIME (s)", "TOTAL_TIME"),
+                             ("GPS_POINTS", "GPS_POINTS")]:
+    if feat_col not in oof_feats.columns:
+        continue
+    print(f"\n  {feat_name} distribution:")
+    for label, subset in [("Correct CAR", car_correct),
+                           ("CAR→WALKING", car_as_walk),
+                           ("True WALKING", walk_correct)]:
+        if len(subset) == 0:
+            continue
+        vals = subset[feat_col]
+        print(f"    {label:<20s}: P10={vals.quantile(0.1):.1f}, P25={vals.quantile(0.25):.1f}, "
+              f"P50={vals.median():.1f}, P75={vals.quantile(0.75):.1f}, P90={vals.quantile(0.9):.1f}")
+
+# What threshold would catch them?
+if "DIST_TOTAL_WGS84" in oof_feats.columns and len(car_as_walk) > 0:
+    print(f"\n  Distance thresholds — how many CAR→WALK trips would be filtered:")
+    for thresh in [100, 200, 500, 1000, 2000]:
+        n_below = (car_as_walk["DIST_TOTAL_WGS84"] < thresh).sum()
+        pct = n_below / len(car_as_walk) * 100
+        # Also check how many correct CAR trips we'd lose
+        n_correct_lost = (car_correct["DIST_TOTAL_WGS84"] < thresh).sum()
+        pct_correct = n_correct_lost / len(car_correct) * 100
+        print(f"    < {thresh:>5d}m: {n_below:>4d}/{len(car_as_walk)} CAR→WALK ({pct:.1f}%), "
+              f"would also drop {n_correct_lost} correct CAR ({pct_correct:.1f}%)")
+
+if "SPEED_AVG" in oof_feats.columns and len(car_as_walk) > 0:
+    print(f"\n  Speed thresholds — how many CAR→WALK trips would be filtered:")
+    for thresh in [0.5, 1.0, 1.5, 2.0, 3.0]:
+        n_below = (car_as_walk["SPEED_AVG"] < thresh).sum()
+        pct = n_below / len(car_as_walk) * 100
+        n_correct_lost = (car_correct["SPEED_AVG"] < thresh).sum()
+        pct_correct = n_correct_lost / len(car_correct) * 100
+        print(f"    < {thresh:.1f} m/s: {n_below:>4d}/{len(car_as_walk)} CAR→WALK ({pct:.1f}%), "
+              f"would also drop {n_correct_lost} correct CAR ({pct_correct:.1f}%)")
+
 print(f"\n{'='*70}")
 print("Done. Use these insights to identify what features or signals are missing.")
 print(f"{'='*70}")
