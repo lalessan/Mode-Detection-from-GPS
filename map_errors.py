@@ -294,6 +294,25 @@ for _, row in sub_walk_moving.iterrows():
     all_maps.append(("SUBWAY→WALK (moving)", "WALKING", trip_key, fpath))
     print(f"    Saved: {fpath} (dist={row['DIST_TOTAL_WGS84']:.0f}m, disp={row['DISPLACEMENT_M']:.0f}m, range={row.get('MAX_RANGE_M', 0):.0f}m)")
 
+# Random correctly classified WALKING examples (longer trips)
+walk_correct_mask = (oof_stats[true_col] == "WALKING") & (oof_stats[pred_col] == "WALKING")
+walk_correct_all = oof_stats[walk_correct_mask]
+# Filter to longer walks (> median distance) and sample randomly
+walk_long = walk_correct_all[walk_correct_all["DIST_TOTAL_WGS84"] > walk_correct_all["DIST_TOTAL_WGS84"].median()]
+walk_sample = walk_long.sample(n=min(15, len(walk_long)), random_state=42)
+print(f"\n  Correct WALKING (random, longer trips): {len(walk_sample)} examples")
+for _, row in walk_sample.iterrows():
+    trip_key = row["trip_key"]
+    trip_gps = gps[gps["KEY"] == trip_key].sort_values("timestamp")
+    if len(trip_gps) == 0:
+        continue
+    m = make_trip_map(trip_gps, trip_key, "WALKING", "WALKING", row)
+    fname = f"CORRECT_WALKING_long_{trip_key.replace('/', '_')}.html"
+    fpath = OUT_DIR / fname
+    m.save(str(fpath))
+    all_maps.append(("WALKING (correct, long)", "WALKING", trip_key, fpath))
+    print(f"    Saved: {fpath} (dist={row['DIST_TOTAL_WGS84']:.0f}m, range={row.get('MAX_RANGE_M', 0):.0f}m)")
+
 # Correctly classified examples for comparison
 for mode in CORRECT_EXAMPLES:
     mask = (oof_stats[true_col] == mode) & (oof_stats[pred_col] == mode)
