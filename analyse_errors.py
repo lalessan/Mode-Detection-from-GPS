@@ -76,8 +76,12 @@ disp_df = pd.DataFrame({
 })
 
 # Compute distance from start/end to nearest metro station
-GTFS_DIR = Path(os.environ["GTFS_DIR"]) if os.environ.get("GTFS_DIR") else Path("gtfs/")
-if not GTFS_DIR.exists():
+GTFS_DIR = Path(os.environ["GTFS_DIR"]) if os.environ.get("GTFS_DIR") else None
+for _candidate in [Path("gtfs/"), Path("/home/lauale/ModeDetection/gtfs/")]:
+    if GTFS_DIR is None and _candidate.exists():
+        GTFS_DIR = _candidate
+        break
+if GTFS_DIR is not None and not GTFS_DIR.exists():
     GTFS_DIR = None
 if GTFS_DIR is not None:
     print("Computing start/end distance to nearest metro station...")
