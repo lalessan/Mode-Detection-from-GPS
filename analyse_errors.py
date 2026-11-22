@@ -44,7 +44,7 @@ def haversine_m(lat1, lon1, lat2, lon2):
     a = np.sin(dphi / 2) ** 2 + np.cos(phi1) * np.cos(phi2) * np.sin(dlam / 2) ** 2
     return 2 * R * np.arctan2(np.sqrt(a), np.sqrt(1 - a))
 
-print("Computing displacement (start-to-end distance) per trip...")
+print("Computing displacement and max range per trip...")
 gps_key = "trip_key" if "trip_key" in gps.columns else "KEY"
 first_pts = gps.groupby(gps_key).first()[["LATITUDE", "LONGITUDE"]]
 last_pts = gps.groupby(gps_key).last()[["LATITUDE", "LONGITUDE"]]
@@ -52,7 +52,26 @@ displacement = haversine_m(
     first_pts["LATITUDE"].values, first_pts["LONGITUDE"].values,
     last_pts["LATITUDE"].values, last_pts["LONGITUDE"].values,
 )
-disp_df = pd.DataFrame({"trip_key": first_pts.index, "DISPLACEMENT_M": displacement})
+
+# Max distance from centroid — how far the furthest GPS point is from the mean position
+centroids = gps.groupby(gps_key)[["LATITUDE", "LONGITUDE"]].mean()
+# Join centroid back to each GPS point
+gps_with_centroid = gps.merge(
+    centroids.rename(columns={"LATITUDE": "_clat", "LONGITUDE": "_clon"}),
+    left_on=gps_key, right_index=True,
+)
+gps_with_centroid["_dist_from_centroid"] = haversine_m(
+    gps_with_centroid["LATITUDE"].values, gps_with_centroid["LONGITUDE"].values,
+    gps_with_centroid["_clat"].values, gps_with_centroid["_clon"].values,
+)
+max_range = gps_with_centroid.groupby(gps_key)["_dist_from_centroid"].max()
+del gps_with_centroid
+
+disp_df = pd.DataFrame({
+    "trip_key": first_pts.index,
+    "DISPLACEMENT_M": displacement,
+    "MAX_RANGE_M": max_range.values,
+})
 
 # Load features
 print("Loading features...")
@@ -277,6 +296,7 @@ for feat in KEY_FEATURES:
 for feat_name, feat_col in [("SPEED_AVG (m/s)", "SPEED_AVG"),
                              ("DIST_TOTAL_WGS84 (m)", "DIST_TOTAL_WGS84"),
                              ("DISPLACEMENT_M (start→end)", "DISPLACEMENT_M"),
+                             ("MAX_RANGE_M (furthest from centroid)", "MAX_RANGE_M"),
                              ("TOTAL_TIME (s)", "TOTAL_TIME"),
                              ("GPS_POINTS", "GPS_POINTS")]:
     if feat_col not in oof_feats.columns:
@@ -309,6 +329,16 @@ if "DIST_TOTAL_WGS84" in oof_feats.columns and len(car_as_walk) > 0:
         pct = n_below / len(car_as_walk) * 100
         # Also check how many correct CAR trips we'd lose
         n_correct_lost = (car_correct["DIST_TOTAL_WGS84"] < thresh).sum()
+        pct_correct = n_correct_lost / len(car_correct) * 100
+        print(f"    < {thresh:>5d}m: {n_below:>4d}/{len(car_as_walk)} CAR→WALK ({pct:.1f}%), "
+              f"would also drop {n_correct_lost} correct CAR ({pct_correct:.1f}%)")
+
+if "MAX_RANGE_M" in oof_feats.columns and len(car_as_walk) > 0:
+    print(f"\n  Max range thresholds (furthest point from centroid):")
+    for thresh in [25, 50, 100, 200, 500]:
+        n_below = (car_as_walk["MAX_RANGE_M"] < thresh).sum()
+        pct = n_below / len(car_as_walk) * 100
+        n_correct_lost = (car_correct["MAX_RANGE_M"] < thresh).sum()
         pct_correct = n_correct_lost / len(car_correct) * 100
         print(f"    < {thresh:>5d}m: {n_below:>4d}/{len(car_as_walk)} CAR→WALK ({pct:.1f}%), "
               f"would also drop {n_correct_lost} correct CAR ({pct_correct:.1f}%)")
