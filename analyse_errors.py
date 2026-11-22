@@ -337,6 +337,51 @@ if "DISPLACEMENT_M" in oof_feats.columns and "DIST_TOTAL_WGS84" in oof_feats.col
             pct_cc = n_cc / len(car_correct) * 100
             print(f"  {d_thresh:>6d}m {t_thresh:>8d}m {n_cw:>6d}/{len(car_as_walk)} ({pct_cw:>5.1f}%) {n_cc:>8d}/{len(car_correct)} ({pct_cc:>5.1f}%)")
 
+# ── SUBWAY → WALKING combined thresholds ─────────────────────────
+
+if "DISPLACEMENT_M" in oof_feats.columns and "DIST_TOTAL_WGS84" in oof_feats.columns:
+    subway_trips = oof_feats[oof_feats[true_col] == "SUBWAY"]
+    subway_correct = subway_trips[subway_trips[pred_col] == "SUBWAY"]
+    subway_as_walk = subway_trips[subway_trips[pred_col] == "WALKING"]
+
+    if len(subway_as_walk) > 0:
+        print(f"\n{'='*70}")
+        print("SUBWAY → WALKING DISPLACEMENT ANALYSIS")
+        print(f"{'='*70}")
+
+        print(f"\n  Total: {len(subway_trips)}, Correct: {len(subway_correct)}, →WALKING: {len(subway_as_walk)}")
+
+        print(f"\n  Displacement distribution:")
+        for label, subset in [("Correct SUBWAY", subway_correct),
+                               ("SUBWAY→WALKING", subway_as_walk)]:
+            if len(subset) == 0:
+                continue
+            vals = subset["DISPLACEMENT_M"]
+            print(f"    {label:<20s}: P10={vals.quantile(0.1):.0f}, P25={vals.quantile(0.25):.0f}, "
+                  f"P50={vals.median():.0f}, P75={vals.quantile(0.75):.0f}, P90={vals.quantile(0.9):.0f}")
+
+        print(f"\n  Displacement thresholds:")
+        for thresh in [50, 100, 200, 500]:
+            n_sw = (subway_as_walk["DISPLACEMENT_M"] < thresh).sum()
+            pct_sw = n_sw / len(subway_as_walk) * 100
+            n_sc = (subway_correct["DISPLACEMENT_M"] < thresh).sum()
+            pct_sc = n_sc / len(subway_correct) * 100
+            print(f"    < {thresh:>5d}m: {n_sw:>4d}/{len(subway_as_walk)} SUB→WALK ({pct_sw:.1f}%), "
+                  f"would also drop {n_sc} correct SUBWAY ({pct_sc:.1f}%)")
+
+        print(f"\n  Combined thresholds (displacement < D AND total_dist < T):")
+        print(f"  {'Disp<':>8s} {'TotDist<':>10s} {'SUB→WALK caught':>18s} {'Correct SUB lost':>20s}")
+        print(f"  {'─'*60}")
+        for d_thresh in [50, 100, 200]:
+            for t_thresh in [500, 1000, 2000, 5000]:
+                sw_mask = (subway_as_walk["DISPLACEMENT_M"] < d_thresh) & (subway_as_walk["DIST_TOTAL_WGS84"] < t_thresh)
+                sc_mask = (subway_correct["DISPLACEMENT_M"] < d_thresh) & (subway_correct["DIST_TOTAL_WGS84"] < t_thresh)
+                n_sw = sw_mask.sum()
+                n_sc = sc_mask.sum()
+                pct_sw = n_sw / len(subway_as_walk) * 100
+                pct_sc = n_sc / len(subway_correct) * 100
+                print(f"  {d_thresh:>6d}m {t_thresh:>8d}m {n_sw:>6d}/{len(subway_as_walk)} ({pct_sw:>5.1f}%) {n_sc:>8d}/{len(subway_correct)} ({pct_sc:>5.1f}%)")
+
 print(f"\n{'='*70}")
 print("Done. Use these insights to identify what features or signals are missing.")
 print(f"{'='*70}")
