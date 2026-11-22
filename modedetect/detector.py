@@ -682,17 +682,27 @@ class ModeDetector:
         if hasattr(self, '_ckpt_dir') and self._ckpt_dir is not None:
             stop_cache = self._ckpt_dir / "03_stop_point_cache.npz"
         if stop_cache is not None and stop_cache.exists():
-            # Re-aggregate from cached per-point data using segment labels
-            # The cache was saved from gps sorted by trip_key + timestamp,
-            # and gps_seg has the same points with segment labels added.
-            # Sort gps_seg the same way to align with cache indices.
-            from .features.stops import compute_stop_features
-            gps_seg_sorted = gps_seg.sort_values([cfg.col_trip_key, cfg.col_timestamp]).reset_index(drop=True)
-            stop_features = compute_stop_features(
-                gps_seg_sorted, None, None, cfg, segment_col="segment",
-                point_cache_path=stop_cache,
-            )
-        elif self._ensure_stop_resources(cfg):
+            # Check cache size matches current GPS data
+            import numpy as np
+            try:
+                probe = np.load(stop_cache, mmap_mode="r")
+                cache_len = len(probe["counts"])
+                probe.close()
+            except Exception:
+                cache_len = -1
+            n_points = len(gps_seg)
+            if cache_len == n_points:
+                from .features.stops import compute_stop_features
+                gps_seg_sorted = gps_seg.sort_values([cfg.col_trip_key, cfg.col_timestamp]).reset_index(drop=True)
+                stop_features = compute_stop_features(
+                    gps_seg_sorted, None, None, cfg, segment_col="segment",
+                    point_cache_path=stop_cache,
+                )
+            else:
+                logger.info("Stop cache size mismatch (%d vs %d points) — using BallTree.",
+                            cache_len, n_points)
+                stop_cache = None  # fall through to BallTree path
+        if stop_cache is None and self._ensure_stop_resources(cfg):
             from .features.stops import compute_stop_features
             stop_features = compute_stop_features(
                 gps_seg, self._stop_tree, self._stop_df, cfg, segment_col="segment",
