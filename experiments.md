@@ -146,6 +146,21 @@ SUBWAY's poor discrimination (best ratio only 1.91) explains why it's hard to cl
 
 ---
 
+## Run 2026-11-22a: Max-range filter + metro endpoint features
+
+**Changes vs 21c (current best = 21b):**
+1. **Stationary trip filter**: Replace displacement+distance filter with MAX_RANGE_M < 150m (non-walking only). Max range = furthest GPS point from trip centroid. From error analysis: catches 75.6% of CAR→WALKING errors, loses only 1.9% correct CAR. GPS drift inflates total distance but not max range.
+2. **Metro endpoint features**: `METRO_DIST_START_M`, `METRO_DIST_END_M` — distance from first/last GPS point to nearest metro station. From error analysis: correct SUBWAY median 195m/139m, true WALKING median 1151m/1160m. SUBWAY→WALKING errors also near metro (205m/157m) — the model just doesn't have this signal yet.
+
+**Hypothesis:**
+- CAR→WALKING errors (n=1188, 5.2% of CAR) should drop substantially — these are mostly parked cars with GPS drift.
+- SUBWAY→WALKING errors (n=750, 38.3% of SUBWAY) should improve — metro endpoint distance is highly discriminative (6x difference in medians).
+- OOF macro F1 should improve from 0.7486 baseline.
+
+**Result:** _(pending)_
+
+---
+
 ## Open issues
 
 1. **BUS Level 4**: Trip-level exact dropped from 71.2% to 23.1%. Segments within BUS trips get classified as CAR (BUS+CAR = 22.7%). The classifier knows BUS at trip level (OOF F1 0.68) but short segments lose the discriminative pattern.
