@@ -390,19 +390,35 @@ if "DISPLACEMENT_M" in oof_feats.columns and "DIST_TOTAL_WGS84" in oof_feats.col
 
     if len(subway_as_walk) > 0:
         print(f"\n{'='*70}")
-        print("SUBWAY → WALKING DISPLACEMENT ANALYSIS")
+        print("SUBWAY → WALKING DEEP DIVE (DISPLACEMENT & MAX RANGE)")
         print(f"{'='*70}")
 
         print(f"\n  Total: {len(subway_trips)}, Correct: {len(subway_correct)}, →WALKING: {len(subway_as_walk)}")
 
-        print(f"\n  Displacement distribution:")
-        for label, subset in [("Correct SUBWAY", subway_correct),
-                               ("SUBWAY→WALKING", subway_as_walk)]:
-            if len(subset) == 0:
+        for feat_name, feat_col in [("DIST_TOTAL_WGS84 (m)", "DIST_TOTAL_WGS84"),
+                                     ("DISPLACEMENT_M (start→end)", "DISPLACEMENT_M"),
+                                     ("MAX_RANGE_M (furthest from centroid)", "MAX_RANGE_M"),
+                                     ("SPEED_AVG (m/s)", "SPEED_AVG")]:
+            if feat_col not in oof_feats.columns:
                 continue
-            vals = subset["DISPLACEMENT_M"]
-            print(f"    {label:<20s}: P10={vals.quantile(0.1):.0f}, P25={vals.quantile(0.25):.0f}, "
-                  f"P50={vals.median():.0f}, P75={vals.quantile(0.75):.0f}, P90={vals.quantile(0.9):.0f}")
+            print(f"\n  {feat_name} distribution:")
+            for label, subset in [("Correct SUBWAY", subway_correct),
+                                   ("SUBWAY→WALKING", subway_as_walk),
+                                   ("True WALKING", walk_correct)]:
+                if len(subset) == 0:
+                    continue
+                vals = subset[feat_col]
+                print(f"    {label:<20s}: P10={vals.quantile(0.1):.0f}, P25={vals.quantile(0.25):.0f}, "
+                      f"P50={vals.median():.0f}, P75={vals.quantile(0.75):.0f}, P90={vals.quantile(0.9):.0f}")
+
+        print(f"\n  Max range thresholds (furthest point from centroid):")
+        for thresh in [25, 50, 100, 200, 500]:
+            n_sw = (subway_as_walk["MAX_RANGE_M"] < thresh).sum()
+            pct_sw = n_sw / len(subway_as_walk) * 100
+            n_sc = (subway_correct["MAX_RANGE_M"] < thresh).sum()
+            pct_sc = n_sc / len(subway_correct) * 100
+            print(f"    < {thresh:>5d}m: {n_sw:>4d}/{len(subway_as_walk)} SUB→WALK ({pct_sw:.1f}%), "
+                  f"would also drop {n_sc} correct SUBWAY ({pct_sc:.1f}%)")
 
         print(f"\n  Displacement thresholds:")
         for thresh in [50, 100, 200, 500]:
