@@ -234,19 +234,49 @@ class ModeDetector:
             logger.info("Loaded stats + percentile map from checkpoint.")
             self._optimal_percentiles = find_optimal_percentiles(pct_map, stats, cfg)
 
-        # ── Filter: remove stationary / near-zero-distance trips ──────
-        if cfg.min_trip_distance_m > 0 and "DIST_TOTAL_WGS84" in stats.columns:
-            short_mask = stats["DIST_TOTAL_WGS84"] < cfg.min_trip_distance_m
-            n_short = short_mask.sum()
-            if n_short > 0:
-                short_keys = set(stats.loc[short_mask, "trip_key"])
+        # ── Filter: remove stationary trips (non-walking only) ─────────
+        # A parked car accumulates GPS drift → high total distance but zero
+        # displacement.  Combined filter protects circular trips (high total
+        # distance, low displacement) while catching truly stationary ones.
+        if (cfg.min_trip_displacement_m > 0
+                and "DIST_TOTAL_WGS84" in stats.columns
+                and cfg.col_main_mode is not None):
+            from ._geo import haversine_m
+            # Compute displacement per trip from GPS
+            first_pts = gps.groupby(cfg.col_trip_key).first()[[cfg.col_latitude, cfg.col_longitude]]
+            last_pts = gps.groupby(cfg.col_trip_key).last()[[cfg.col_latitude, cfg.col_longitude]]
+            import numpy as np
+            disp = haversine_m(
+                first_pts[cfg.col_latitude].values, first_pts[cfg.col_longitude].values,
+                last_pts[cfg.col_latitude].values, last_pts[cfg.col_longitude].values,
+            )
+            disp_map = dict(zip(first_pts.index, disp))
+            stats["_displacement"] = stats["trip_key"].map(disp_map)
+
+            # Get mode labels for each trip
+            mode_map = trips_df.set_index(cfg.col_trip_key)[cfg.col_main_mode].to_dict()
+            stats["_mode_tmp"] = stats["trip_key"].map(mode_map)
+            stats["_mode_tmp"] = stats["_mode_tmp"].replace(cfg.mode_remap)
+
+            # Only filter non-walking modes
+            stationary_mask = (
+                (stats["_displacement"] < cfg.min_trip_displacement_m)
+                & (stats["DIST_TOTAL_WGS84"] < cfg.min_trip_distance_m)
+                & (stats["_mode_tmp"] != "WALKING")
+            )
+            n_drop = stationary_mask.sum()
+            if n_drop > 0:
+                drop_keys = set(stats.loc[stationary_mask, "trip_key"])
+                # Log per-mode breakdown
+                dropped_modes = stats.loc[stationary_mask, "_mode_tmp"].value_counts()
                 logger.info(
-                    "Dropping %d trips with total distance < %.0f m",
-                    n_short, cfg.min_trip_distance_m,
+                    "Dropping %d stationary trips (displacement < %.0fm AND total dist < %.0fm): %s",
+                    n_drop, cfg.min_trip_displacement_m, cfg.min_trip_distance_m,
+                    dict(dropped_modes),
                 )
-                stats = stats[~short_mask].reset_index(drop=True)
-                pct_map = pct_map[~pct_map["trip_key"].isin(short_keys)].reset_index(drop=True)
-                gps = gps[~gps[cfg.col_trip_key].isin(short_keys)].reset_index(drop=True)
+                stats = stats[~stationary_mask].reset_index(drop=True)
+                pct_map = pct_map[~pct_map["trip_key"].isin(drop_keys)].reset_index(drop=True)
+                gps = gps[~gps[cfg.col_trip_key].isin(drop_keys)].reset_index(drop=True)
                 # Invalidate per-point caches that no longer match gps row count
                 if ckpt is not None:
                     for stale in ["04_route_signals.parquet", "03_stop_point_cache.npz"]:
@@ -254,6 +284,7 @@ class ModeDetector:
                         if p.exists():
                             p.unlink()
                             logger.info("Invalidated stale cache: %s", stale)
+            stats.drop(columns=["_displacement", "_mode_tmp"], inplace=True)
 
         # ── Step 3: Stop proximity features ───────────────────────────
         stop_features = self._ckpt_load(ckpt, "03_stop_features.parquet")

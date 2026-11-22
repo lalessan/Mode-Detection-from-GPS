@@ -56,7 +56,8 @@ class ModeDetectConfig:
     # ── GPS quality / validation ──────────────────────────────────────
     min_gps_points: int = 10
     min_trip_duration_s: int = 180
-    min_trip_distance_m: float = 100.0  # trips with total travel < this are dropped (fit only)
+    min_trip_distance_m: float = 2000.0  # trips with total travel < this AND displacement < threshold are dropped
+    min_trip_displacement_m: float = 50.0  # start-to-end straight-line distance threshold
     gap_threshold_s: float = 300.0  # gaps > this → split (predict) or drop (fit)
 
     # ── Speed outlier filtering ───────────────────────────────────────
