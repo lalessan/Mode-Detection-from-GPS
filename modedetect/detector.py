@@ -247,6 +247,13 @@ class ModeDetector:
                 stats = stats[~short_mask].reset_index(drop=True)
                 pct_map = pct_map[~pct_map["trip_key"].isin(short_keys)].reset_index(drop=True)
                 gps = gps[~gps[cfg.col_trip_key].isin(short_keys)].reset_index(drop=True)
+                # Invalidate per-point caches that no longer match gps row count
+                if ckpt is not None:
+                    for stale in ["04_route_signals.parquet", "03_stop_point_cache.npz"]:
+                        p = ckpt / stale
+                        if p.exists():
+                            p.unlink()
+                            logger.info("Invalidated stale cache: %s", stale)
 
         # ── Step 3: Stop proximity features ───────────────────────────
         stop_features = self._ckpt_load(ckpt, "03_stop_features.parquet")
