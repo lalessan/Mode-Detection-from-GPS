@@ -29,15 +29,33 @@ gps = pd.read_parquet(CHECKPOINT_DIR / "fit_steps" / "01_gps_motion.parquet")
 # Load stats for feature context
 stats = pd.read_parquet(CHECKPOINT_DIR / "fit_steps" / "02_stats.parquet")
 
+# Compute displacement (start-to-end distance) per trip
+def haversine_m(lat1, lon1, lat2, lon2):
+    R = 6_371_000
+    phi1, phi2 = np.radians(lat1), np.radians(lat2)
+    dphi = np.radians(lat2 - lat1)
+    dlam = np.radians(lon2 - lon1)
+    a = np.sin(dphi / 2) ** 2 + np.cos(phi1) * np.cos(phi2) * np.sin(dlam / 2) ** 2
+    return 2 * R * np.arctan2(np.sqrt(a), np.sqrt(1 - a))
+
+first_pts = gps.groupby("trip_key").first()[["LATITUDE", "LONGITUDE"]]
+last_pts = gps.groupby("trip_key").last()[["LATITUDE", "LONGITUDE"]]
+disp_vals = haversine_m(
+    first_pts["LATITUDE"].values, first_pts["LONGITUDE"].values,
+    last_pts["LATITUDE"].values, last_pts["LONGITUDE"].values,
+)
+disp_df = pd.DataFrame({"trip_key": first_pts.index, "DISPLACEMENT_M": disp_vals})
+
 # Merge predictions with stats
 oof_stats = oof.merge(stats, on="trip_key", how="left")
+oof_stats = oof_stats.merge(disp_df, on="trip_key", how="left")
 
 # ── Define confusion pairs to visualize ───────────────────────────
 
 PAIRS = [
-    ("SUBWAY", "WALKING", 5),   # 5 examples each
+    ("CAR", "WALKING", 15),     # main focus — are these stationary?
+    ("SUBWAY", "WALKING", 5),
     ("SUBWAY", "BUS", 3),
-    ("CAR", "WALKING", 5),
     ("CAR", "BUS", 3),
     ("WALKING", "SUBWAY", 3),
     ("BUS", "CAR", 3),
@@ -164,8 +182,9 @@ def make_trip_map(trip_gps, trip_key, true_mode, pred_mode, stats_row=None):
         dist = stats_row.get("DIST_TOTAL_WGS84", 0)
         subway_pct = stats_row.get("subway_match_pct", 0)
         bus_pct = stats_row.get("bus_match_pct", 0)
+        displacement = stats_row.get("DISPLACEMENT_M", 0)
         info += (f"<br>Speed avg: {speed_avg:.1f} m/s, max gap: {gap_max:.0f}s"
-                 f"<br>Duration: {total_time:.0f}s, Dist: {dist:.0f}m"
+                 f"<br>Duration: {total_time:.0f}s, Dist: {dist:.0f}m, Displacement: {displacement:.0f}m"
                  f"<br>subway_match: {subway_pct:.2f}, bus_match: {bus_pct:.2f}")
 
     title_html = f'''
@@ -214,7 +233,8 @@ all_maps = []
 # Confusion pairs
 for true_mode, pred_mode, n_examples in PAIRS:
     mask = (oof_stats[true_col] == true_mode) & (oof_stats[pred_col] == pred_mode)
-    confused = oof_stats[mask].head(n_examples)
+    # Sort by displacement so we see a range from most stationary to moving
+    confused = oof_stats[mask].sort_values("DISPLACEMENT_M", ascending=True).head(n_examples)
 
     if len(confused) == 0:
         print(f"  No examples for {true_mode} → {pred_mode}")

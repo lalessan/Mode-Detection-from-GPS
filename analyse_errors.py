@@ -31,6 +31,28 @@ else:
 
 print(f"  True: '{true_col}', Predicted: '{pred_col}'")
 
+# Load GPS data to compute displacement
+print("Loading GPS data...")
+gps = pd.read_parquet(CHECKPOINT_DIR / "fit_steps" / "01_gps_motion.parquet")
+
+def haversine_m(lat1, lon1, lat2, lon2):
+    """Haversine distance in meters between two points."""
+    R = 6_371_000
+    phi1, phi2 = np.radians(lat1), np.radians(lat2)
+    dphi = np.radians(lat2 - lat1)
+    dlam = np.radians(lon2 - lon1)
+    a = np.sin(dphi / 2) ** 2 + np.cos(phi1) * np.cos(phi2) * np.sin(dlam / 2) ** 2
+    return 2 * R * np.arctan2(np.sqrt(a), np.sqrt(1 - a))
+
+print("Computing displacement (start-to-end distance) per trip...")
+first_pts = gps.groupby("trip_key").first()[["LATITUDE", "LONGITUDE"]]
+last_pts = gps.groupby("trip_key").last()[["LATITUDE", "LONGITUDE"]]
+displacement = haversine_m(
+    first_pts["LATITUDE"].values, first_pts["LONGITUDE"].values,
+    last_pts["LATITUDE"].values, last_pts["LONGITUDE"].values,
+)
+disp_df = pd.DataFrame({"trip_key": first_pts.index, "DISPLACEMENT_M": displacement})
+
 # Load features
 print("Loading features...")
 stats = pd.read_parquet(CHECKPOINT_DIR / "fit_steps" / "02_stats.parquet")
@@ -53,6 +75,7 @@ for extra, name in [(stops, "stops"), (bus_seq, "bus_seq"), (routes, "routes")]:
         print(f"  Merged {name}: {feats.shape}")
 
 oof_feats = oof.merge(feats, on="trip_key", how="left")
+oof_feats = oof_feats.merge(disp_df, on="trip_key", how="left")
 print(f"  OOF + features: {oof_feats.shape}")
 
 # ── Find biggest confusion pairs ──────────────────────────────────
@@ -136,19 +159,17 @@ for _, row in conf.head(6).iterrows():
 
         print(f"  {feat:<25s} {val_correct:>15.1f} {val_confused:>15.1f} {val_pred:>15.1f}{direction}")
 
-    # Show example trips (all, sorted by distance)
-    print(f"\n  All confused trips (sorted by distance, showing first 30):")
-    example_cols = ["trip_key", "SPEED_AVG", "TOTAL_TIME", "DIST_TOTAL_WGS84", "GPS_POINTS"]
+    # Show example trips (sorted by displacement)
+    print(f"\n  Confused trips (sorted by displacement, showing first 30):")
+    example_cols = ["trip_key", "SPEED_AVG", "TOTAL_TIME", "DIST_TOTAL_WGS84"]
+    if "DISPLACEMENT_M" in confused_trips.columns:
+        example_cols.append("DISPLACEMENT_M")
+    example_cols.append("GPS_POINTS")
     example_cols = [c for c in example_cols if c in confused_trips.columns]
-    if "bus_match_pct" in confused_trips.columns:
-        example_cols.append("bus_match_pct")
-    if "subway_match_pct" in confused_trips.columns:
-        example_cols.append("subway_match_pct")
-    if "train_match_pct" in confused_trips.columns:
-        example_cols.append("train_match_pct")
-    sorted_confused = confused_trips.sort_values("DIST_TOTAL_WGS84", ascending=True)
+    sort_col = "DISPLACEMENT_M" if "DISPLACEMENT_M" in confused_trips.columns else "DIST_TOTAL_WGS84"
+    sorted_confused = confused_trips.sort_values(sort_col, ascending=True)
     pd.set_option("display.max_rows", 30)
-    pd.set_option("display.width", 150)
+    pd.set_option("display.width", 160)
     print(sorted_confused[example_cols].head(30).to_string(index=False))
 
 # ── SUBWAY deep dive ──────────────────────────────────────────────
@@ -254,6 +275,7 @@ for feat in KEY_FEATURES:
 
 for feat_name, feat_col in [("SPEED_AVG (m/s)", "SPEED_AVG"),
                              ("DIST_TOTAL_WGS84 (m)", "DIST_TOTAL_WGS84"),
+                             ("DISPLACEMENT_M (start→end)", "DISPLACEMENT_M"),
                              ("TOTAL_TIME (s)", "TOTAL_TIME"),
                              ("GPS_POINTS", "GPS_POINTS")]:
     if feat_col not in oof_feats.columns:
@@ -269,8 +291,18 @@ for feat_name, feat_col in [("SPEED_AVG (m/s)", "SPEED_AVG"),
               f"P50={vals.median():.1f}, P75={vals.quantile(0.75):.1f}, P90={vals.quantile(0.9):.1f}")
 
 # What threshold would catch them?
+if "DISPLACEMENT_M" in oof_feats.columns and len(car_as_walk) > 0:
+    print(f"\n  Displacement thresholds (start→end) — how many CAR→WALK trips would be filtered:")
+    for thresh in [50, 100, 200, 500, 1000]:
+        n_below = (car_as_walk["DISPLACEMENT_M"] < thresh).sum()
+        pct = n_below / len(car_as_walk) * 100
+        n_correct_lost = (car_correct["DISPLACEMENT_M"] < thresh).sum()
+        pct_correct = n_correct_lost / len(car_correct) * 100
+        print(f"    < {thresh:>5d}m: {n_below:>4d}/{len(car_as_walk)} CAR→WALK ({pct:.1f}%), "
+              f"would also drop {n_correct_lost} correct CAR ({pct_correct:.1f}%)")
+
 if "DIST_TOTAL_WGS84" in oof_feats.columns and len(car_as_walk) > 0:
-    print(f"\n  Distance thresholds — how many CAR→WALK trips would be filtered:")
+    print(f"\n  Total distance thresholds — how many CAR→WALK trips would be filtered:")
     for thresh in [100, 200, 500, 1000, 2000]:
         n_below = (car_as_walk["DIST_TOTAL_WGS84"] < thresh).sum()
         pct = n_below / len(car_as_walk) * 100
