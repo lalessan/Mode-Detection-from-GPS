@@ -6,9 +6,11 @@ feature values of correctly vs incorrectly classified trips.
 Usage:
     python analyse_errors.py
 """
+import os
 import numpy as np
 import pandas as pd
 from pathlib import Path
+from sklearn.neighbors import BallTree
 
 CHECKPOINT_DIR = Path("checkpoints/")
 
@@ -72,6 +74,38 @@ disp_df = pd.DataFrame({
     "DISPLACEMENT_M": displacement,
     "MAX_RANGE_M": max_range.values,
 })
+
+# Compute distance from start/end to nearest metro station
+GTFS_DIR = Path(os.environ["GTFS_DIR"]) if os.environ.get("GTFS_DIR") else None
+if GTFS_DIR is not None:
+    print("Computing start/end distance to nearest metro station...")
+    from modedetect.features.stops import load_gtfs_stops
+    gtfs_stops = load_gtfs_stops(GTFS_DIR)
+    # Filter to metro stops (route_type 1)
+    metro_stops = gtfs_stops[gtfs_stops["route_type_set"].apply(lambda s: 1 in s)]
+    print(f"  {len(metro_stops)} metro stops loaded")
+
+    metro_rad = np.radians(metro_stops[["stop_lat", "stop_lon"]].values)
+    metro_tree = BallTree(metro_rad, metric="haversine")
+
+    # First and last GPS points per trip
+    first_rad = np.radians(first_pts[["LATITUDE", "LONGITUDE"]].values)
+    last_rad = np.radians(last_pts[["LATITUDE", "LONGITUDE"]].values)
+
+    dist_start, _ = metro_tree.query(first_rad, k=1)
+    dist_end, _ = metro_tree.query(last_rad, k=1)
+
+    disp_df["METRO_DIST_START_M"] = dist_start.ravel() * 6_371_000
+    disp_df["METRO_DIST_END_M"] = dist_end.ravel() * 6_371_000
+    disp_df["METRO_DIST_MAX_SE"] = np.maximum(disp_df["METRO_DIST_START_M"], disp_df["METRO_DIST_END_M"])
+    # Both start and end near metro?
+    disp_df["METRO_START_END_NEAR"] = (
+        (disp_df["METRO_DIST_START_M"] < 500) & (disp_df["METRO_DIST_END_M"] < 500)
+    ).astype(int)
+    print(f"  METRO_DIST_START_M median: {disp_df['METRO_DIST_START_M'].median():.0f}m")
+    print(f"  METRO_DIST_END_M median: {disp_df['METRO_DIST_END_M'].median():.0f}m")
+else:
+    print("GTFS_DIR not set — skipping metro start/end feature")
 
 # Load features
 print("Loading features...")
@@ -395,10 +429,14 @@ if "DISPLACEMENT_M" in oof_feats.columns and "DIST_TOTAL_WGS84" in oof_feats.col
 
         print(f"\n  Total: {len(subway_trips)}, Correct: {len(subway_correct)}, →WALKING: {len(subway_as_walk)}")
 
-        for feat_name, feat_col in [("DIST_TOTAL_WGS84 (m)", "DIST_TOTAL_WGS84"),
-                                     ("DISPLACEMENT_M (start→end)", "DISPLACEMENT_M"),
-                                     ("MAX_RANGE_M (furthest from centroid)", "MAX_RANGE_M"),
-                                     ("SPEED_AVG (m/s)", "SPEED_AVG")]:
+        metro_feats = [("DIST_TOTAL_WGS84 (m)", "DIST_TOTAL_WGS84"),
+                       ("DISPLACEMENT_M (start→end)", "DISPLACEMENT_M"),
+                       ("MAX_RANGE_M (furthest from centroid)", "MAX_RANGE_M"),
+                       ("SPEED_AVG (m/s)", "SPEED_AVG"),
+                       ("METRO_DIST_START_M (start → metro)", "METRO_DIST_START_M"),
+                       ("METRO_DIST_END_M (end → metro)", "METRO_DIST_END_M"),
+                       ("METRO_START_END_NEAR (both < 500m)", "METRO_START_END_NEAR")]
+        for feat_name, feat_col in metro_feats:
             if feat_col not in oof_feats.columns:
                 continue
             print(f"\n  {feat_name} distribution:")
@@ -441,6 +479,21 @@ if "DISPLACEMENT_M" in oof_feats.columns and "DIST_TOTAL_WGS84" in oof_feats.col
                 pct_sw = n_sw / len(subway_as_walk) * 100
                 pct_sc = n_sc / len(subway_correct) * 100
                 print(f"  {d_thresh:>6d}m {t_thresh:>8d}m {n_sw:>6d}/{len(subway_as_walk)} ({pct_sw:>5.1f}%) {n_sc:>8d}/{len(subway_correct)} ({pct_sc:>5.1f}%)")
+
+        # Metro start/end feature analysis
+        if "METRO_START_END_NEAR" in oof_feats.columns:
+            print(f"\n  Metro start/end proximity:")
+            print(f"  {'Group':<20s} {'Both<500m':>10s} {'Start<500m':>12s} {'End<500m':>10s}")
+            print(f"  {'─'*55}")
+            for label, subset in [("Correct SUBWAY", subway_correct),
+                                   ("SUBWAY→WALKING", subway_as_walk),
+                                   ("True WALKING", walk_correct)]:
+                if len(subset) == 0:
+                    continue
+                both = subset["METRO_START_END_NEAR"].mean() * 100
+                start = (subset["METRO_DIST_START_M"] < 500).mean() * 100
+                end = (subset["METRO_DIST_END_M"] < 500).mean() * 100
+                print(f"  {label:<20s} {both:>9.1f}% {start:>11.1f}% {end:>9.1f}%")
 
 print(f"\n{'='*70}")
 print("Done. Use these insights to identify what features or signals are missing.")
