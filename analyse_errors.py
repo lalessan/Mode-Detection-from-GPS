@@ -45,8 +45,9 @@ def haversine_m(lat1, lon1, lat2, lon2):
     return 2 * R * np.arctan2(np.sqrt(a), np.sqrt(1 - a))
 
 print("Computing displacement (start-to-end distance) per trip...")
-first_pts = gps.groupby("trip_key").first()[["LATITUDE", "LONGITUDE"]]
-last_pts = gps.groupby("trip_key").last()[["LATITUDE", "LONGITUDE"]]
+gps_key = "trip_key" if "trip_key" in gps.columns else "KEY"
+first_pts = gps.groupby(gps_key).first()[["LATITUDE", "LONGITUDE"]]
+last_pts = gps.groupby(gps_key).last()[["LATITUDE", "LONGITUDE"]]
 displacement = haversine_m(
     first_pts["LATITUDE"].values, first_pts["LONGITUDE"].values,
     last_pts["LATITUDE"].values, last_pts["LONGITUDE"].values,

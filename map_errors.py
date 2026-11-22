@@ -38,8 +38,9 @@ def haversine_m(lat1, lon1, lat2, lon2):
     a = np.sin(dphi / 2) ** 2 + np.cos(phi1) * np.cos(phi2) * np.sin(dlam / 2) ** 2
     return 2 * R * np.arctan2(np.sqrt(a), np.sqrt(1 - a))
 
-first_pts = gps.groupby("trip_key").first()[["LATITUDE", "LONGITUDE"]]
-last_pts = gps.groupby("trip_key").last()[["LATITUDE", "LONGITUDE"]]
+gps_key = "trip_key" if "trip_key" in gps.columns else "KEY"
+first_pts = gps.groupby(gps_key).first()[["LATITUDE", "LONGITUDE"]]
+last_pts = gps.groupby(gps_key).last()[["LATITUDE", "LONGITUDE"]]
 disp_vals = haversine_m(
     first_pts["LATITUDE"].values, first_pts["LONGITUDE"].values,
     last_pts["LATITUDE"].values, last_pts["LONGITUDE"].values,
