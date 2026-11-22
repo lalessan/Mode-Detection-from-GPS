@@ -353,6 +353,20 @@ if "SPEED_AVG" in oof_feats.columns and len(car_as_walk) > 0:
         print(f"    < {thresh:.1f} m/s: {n_below:>4d}/{len(car_as_walk)} CAR→WALK ({pct:.1f}%), "
               f"would also drop {n_correct_lost} correct CAR ({pct_correct:.1f}%)")
 
+if "MAX_RANGE_M" in oof_feats.columns and "DIST_TOTAL_WGS84" in oof_feats.columns and len(car_as_walk) > 0:
+    print(f"\n  Combined thresholds (max_range < R AND total_dist < T):")
+    print(f"  {'Range<':>8s} {'TotDist<':>10s} {'CAR→WALK caught':>18s} {'Correct CAR lost':>20s}")
+    print(f"  {'─'*60}")
+    for r_thresh in [25, 50, 100, 200]:
+        for t_thresh in [500, 1000, 2000, 5000]:
+            cw_mask = (car_as_walk["MAX_RANGE_M"] < r_thresh) & (car_as_walk["DIST_TOTAL_WGS84"] < t_thresh)
+            cc_mask = (car_correct["MAX_RANGE_M"] < r_thresh) & (car_correct["DIST_TOTAL_WGS84"] < t_thresh)
+            n_cw = cw_mask.sum()
+            n_cc = cc_mask.sum()
+            pct_cw = n_cw / len(car_as_walk) * 100
+            pct_cc = n_cc / len(car_correct) * 100
+            print(f"  {r_thresh:>6d}m {t_thresh:>8d}m {n_cw:>6d}/{len(car_as_walk)} ({pct_cw:>5.1f}%) {n_cc:>8d}/{len(car_correct)} ({pct_cc:>5.1f}%)")
+
 if "DISPLACEMENT_M" in oof_feats.columns and "DIST_TOTAL_WGS84" in oof_feats.columns and len(car_as_walk) > 0:
     print(f"\n  Combined thresholds (displacement < D AND total_dist < T):")
     print(f"  {'Disp<':>8s} {'TotDist<':>10s} {'CAR→WALK caught':>18s} {'Correct CAR lost':>20s}")
