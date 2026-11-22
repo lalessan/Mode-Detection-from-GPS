@@ -76,7 +76,9 @@ disp_df = pd.DataFrame({
 })
 
 # Compute distance from start/end to nearest metro station
-GTFS_DIR = Path(os.environ["GTFS_DIR"]) if os.environ.get("GTFS_DIR") else None
+GTFS_DIR = Path(os.environ["GTFS_DIR"]) if os.environ.get("GTFS_DIR") else Path("gtfs/")
+if not GTFS_DIR.exists():
+    GTFS_DIR = None
 if GTFS_DIR is not None:
     print("Computing start/end distance to nearest metro station...")
     from modedetect.features.stops import load_gtfs_stops
