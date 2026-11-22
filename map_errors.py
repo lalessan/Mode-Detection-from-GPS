@@ -55,7 +55,7 @@ oof_stats = oof_stats.merge(disp_df, on="trip_key", how="left")
 
 PAIRS = [
     ("CAR", "WALKING", 15),     # main focus — are these stationary?
-    ("SUBWAY", "WALKING", 5),
+    ("SUBWAY", "WALKING", 15),  # also check subway
     ("SUBWAY", "BUS", 3),
     ("CAR", "BUS", 3),
     ("WALKING", "SUBWAY", 3),
@@ -277,6 +277,22 @@ for _, row in special.iterrows():
     m.save(str(fpath))
     all_maps.append(("CAR (disp<50, dist≥500)", "WALKING", trip_key, fpath))
     print(f"    Saved: {fpath} (dist={row['DIST_TOTAL_WGS84']:.0f}m, disp={row['DISPLACEMENT_M']:.0f}m)")
+
+# SUBWAY→WALKING with HIGH displacement (the ones that actually moved)
+sub_walk_mask = (oof_stats[true_col] == "SUBWAY") & (oof_stats[pred_col] == "WALKING")
+sub_walk_moving = oof_stats[sub_walk_mask].sort_values("DISPLACEMENT_M", ascending=False).head(10)
+print(f"\n  SUBWAY→WALK (highest displacement): {len(sub_walk_moving)} examples")
+for _, row in sub_walk_moving.iterrows():
+    trip_key = row["trip_key"]
+    trip_gps = gps[gps["KEY"] == trip_key].sort_values("timestamp")
+    if len(trip_gps) == 0:
+        continue
+    m = make_trip_map(trip_gps, trip_key, "SUBWAY", "WALKING", row)
+    fname = f"SUBWAY_WALK_moving_{trip_key.replace('/', '_')}.html"
+    fpath = OUT_DIR / fname
+    m.save(str(fpath))
+    all_maps.append(("SUBWAY→WALK (moving)", "WALKING", trip_key, fpath))
+    print(f"    Saved: {fpath} (dist={row['DIST_TOTAL_WGS84']:.0f}m, disp={row['DISPLACEMENT_M']:.0f}m, range={row.get('MAX_RANGE_M', 0):.0f}m)")
 
 # Correctly classified examples for comparison
 for mode in CORRECT_EXAMPLES:
