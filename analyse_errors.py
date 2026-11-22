@@ -136,8 +136,8 @@ for _, row in conf.head(6).iterrows():
 
         print(f"  {feat:<25s} {val_correct:>15.1f} {val_confused:>15.1f} {val_pred:>15.1f}{direction}")
 
-    # Show a few example trips
-    print(f"\n  Example confused trips (first 5):")
+    # Show example trips (all, sorted by distance)
+    print(f"\n  All confused trips (sorted by distance, showing first 30):")
     example_cols = ["trip_key", "SPEED_AVG", "TOTAL_TIME", "DIST_TOTAL_WGS84", "GPS_POINTS"]
     example_cols = [c for c in example_cols if c in confused_trips.columns]
     if "bus_match_pct" in confused_trips.columns:
@@ -146,7 +146,10 @@ for _, row in conf.head(6).iterrows():
         example_cols.append("subway_match_pct")
     if "train_match_pct" in confused_trips.columns:
         example_cols.append("train_match_pct")
-    print(confused_trips[example_cols].head(5).to_string(index=False))
+    sorted_confused = confused_trips.sort_values("DIST_TOTAL_WGS84", ascending=True)
+    pd.set_option("display.max_rows", 30)
+    pd.set_option("display.width", 150)
+    print(sorted_confused[example_cols].head(30).to_string(index=False))
 
 # ── SUBWAY deep dive ──────────────────────────────────────────────
 
