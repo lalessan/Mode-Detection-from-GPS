@@ -805,3 +805,62 @@ def load_gtfs_stops(gtfs_dir: Path) -> pd.DataFrame:
         raise ValueError(f"GTFS stops missing columns: {required - set(stops.columns)}")
 
     return stops[["stop_id", "stop_lat", "stop_lon", "route_type_set", "bus_route_id_set"]]
+
+
+# ── Metro endpoint features ────────────────────────────────────────
+
+
+def compute_metro_endpoint_features(
+    gps_df: pd.DataFrame,
+    stops_df: pd.DataFrame,
+    config: "ModeDetectConfig",
+    segment_col: str | None = None,
+) -> pd.DataFrame | None:
+    """Distance from trip start/end to nearest metro station.
+
+    Returns a DataFrame with trip_key (+ segment if applicable) and:
+    - METRO_DIST_START_M: distance from first GPS point to nearest metro stop
+    - METRO_DIST_END_M: distance from last GPS point to nearest metro stop
+
+    Returns None if no metro stops found in GTFS data.
+    """
+    # Filter to metro stops (route_type 1)
+    if "route_type_set" not in stops_df.columns:
+        return None
+    metro_mask = stops_df["route_type_set"].apply(lambda s: 1 in s if isinstance(s, list) else False)
+    metro_stops = stops_df[metro_mask]
+    if metro_stops.empty:
+        logger.info("No metro stops found in GTFS — skipping metro endpoint features.")
+        return None
+
+    logger.info("Computing metro endpoint features (%d metro stops)...", len(metro_stops))
+
+    metro_rad = np.radians(metro_stops[["stop_lat", "stop_lon"]].values)
+    metro_tree = BallTree(metro_rad, metric="haversine")
+
+    key_col = config.col_trip_key
+    lat_col = config.col_latitude
+    lon_col = config.col_longitude
+    group_cols = [key_col] if segment_col is None else [key_col, segment_col]
+
+    grouped = gps_df.groupby(group_cols, sort=False, observed=True)
+    first_pts = grouped.agg({lat_col: "first", lon_col: "first"})
+    last_pts = grouped.agg({lat_col: "last", lon_col: "last"})
+
+    first_rad = np.radians(first_pts[[lat_col, lon_col]].astype("float64").values)
+    last_rad = np.radians(last_pts[[lat_col, lon_col]].astype("float64").values)
+
+    dist_start, _ = metro_tree.query(first_rad, k=1)
+    dist_end, _ = metro_tree.query(last_rad, k=1)
+
+    result = first_pts.reset_index()[group_cols].copy()
+    result["METRO_DIST_START_M"] = dist_start.ravel() * EARTH_RADIUS_M
+    result["METRO_DIST_END_M"] = dist_end.ravel() * EARTH_RADIUS_M
+
+    # Rename trip_key column if needed
+    if key_col != "trip_key":
+        result = result.rename(columns={key_col: "trip_key"})
+    if segment_col is not None and segment_col != "segment":
+        result = result.rename(columns={segment_col: "segment"})
+
+    return result

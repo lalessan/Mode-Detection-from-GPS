@@ -235,23 +235,26 @@ class ModeDetector:
             self._optimal_percentiles = find_optimal_percentiles(pct_map, stats, cfg)
 
         # ── Filter: remove stationary trips (non-walking only) ─────────
-        # A parked car accumulates GPS drift → high total distance but zero
-        # displacement.  Combined filter protects circular trips (high total
-        # distance, low displacement) while catching truly stationary ones.
-        if (cfg.min_trip_displacement_m > 0
-                and "DIST_TOTAL_WGS84" in stats.columns
-                and cfg.col_main_mode is not None):
+        # A parked car with GPS drift has high total distance but never
+        # moves far from its centroid.  MAX_RANGE_M (furthest point from
+        # centroid) is the best single metric for catching these.
+        if cfg.max_range_threshold_m > 0 and cfg.col_main_mode is not None:
             from ._geo import haversine_m
-            # Compute displacement per trip from GPS
-            first_pts = gps.groupby(cfg.col_trip_key).first()[[cfg.col_latitude, cfg.col_longitude]]
-            last_pts = gps.groupby(cfg.col_trip_key).last()[[cfg.col_latitude, cfg.col_longitude]]
-            import numpy as np
-            disp = haversine_m(
-                first_pts[cfg.col_latitude].values, first_pts[cfg.col_longitude].values,
-                last_pts[cfg.col_latitude].values, last_pts[cfg.col_longitude].values,
+
+            # Compute max range per trip: furthest GPS point from centroid
+            centroids = gps.groupby(cfg.col_trip_key)[[cfg.col_latitude, cfg.col_longitude]].mean()
+            gps_c = gps.merge(
+                centroids.rename(columns={cfg.col_latitude: "_clat", cfg.col_longitude: "_clon"}),
+                left_on=cfg.col_trip_key, right_index=True,
             )
-            disp_map = dict(zip(first_pts.index, disp))
-            stats["_displacement"] = stats["trip_key"].map(disp_map)
+            gps_c["_dist_centroid"] = haversine_m(
+                gps_c[cfg.col_latitude].values, gps_c[cfg.col_longitude].values,
+                gps_c["_clat"].values, gps_c["_clon"].values,
+            )
+            max_range = gps_c.groupby(cfg.col_trip_key)["_dist_centroid"].max()
+            del gps_c
+            range_map = max_range.to_dict()
+            stats["_max_range"] = stats["trip_key"].map(range_map)
 
             # Get mode labels for each trip
             mode_map = trips_df.set_index(cfg.col_trip_key)[cfg.col_main_mode].to_dict()
@@ -260,31 +263,29 @@ class ModeDetector:
 
             # Only filter non-walking modes
             stationary_mask = (
-                (stats["_displacement"] < cfg.min_trip_displacement_m)
-                & (stats["DIST_TOTAL_WGS84"] < cfg.min_trip_distance_m)
+                (stats["_max_range"] < cfg.max_range_threshold_m)
                 & (stats["_mode_tmp"] != "WALKING")
             )
             n_drop = stationary_mask.sum()
             if n_drop > 0:
                 drop_keys = set(stats.loc[stationary_mask, "trip_key"])
-                # Log per-mode breakdown
                 dropped_modes = stats.loc[stationary_mask, "_mode_tmp"].value_counts()
                 logger.info(
-                    "Dropping %d stationary trips (displacement < %.0fm AND total dist < %.0fm): %s",
-                    n_drop, cfg.min_trip_displacement_m, cfg.min_trip_distance_m,
-                    dict(dropped_modes),
+                    "Dropping %d stationary trips (max_range < %.0fm, non-walking): %s",
+                    n_drop, cfg.max_range_threshold_m, dict(dropped_modes),
                 )
                 stats = stats[~stationary_mask].reset_index(drop=True)
                 pct_map = pct_map[~pct_map["trip_key"].isin(drop_keys)].reset_index(drop=True)
                 gps = gps[~gps[cfg.col_trip_key].isin(drop_keys)].reset_index(drop=True)
                 # Invalidate per-point caches that no longer match gps row count
                 if ckpt is not None:
-                    for stale in ["04_route_signals.parquet", "03_stop_point_cache.npz"]:
+                    for stale in ["04_route_signals.parquet", "03_stop_point_cache.npz",
+                                    "03a_metro_ep_features.parquet", "03b_bus_seq_features.parquet"]:
                         p = ckpt / stale
                         if p.exists():
                             p.unlink()
                             logger.info("Invalidated stale cache: %s", stale)
-            stats.drop(columns=["_displacement", "_mode_tmp"], inplace=True)
+            stats.drop(columns=["_max_range", "_mode_tmp"], inplace=True)
 
         # ── Step 3: Stop proximity features ───────────────────────────
         stop_features = self._ckpt_load(ckpt, "03_stop_features.parquet")
@@ -313,6 +314,24 @@ class ModeDetector:
                 self._optimal_stop_percentiles = self._find_optimal_stop_percentiles(
                     stop_features, stats, cfg, stop_pct_cols,
                 )
+
+        # ── Step 3a: Metro endpoint features ──────────────────────────
+        metro_ep_features = self._ckpt_load(ckpt, "03a_metro_ep_features.parquet")
+        if metro_ep_features is None:
+            if self._stop_tree is None:
+                self._ensure_stop_resources(cfg)
+            if self._stop_df is not None:
+                from .features.stops import compute_metro_endpoint_features
+                logger.info("Computing metro endpoint features...")
+                metro_ep_features = compute_metro_endpoint_features(
+                    gps, self._stop_df, cfg,
+                )
+                if metro_ep_features is not None:
+                    self._ckpt_save(ckpt, "03a_metro_ep_features.parquet", metro_ep_features)
+            else:
+                logger.info("No GTFS configured — skipping metro endpoint features.")
+        else:
+            logger.info("Loaded metro endpoint features from checkpoint.")
 
         # ── Step 3b: Bus route sequence features ────────────────────────
         bus_seq_features = self._ckpt_load(ckpt, "03b_bus_seq_features.parquet")
@@ -370,7 +389,8 @@ class ModeDetector:
         # ── Step 5: Merge + train ─────────────────────────────────────
         logger.info("Merging feature sets...")
         merged = self._merge_features(stats, pct_map, stop_features, route_features,
-                                      bus_seq_features=bus_seq_features)
+                                      bus_seq_features=bus_seq_features,
+                                      metro_ep_features=metro_ep_features)
 
         logger.info("Training XGBoost classifier...")
         self._train_model(merged, cfg)
@@ -617,12 +637,18 @@ class ModeDetector:
                 radius_m=cfg.bus_seq_radius_m,
             )
 
+        metro_ep_features = None
+        if self._stop_df is not None:
+            from .features.stops import compute_metro_endpoint_features
+            metro_ep_features = compute_metro_endpoint_features(gps, self._stop_df, cfg)
+
         route_features = None
         if self._ensure_route_resources(cfg):
             route_features = feat_routes.compute_route_features(gps, self._route_balltrees, cfg)
 
         return self._merge_features(stats, pct_map, stop_features, route_features,
-                                    bus_seq_features=bus_seq_features)
+                                    bus_seq_features=bus_seq_features,
+                                    metro_ep_features=metro_ep_features)
 
     def _extract_segmented_features(self, gps: pd.DataFrame, cfg: ModeDetectConfig) -> pd.DataFrame:
         """Segment each trip, then extract per-segment features."""
@@ -762,8 +788,19 @@ class ModeDetector:
                 segment_col="segment", radius_m=cfg.bus_seq_radius_m,
             )
 
+        # Metro endpoint features at segment level
+        metro_ep_features = None
+        if self._stop_df is None:
+            self._ensure_stop_resources(cfg)
+        if self._stop_df is not None:
+            from .features.stops import compute_metro_endpoint_features
+            metro_ep_features = compute_metro_endpoint_features(
+                gps_seg, self._stop_df, cfg, segment_col="segment",
+            )
+
         return self._merge_features(stats, pct_map, stop_features, route_features,
-                                    bus_seq_features=bus_seq_features)
+                                    bus_seq_features=bus_seq_features,
+                                    metro_ep_features=metro_ep_features)
 
     # ── Internal: training ────────────────────────────────────────────
 
@@ -1005,6 +1042,7 @@ class ModeDetector:
         stop_features: pd.DataFrame | None,
         route_features: pd.DataFrame | None,
         bus_seq_features: pd.DataFrame | None = None,
+        metro_ep_features: pd.DataFrame | None = None,
     ) -> pd.DataFrame:
         """Merge all feature DataFrames on trip_key (+ segment if present)."""
         has_segment = "segment" in stats.columns
@@ -1035,6 +1073,9 @@ class ModeDetector:
 
         if bus_seq_features is not None:
             merged = merged.merge(bus_seq_features, on=merge_on, how="left")
+
+        if metro_ep_features is not None:
+            merged = merged.merge(metro_ep_features, on=merge_on, how="left")
 
         return merged
 

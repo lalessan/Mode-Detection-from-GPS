@@ -1116,6 +1116,8 @@ def main():
             CHECKPOINT_DIR / "fit_steps" / "03_stop_point_cache.npz",
             CHECKPOINT_DIR / "fit_steps" / "03_stop_features.parquet",
             CHECKPOINT_DIR / "fit_steps" / "03_bus_route_features.parquet",
+            CHECKPOINT_DIR / "fit_steps" / "03a_metro_ep_features.parquet",
+            CHECKPOINT_DIR / "fit_steps" / "03b_bus_seq_features.parquet",
             CHECKPOINT_DIR / "fit_steps" / "04_route_signals.parquet",
         ]
         for p in stale:
