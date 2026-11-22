@@ -257,6 +257,27 @@ for true_mode, pred_mode, n_examples in PAIRS:
         all_maps.append((true_mode, pred_mode, trip_key, fpath))
         print(f"    Saved: {fpath}")
 
+# CAR→WALKING with displacement < 50m but total distance > 500m
+# (the ones the combined filter misses — are they really stationary?)
+special_mask = (
+    (oof_stats[true_col] == "CAR") & (oof_stats[pred_col] == "WALKING")
+    & (oof_stats["DISPLACEMENT_M"] < 50)
+    & (oof_stats["DIST_TOTAL_WGS84"] >= 500)
+)
+special = oof_stats[special_mask].sort_values("DIST_TOTAL_WGS84", ascending=False).head(10)
+print(f"\n  CAR→WALK (disp<50m, dist≥500m): {len(special)} examples")
+for _, row in special.iterrows():
+    trip_key = row["trip_key"]
+    trip_gps = gps[gps["KEY"] == trip_key].sort_values("timestamp")
+    if len(trip_gps) == 0:
+        continue
+    m = make_trip_map(trip_gps, trip_key, "CAR", "WALKING", row)
+    fname = f"CAR_WALK_disp0_dist500plus_{trip_key.replace('/', '_')}.html"
+    fpath = OUT_DIR / fname
+    m.save(str(fpath))
+    all_maps.append(("CAR (disp<50, dist≥500)", "WALKING", trip_key, fpath))
+    print(f"    Saved: {fpath} (dist={row['DIST_TOTAL_WGS84']:.0f}m, disp={row['DISPLACEMENT_M']:.0f}m)")
+
 # Correctly classified examples for comparison
 for mode in CORRECT_EXAMPLES:
     mask = (oof_stats[true_col] == mode) & (oof_stats[pred_col] == mode)
