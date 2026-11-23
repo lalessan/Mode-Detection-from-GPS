@@ -285,6 +285,12 @@ class ModeDetector:
                         if p.exists():
                             p.unlink()
                             logger.info("Invalidated stale cache: %s", stale)
+                # Re-save the filtered stats so the filter doesn't re-trigger on next run
+                self._ckpt_save(ckpt, "02_stats.parquet", stats)
+                self._ckpt_save(ckpt, "02_pct_map.parquet", pct_map)
+                self._ckpt_save(ckpt, "01_gps_motion.parquet", gps)
+            else:
+                logger.info("No stationary trips to drop (max_range filter).")
             stats.drop(columns=["_max_range", "_mode_tmp"], inplace=True)
 
         # ── Step 3: Stop proximity features ───────────────────────────
