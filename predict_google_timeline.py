@@ -447,11 +447,11 @@ def main():
         preds = pd.read_parquet(preds_ckpt)
     else:
         logger.info("Running prediction on %d trips...", gps["trip_key"].nunique())
-        preds = model.predict(gps)
-
-        # Add confidence
+        # Use predict_proba once (avoids running the pipeline twice)
         proba_df = model.predict_proba(gps)
         proba_cols = [c for c in proba_df.columns if c not in ("trip_key", "segment")]
+        preds = proba_df[["trip_key"]].copy()
+        preds["predicted_mode"] = proba_df[proba_cols].idxmax(axis=1).values
         preds["confidence"] = proba_df[proba_cols].max(axis=1).values
 
         # Merge with Google labels
