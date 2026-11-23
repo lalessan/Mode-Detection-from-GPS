@@ -46,7 +46,7 @@ Source: validate_pipeline.py Level 3 + Level 4 output from original code.
 
 ---
 
-## Run 2026-11-21b: Trip-level training + per-mode radii + bus seq (**CURRENT BEST**)
+## Run 2026-11-21b: Trip-level training + per-mode radii + bus seq
 
 **Changes** (kept from previous):
 - Per-mode stop radii (50m bus/tram/rail, 250m metro)
@@ -157,7 +157,46 @@ SUBWAY's poor discrimination (best ratio only 1.91) explains why it's hard to cl
 - SUBWAY→WALKING errors (n=750, 38.3% of SUBWAY) should improve — metro endpoint distance is highly discriminative (6x difference in medians).
 - OOF macro F1 should improve from 0.7486 baseline.
 
-**Result:** _(pending)_
+**Result:**
+
+Filter dropped 2,128 stationary trips (52,366 → 50,238 GPS trips, 48,388 after mode drop).
+
+Level 3 OOF (48,388 trips, 63 features):
+
+| Mode | Baseline | Run 21b | This run | Delta vs 21b |
+|------|----------|---------|----------|--------------|
+| BIKE | 0.8199 | 0.8005 | **0.8432** | +0.0427 |
+| BUS | 0.6636 | 0.6841 | **0.7026** | +0.0185 |
+| CAR | 0.9363 | 0.9320 | **0.9565** | +0.0245 |
+| SUBWAY | 0.6574 | 0.3670 | 0.3990 | +0.0320 |
+| TRAIN | 0.8111 | 0.8252 | **0.8522** | +0.0270 |
+| TRAMWAY | 0.6740 | 0.7464 | 0.7562 | +0.0098 |
+| WALKING | 0.8799 | 0.8698 | **0.9232** | +0.0534 |
+| **MACRO** | **0.7775** | **0.7464** | **0.7761** | **+0.0297** |
+
+Level 4 (multi-modal):
+
+| Metric | Baseline | Run 21b | This run | Delta vs 21b |
+|--------|----------|---------|----------|--------------|
+| ALL excl walk Jaccard | 0.7683 | 0.7740 | **0.8227** | **+0.0487** |
+| ALL excl walk exact | 70.7% | 71.2% | **76.7%** | **+5.5%** |
+| SM excl walk exact | — | 74.3% | **80.1%** | **+5.8%** |
+| CAR→CAR | 69.9% | 83.2% | **87.9%** | **+4.7%** |
+| BUS→BUS | 71.2% | 23.1% | 27.1% | +4.0% |
+| SUBWAY→SUBWAY | — | 39.3% | 35.6% | -3.7% |
+| TRAIN→TRAIN | — | 33.9% | 29.7% | -4.2% |
+| TRAMWAY→TRAMWAY | — | 37.4% | 31.7% | -5.7% |
+
+Feature importance: METRO_DIST_END_M #13 (10.9), METRO_DIST_START_M #17 (6.4).
+
+**Key observations:**
+- **Massive Level 4 improvement**: ALL excl walk Jaccard 0.7740 → 0.8227 (+0.049), exact 71.2% → 76.7% (+5.5%). Best result by far.
+- **CAR→CAR at 87.9%** — up from 83.2%. Max-range filter removed noisy stationary trips from training.
+- **Every mode improved at OOF level** vs Run 21b. Macro F1 recovered to near-baseline (0.7761 vs 0.7775).
+- **SUBWAY still weak**: OOF F1 only 0.40, Level 4 exact 35.6% (down from 39.3%). Metro endpoint features ranked #13/#17 — model uses them but SUBWAY→WALKING confusion persists (37% at Level 4).
+- **Caveat**: Part of the OOF improvement is from removing 2,128 hard-to-classify trips from evaluation, not purely from better classification.
+
+**Verdict**: New best on the main metric. **CURRENT BEST.**
 
 ---
 
