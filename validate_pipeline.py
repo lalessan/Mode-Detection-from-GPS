@@ -1112,13 +1112,16 @@ def main():
         stale = [
             CHECKPOINT_DIR / "modedetect_model.zip",
             CHECKPOINT_DIR / "seg_preds_all.parquet",
-            CHECKPOINT_DIR / "fit_steps" / "05_oof_predictions.parquet",
+            CHECKPOINT_DIR / "fit_steps" / "01_gps_motion.parquet",
+            CHECKPOINT_DIR / "fit_steps" / "02_stats.parquet",
+            CHECKPOINT_DIR / "fit_steps" / "02_pct_map.parquet",
             CHECKPOINT_DIR / "fit_steps" / "03_stop_point_cache.npz",
             CHECKPOINT_DIR / "fit_steps" / "03_stop_features.parquet",
-            CHECKPOINT_DIR / "fit_steps" / "03_bus_route_features.parquet",
             CHECKPOINT_DIR / "fit_steps" / "03a_metro_ep_features.parquet",
             CHECKPOINT_DIR / "fit_steps" / "03b_bus_seq_features.parquet",
+            CHECKPOINT_DIR / "fit_steps" / "04_route_features.parquet",
             CHECKPOINT_DIR / "fit_steps" / "04_route_signals.parquet",
+            CHECKPOINT_DIR / "fit_steps" / "05_oof_predictions.parquet",
         ]
         for p in stale:
             if p.exists():

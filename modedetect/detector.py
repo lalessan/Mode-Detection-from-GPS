@@ -198,6 +198,40 @@ class ModeDetector:
                 gps.rename(columns={"_mode_tmp": cfg.col_main_mode}),
                 self._speed_thresholds, cfg,
             )
+
+            # Stationary trip filter: drop non-walking trips whose GPS
+            # never goes further than max_range_threshold_m from centroid
+            # (e.g. parked cars with GPS drift).
+            if cfg.max_range_threshold_m > 0:
+                from ._geo import haversine_m as _hav
+
+                centroids = gps.groupby(cfg.col_trip_key)[[cfg.col_latitude, cfg.col_longitude]].mean()
+                gps_c = gps.merge(
+                    centroids.rename(columns={cfg.col_latitude: "_clat", cfg.col_longitude: "_clon"}),
+                    left_on=cfg.col_trip_key, right_index=True,
+                )
+                gps_c["_dc"] = _hav(
+                    gps_c[cfg.col_latitude].values, gps_c[cfg.col_longitude].values,
+                    gps_c["_clat"].values, gps_c["_clon"].values,
+                )
+                max_range = gps_c.groupby(cfg.col_trip_key)["_dc"].max()
+                del gps_c
+
+                # mode_map already exists from speed filtering above
+                mode_per_trip = gps.groupby(cfg.col_trip_key)[cfg.col_main_mode].first()
+                drop_keys = set(
+                    max_range[(max_range < cfg.max_range_threshold_m)
+                              & (mode_per_trip != "WALKING")].index
+                )
+                if drop_keys:
+                    n_before = gps[cfg.col_trip_key].nunique()
+                    gps = gps[~gps[cfg.col_trip_key].isin(drop_keys)].reset_index(drop=True)
+                    logger.info(
+                        "Dropped %d stationary trips (max_range < %.0fm, non-walking). %d → %d trips.",
+                        len(drop_keys), cfg.max_range_threshold_m,
+                        n_before, gps[cfg.col_trip_key].nunique(),
+                    )
+
             gps.drop(columns=[cfg.col_main_mode], errors="ignore", inplace=True)
 
             self._ckpt_save(ckpt, "01_gps_motion.parquet", gps)
@@ -233,65 +267,6 @@ class ModeDetector:
         else:
             logger.info("Loaded stats + percentile map from checkpoint.")
             self._optimal_percentiles = find_optimal_percentiles(pct_map, stats, cfg)
-
-        # ── Filter: remove stationary trips (non-walking only) ─────────
-        # A parked car with GPS drift has high total distance but never
-        # moves far from its centroid.  MAX_RANGE_M (furthest point from
-        # centroid) is the best single metric for catching these.
-        if cfg.max_range_threshold_m > 0 and cfg.col_main_mode is not None:
-            from ._geo import haversine_m
-
-            # Compute max range per trip: furthest GPS point from centroid
-            centroids = gps.groupby(cfg.col_trip_key)[[cfg.col_latitude, cfg.col_longitude]].mean()
-            gps_c = gps.merge(
-                centroids.rename(columns={cfg.col_latitude: "_clat", cfg.col_longitude: "_clon"}),
-                left_on=cfg.col_trip_key, right_index=True,
-            )
-            gps_c["_dist_centroid"] = haversine_m(
-                gps_c[cfg.col_latitude].values, gps_c[cfg.col_longitude].values,
-                gps_c["_clat"].values, gps_c["_clon"].values,
-            )
-            max_range = gps_c.groupby(cfg.col_trip_key)["_dist_centroid"].max()
-            del gps_c
-            range_map = max_range.to_dict()
-            stats["_max_range"] = stats["trip_key"].map(range_map)
-
-            # Get mode labels for each trip
-            mode_map = trips_df.set_index(cfg.col_trip_key)[cfg.col_main_mode].to_dict()
-            stats["_mode_tmp"] = stats["trip_key"].map(mode_map)
-            stats["_mode_tmp"] = stats["_mode_tmp"].replace(cfg.mode_remap)
-
-            # Only filter non-walking modes
-            stationary_mask = (
-                (stats["_max_range"] < cfg.max_range_threshold_m)
-                & (stats["_mode_tmp"] != "WALKING")
-            )
-            n_drop = stationary_mask.sum()
-            if n_drop > 0:
-                drop_keys = set(stats.loc[stationary_mask, "trip_key"])
-                dropped_modes = stats.loc[stationary_mask, "_mode_tmp"].value_counts()
-                logger.info(
-                    "Dropping %d stationary trips (max_range < %.0fm, non-walking): %s",
-                    n_drop, cfg.max_range_threshold_m, dict(dropped_modes),
-                )
-                stats = stats[~stationary_mask].reset_index(drop=True)
-                pct_map = pct_map[~pct_map["trip_key"].isin(drop_keys)].reset_index(drop=True)
-                gps = gps[~gps[cfg.col_trip_key].isin(drop_keys)].reset_index(drop=True)
-                # Invalidate per-point caches that no longer match gps row count
-                if ckpt is not None:
-                    for stale in ["04_route_signals.parquet", "03_stop_point_cache.npz",
-                                    "03a_metro_ep_features.parquet", "03b_bus_seq_features.parquet"]:
-                        p = ckpt / stale
-                        if p.exists():
-                            p.unlink()
-                            logger.info("Invalidated stale cache: %s", stale)
-                # Re-save the filtered stats so the filter doesn't re-trigger on next run
-                self._ckpt_save(ckpt, "02_stats.parquet", stats)
-                self._ckpt_save(ckpt, "02_pct_map.parquet", pct_map)
-                self._ckpt_save(ckpt, "01_gps_motion.parquet", gps)
-            else:
-                logger.info("No stationary trips to drop (max_range filter).")
-            stats.drop(columns=["_max_range", "_mode_tmp"], inplace=True)
 
         # ── Step 3: Stop proximity features ───────────────────────────
         stop_features = self._ckpt_load(ckpt, "03_stop_features.parquet")
