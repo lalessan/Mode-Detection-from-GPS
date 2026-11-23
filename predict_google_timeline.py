@@ -556,6 +556,64 @@ def main():
             ag = (labeled.loc[mask, "predicted_mode"] == labeled.loc[mask, "google_label"]).mean()
             print(f"  {t:>10.2f} {n:>7} {cov:>8.1%} {ag:>9.1%}")
 
+    # ── Filtered analysis: only trips where our model predicts a Google-available mode ──
+    if len(labeled) > 0:
+        google_modes = set(labeled["google_label"].unique())
+        filtered = labeled[labeled["predicted_mode"].isin(google_modes)].copy()
+        n_filtered = len(filtered)
+        n_pt = labeled[~labeled["predicted_mode"].isin(google_modes)]
+
+        print(f"\n  --- Filtered: only trips where we predict {sorted(google_modes)} ---")
+        print(f"  {n_filtered}/{len(labeled)} trips ({n_filtered/len(labeled)*100:.1f}%) — "
+              f"excluded {len(n_pt)} where we predict public transport")
+
+        if n_filtered > 0:
+            agree_f = (filtered["predicted_mode"] == filtered["google_label"]).mean()
+            print(f"  Agreement (filtered): {agree_f*100:.1f}%")
+
+            from sklearn.metrics import f1_score as _f1
+            f1_f = _f1(filtered["google_label"], filtered["predicted_mode"],
+                        average="macro", labels=sorted(google_modes))
+            print(f"  Macro F1 (filtered): {f1_f:.4f}")
+
+            print(f"\n  {'Google label':<12} {'N':>6} {'Agreement':>10} {'Our predictions':>30}")
+            print("  " + "-" * 62)
+            for gl in sorted(google_modes):
+                gl_mask = filtered["google_label"] == gl
+                gl_n = gl_mask.sum()
+                if gl_n == 0:
+                    continue
+                gl_agree = (filtered.loc[gl_mask, "predicted_mode"] == gl).mean()
+                top_pred = filtered.loc[gl_mask, "predicted_mode"].value_counts()
+                top_str = ", ".join(f"{m}({c})" for m, c in top_pred.head(3).items())
+                print(f"  {gl:<12} {gl_n:>6} {gl_agree:>9.1%} {top_str:>30}")
+
+            # Agreement by confidence (filtered)
+            print(f"\n  Agreement by confidence (filtered):")
+            print(f"  {'Threshold':>10} {'Kept':>7} {'Coverage':>9} {'Agreement':>10}")
+            print("  " + "-" * 40)
+            for t in [0.0, 0.3, 0.5, 0.7, 0.8, 0.9, 0.95]:
+                mask = filtered["confidence"] >= t
+                n = mask.sum()
+                if n == 0:
+                    continue
+                cov = n / n_filtered
+                ag = (filtered.loc[mask, "predicted_mode"] == filtered.loc[mask, "google_label"]).mean()
+                print(f"  {t:>10.2f} {n:>7} {cov:>8.1%} {ag:>9.1%}")
+
+        # What does Google say about trips we predict as public transport?
+        print(f"\n  --- Trips we predict as public transport (not in Google's labels) ---")
+        pt_modes = ["SUBWAY", "TRAIN", "BUS", "TRAMWAY"]
+        for pm in pt_modes:
+            pm_mask = labeled["predicted_mode"] == pm
+            if pm_mask.sum() == 0:
+                continue
+            gl_dist = labeled.loc[pm_mask, "google_label"].value_counts()
+            gl_str = ", ".join(f"{m}({c})" for m, c in gl_dist.head(4).items())
+            med_conf = labeled.loc[pm_mask, "confidence"].median()
+            print(f"  We say {pm:<8} ({pm_mask.sum():>4} trips, med conf {med_conf:.3f}): "
+                  f"Google says {gl_str}")
+
     # Confidence stats
     print(f"\n  Confidence distribution:")
     print(f"    Mean: {preds['confidence'].mean():.3f}, Median: {preds['confidence'].median():.3f}")
