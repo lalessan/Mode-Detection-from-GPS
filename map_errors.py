@@ -273,16 +273,17 @@ def save_map(trip_gps, trip_key, true_mode, pred_mode, stats_row, fname, all_map
 
 all_maps = []
 
-# Main confusion pairs — sorted by displacement (mix of stationary and moving)
+# Main confusion pairs — random sample for representative examples
 for true_mode, pred_mode, n_examples in PAIRS:
     mask = (oof_stats[true_col] == true_mode) & (oof_stats[pred_col] == pred_mode)
-    confused = oof_stats[mask].sort_values("DISPLACEMENT_M", ascending=True).head(n_examples)
+    pool = oof_stats[mask]
+    confused = pool.sample(n=min(n_examples, len(pool)), random_state=42)
 
     if len(confused) == 0:
         print(f"  No examples for {true_mode} -> {pred_mode}")
         continue
 
-    print(f"\n  {true_mode} -> {pred_mode}: {len(confused)} examples (sorted by displacement)")
+    print(f"\n  {true_mode} -> {pred_mode}: {len(confused)} random examples (of {len(pool)} total)")
 
     for _, row in confused.iterrows():
         trip_key = row["trip_key"]
