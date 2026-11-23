@@ -318,7 +318,19 @@ def main():
     parser.add_argument("--lon-range", nargs=2, type=float, default=None, help="Lon min max")
     parser.add_argument("--output", default="google_timeline_predictions.csv", help="Output CSV path")
     parser.add_argument("--maps", default=None, help="Directory to save trip maps (optional)")
+    parser.add_argument("--clean", action="store_true", help="Delete checkpoints and re-run from scratch")
     args = parser.parse_args()
+
+    # ── Checkpoint directory ──
+    ckpt_dir = Path(f"checkpoints_timeline_{args.city}") if args.city else Path("checkpoints_timeline")
+    ckpt_dir.mkdir(exist_ok=True)
+
+    if args.clean:
+        import shutil
+        if ckpt_dir.exists():
+            shutil.rmtree(ckpt_dir)
+            ckpt_dir.mkdir()
+            logger.info("Deleted checkpoints in %s", ckpt_dir)
 
     # ── Resolve city preset ──
     preset = None
@@ -352,23 +364,39 @@ def main():
     elif args.download_data and not preset:
         logger.warning("--download-data requires --city. Skipping data download.")
 
-    # ── Parse and segment ──
-    gps = parse_google_timeline(
-        args.json, start=args.start, end=args.end,
-        lat_range=args.lat_range, lon_range=args.lon_range,
-    )
-    if len(gps) == 0:
-        print("No GPS data after filtering.")
-        return
+    # ── Parse and segment (with checkpointing) ──
+    gps_ckpt = ckpt_dir / "gps_segmented.parquet"
+    labels_ckpt = ckpt_dir / "google_labels.parquet"
 
-    gps = segment_trips_by_still(gps)
-    if gps["trip_key"].nunique() == 0:
-        print("No valid trips found.")
-        return
+    if gps_ckpt.exists() and labels_ckpt.exists():
+        logger.info("Loading segmented GPS from checkpoint: %s", gps_ckpt)
+        gps = pd.read_parquet(gps_ckpt)
+        google_labels = pd.read_parquet(labels_ckpt)
+        logger.info("Loaded %d GPS points, %d trips", len(gps), gps["trip_key"].nunique())
+    else:
+        gps = parse_google_timeline(
+            args.json, start=args.start, end=args.end,
+            lat_range=args.lat_range, lon_range=args.lon_range,
+        )
+        if len(gps) == 0:
+            print("No GPS data after filtering.")
+            return
 
-    # ── Google ground truth per trip ──
-    google_labels = gps.groupby("trip_key").apply(google_trip_label).reset_index()
-    google_labels.columns = ["trip_key", "google_label"]
+        gps = segment_trips_by_still(gps)
+        if gps["trip_key"].nunique() == 0:
+            print("No valid trips found.")
+            return
+
+        # Google ground truth per trip
+        google_labels = gps.groupby("trip_key").apply(
+            google_trip_label, include_groups=False
+        ).reset_index()
+        google_labels.columns = ["trip_key", "google_label"]
+
+        # Save checkpoints
+        gps.to_parquet(gps_ckpt, index=False)
+        google_labels.to_parquet(labels_ckpt, index=False)
+        logger.info("Saved GPS checkpoint: %s (%d trips)", gps_ckpt, gps["trip_key"].nunique())
 
     # ── Load model ──
     from modedetect import ModeDetector, ModeDetectConfig
@@ -396,6 +424,13 @@ def main():
             )
             logger.info("OSM PBF configured: %s (routes will be extracted)", pbf_path)
 
+    # Override column names to match our Google Timeline GPS format
+    model.config.col_latitude = "latitude"
+    model.config.col_longitude = "longitude"
+    model.config.col_timestamp = "timestamp"
+    model.config.col_trip_key = "trip_key"
+    model.config.col_speed_kmh = None  # compute from coords
+
     has_gtfs = model.config.gtfs_dir is not None
     has_osm = model.config.osm_routes_dir is not None or model.config.osm_pbf_path is not None
     feature_mode = "full" if (has_gtfs and has_osm) else \
@@ -404,32 +439,42 @@ def main():
     logger.info("Model loaded: %d features, classes: %s, feature mode: %s",
                 len(model._feature_list), list(model._encoder.classes_), feature_mode)
 
-    # Whole-trip prediction (not segmented — compare trip-level)
-    logger.info("Running prediction on %d trips...", gps["trip_key"].nunique())
-    preds = model.predict(gps)
+    # ── Predict (with checkpointing) ──
+    preds_ckpt = ckpt_dir / "predictions.parquet"
 
-    # Add confidence
-    proba_df = model.predict_proba(gps)
-    proba_cols = [c for c in proba_df.columns if c not in ("trip_key", "segment")]
-    preds["confidence"] = proba_df[proba_cols].max(axis=1).values
+    if preds_ckpt.exists():
+        logger.info("Loading predictions from checkpoint: %s", preds_ckpt)
+        preds = pd.read_parquet(preds_ckpt)
+    else:
+        logger.info("Running prediction on %d trips...", gps["trip_key"].nunique())
+        preds = model.predict(gps)
 
-    # Merge with Google labels
-    preds = preds.merge(google_labels, on="trip_key", how="left")
+        # Add confidence
+        proba_df = model.predict_proba(gps)
+        proba_cols = [c for c in proba_df.columns if c not in ("trip_key", "segment")]
+        preds["confidence"] = proba_df[proba_cols].max(axis=1).values
 
-    # Enrich with trip stats
-    trip_stats = gps.groupby("trip_key").agg(
-        start_time=("timestamp", "first"),
-        end_time=("timestamp", "last"),
-        n_points=("timestamp", "count"),
-        duration_s=("timestamp", lambda s: (s.max() - s.min()).total_seconds()),
-        lat_start=("latitude", "first"),
-        lon_start=("longitude", "first"),
-        lat_end=("latitude", "last"),
-        lon_end=("longitude", "last"),
-    )
-    preds = preds.merge(trip_stats, on="trip_key", how="left")
+        # Merge with Google labels
+        preds = preds.merge(google_labels, on="trip_key", how="left")
 
-    # Save
+        # Enrich with trip stats
+        trip_stats = gps.groupby("trip_key").agg(
+            start_time=("timestamp", "first"),
+            end_time=("timestamp", "last"),
+            n_points=("timestamp", "count"),
+            duration_s=("timestamp", lambda s: (s.max() - s.min()).total_seconds()),
+            lat_start=("latitude", "first"),
+            lon_start=("longitude", "first"),
+            lat_end=("latitude", "last"),
+            lon_end=("longitude", "last"),
+        )
+        preds = preds.merge(trip_stats, on="trip_key", how="left")
+
+        # Save checkpoint
+        preds.to_parquet(preds_ckpt, index=False)
+        logger.info("Saved predictions checkpoint: %s", preds_ckpt)
+
+    # Save CSV output
     preds.to_csv(args.output, index=False)
     logger.info("Saved %d predictions to %s", len(preds), args.output)
 
