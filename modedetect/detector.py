@@ -849,6 +849,7 @@ class ModeDetector:
 
         # Collect out-of-fold predictions for honest evaluation
         oof_preds = np.full(len(y), -1, dtype=int)
+        oof_confidence = np.full(len(y), np.nan, dtype=float)
         trip_keys = merged["trip_key"].values if "trip_key" in merged.columns else merged[cfg.col_trip_key].values
 
         for fold, (train_idx, val_idx) in enumerate(skf.split(X, y)):
@@ -860,6 +861,8 @@ class ModeDetector:
 
             y_pred = clf.predict(X[val_idx])
             oof_preds[val_idx] = y_pred
+            proba = clf.predict_proba(X[val_idx])
+            oof_confidence[val_idx] = proba.max(axis=1)
             f1 = f1_score(y[val_idx], y_pred, average="macro")
 
             logger.info("Fold %d/%d — macro F1: %.4f", fold + 1, cfg.n_folds, f1)
@@ -873,6 +876,7 @@ class ModeDetector:
             "trip_key": trip_keys,
             "true_label": self._encoder.inverse_transform(y),
             "pred_label": self._encoder.inverse_transform(oof_preds),
+            "confidence": oof_confidence,
         }
         if "segment" in merged.columns:
             oof_dict["segment"] = merged["segment"].values

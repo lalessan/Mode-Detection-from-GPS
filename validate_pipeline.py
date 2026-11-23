@@ -794,7 +794,54 @@ def level3_compare_confusion(merged_orig, orig_clf, orig_feature_cols,
                 rank = next(i+1 for i, (f, _) in enumerate(sorted_imp) if f == feat)
                 print(f"    #{rank:>2}  {feat:<40s} {gain:>10.1f}")
 
+    # ── Confidence analysis ──
+    if oof is not None and "confidence" in oof.columns:
+        _confidence_analysis(oof)
+
     return f1_orig
+
+
+def _confidence_analysis(oof: pd.DataFrame):
+    """Show how metrics change as we filter by prediction confidence."""
+    print()
+    print("  --- Confidence Analysis (OOF) ---")
+    print(f"  Confidence = max predicted probability for chosen class.")
+    print(f"  Filtering out low-confidence predictions improves accuracy but reduces coverage.\n")
+
+    conf = oof["confidence"].values
+    true = oof["true_label"].values
+    pred = oof["pred_label"].values
+    correct = (true == pred)
+
+    thresholds = [0.0, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 0.95]
+    print(f"  {'Threshold':>10} {'Kept':>7} {'Coverage':>9} {'Accuracy':>9} {'Macro F1':>9} {'Correct dropped':>16}")
+    print("  " + "-" * 64)
+
+    n_total = len(oof)
+    for t in thresholds:
+        mask = conf >= t
+        n_kept = mask.sum()
+        coverage = n_kept / n_total
+        if n_kept == 0:
+            continue
+        acc = correct[mask].mean()
+        f1 = f1_score(true[mask], pred[mask], average="macro")
+        # How many correct predictions would we lose?
+        correct_dropped = correct[~mask].sum()
+        print(f"  {t:>10.2f} {n_kept:>7} {coverage:>8.1%} {acc:>9.1%} {f1:>9.4f} {correct_dropped:>16}")
+
+    # Per-mode: show median confidence for correct vs incorrect
+    print(f"\n  --- Confidence by mode (correct vs incorrect) ---")
+    print(f"  {'Mode':<12} {'N correct':>10} {'Med conf':>9} {'N wrong':>8} {'Med conf':>9} {'Gap':>6}")
+    print("  " + "-" * 58)
+    for mode in sorted(set(true)):
+        mode_mask = true == mode
+        c_mask = mode_mask & correct
+        w_mask = mode_mask & ~correct
+        med_c = np.median(conf[c_mask]) if c_mask.sum() > 0 else 0
+        med_w = np.median(conf[w_mask]) if w_mask.sum() > 0 else 0
+        gap = med_c - med_w
+        print(f"  {mode:<12} {c_mask.sum():>10} {med_c:>9.3f} {w_mask.sum():>8} {med_w:>9.3f} {gap:>+6.3f}")
 
 
 # ─────────────────────────────────────────────────────────────────────
