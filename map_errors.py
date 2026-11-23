@@ -7,6 +7,7 @@ Usage:
     python map_errors.py
     # Open the HTML files in a browser
 """
+import shutil
 import numpy as np
 import pandas as pd
 import folium
@@ -15,6 +16,11 @@ from pathlib import Path
 
 CHECKPOINT_DIR = Path("checkpoints/")
 OUT_DIR = Path("error_maps/")
+
+# ── Delete old maps ───────────────────────────────────────────────
+if OUT_DIR.exists():
+    shutil.rmtree(OUT_DIR)
+    print(f"Deleted old maps in {OUT_DIR}/")
 OUT_DIR.mkdir(exist_ok=True)
 
 # ── Load data ──────────────────────────────────────────────────────
@@ -47,23 +53,60 @@ disp_vals = haversine_m(
 )
 disp_df = pd.DataFrame({"trip_key": first_pts.index, "DISPLACEMENT_M": disp_vals})
 
+# Compute max range (furthest GPS point from centroid) per trip
+centroids = gps.groupby(gps_key)[["LATITUDE", "LONGITUDE"]].mean()
+gps_c = gps.merge(
+    centroids.rename(columns={"LATITUDE": "_clat", "LONGITUDE": "_clon"}),
+    left_on=gps_key, right_index=True,
+)
+gps_c["_dc"] = haversine_m(
+    gps_c["LATITUDE"].values, gps_c["LONGITUDE"].values,
+    gps_c["_clat"].values, gps_c["_clon"].values,
+)
+max_range_df = gps_c.groupby(gps_key)["_dc"].max().reset_index()
+max_range_df.columns = ["trip_key", "MAX_RANGE_M"]
+del gps_c
+
 # Merge predictions with stats
 oof_stats = oof.merge(stats, on="trip_key", how="left")
 oof_stats = oof_stats.merge(disp_df, on="trip_key", how="left")
+oof_stats = oof_stats.merge(max_range_df, on="trip_key", how="left")
+
+# ── Load additional feature checkpoints ──────────────────────────
+
+routes_path = CHECKPOINT_DIR / "fit_steps" / "04_route_features.parquet"
+routes = pd.read_parquet(routes_path) if routes_path.exists() else None
+if routes is not None:
+    oof_stats = oof_stats.merge(routes, on="trip_key", how="left", suffixes=("", "_route"))
+
+stops_path = CHECKPOINT_DIR / "fit_steps" / "03_stop_features.parquet"
+stops = pd.read_parquet(stops_path) if stops_path.exists() else None
+if stops is not None:
+    stop_cols = ["trip_key", "MIN_DIST_METRO", "DURATION_METRO", "MIN_DIST_BUS", "DURATION_BUS"]
+    stop_cols = [c for c in stop_cols if c in stops.columns]
+    oof_stats = oof_stats.merge(stops[stop_cols], on="trip_key", how="left", suffixes=("", "_stop"))
+
+metro_ep_path = CHECKPOINT_DIR / "fit_steps" / "03a_metro_ep_features.parquet"
+metro_ep = pd.read_parquet(metro_ep_path) if metro_ep_path.exists() else None
+if metro_ep is not None:
+    oof_stats = oof_stats.merge(metro_ep, on="trip_key", how="left", suffixes=("", "_mep"))
 
 # ── Define confusion pairs to visualize ───────────────────────────
+# Updated for Run 22a error landscape (top confusions by count):
+#   SUBWAY→WALKING (571), WALKING→SUBWAY (544), CAR→BUS (401),
+#   CAR→WALKING (394), TRAIN→WALKING (260)
 
 PAIRS = [
-    ("CAR", "WALKING", 15),     # main focus — are these stationary?
-    ("SUBWAY", "WALKING", 15),  # also check subway
+    ("SUBWAY", "WALKING", 10),   # #1 confusion: 571 trips, 34.8% of SUBWAY
+    ("WALKING", "SUBWAY", 5),    # #2 reverse confusion: 544, 3.4% of WALKING
+    ("CAR", "BUS", 5),           # #3: 401, 1.8% of CAR
+    ("CAR", "WALKING", 5),       # #4: 394, 1.8% of CAR (post max-range filter)
+    ("TRAIN", "WALKING", 5),     # #5: 260, 13.5% of TRAIN
+    ("BUS", "CAR", 3),           # also notable
     ("SUBWAY", "BUS", 3),
-    ("CAR", "BUS", 3),
-    ("WALKING", "SUBWAY", 3),
-    ("BUS", "CAR", 3),
 ]
 
-# Also show correctly classified examples for comparison
-CORRECT_EXAMPLES = ["SUBWAY", "BUS", "CAR", "WALKING"]
+CORRECT_EXAMPLES = ["SUBWAY", "BUS", "CAR", "WALKING", "TRAIN"]
 
 
 def make_trip_map(trip_gps, trip_key, true_mode, pred_mode, stats_row=None):
@@ -85,7 +128,6 @@ def make_trip_map(trip_gps, trip_key, true_mode, pred_mode, stats_row=None):
     )
 
     # Color by speed: blue=slow, red=fast
-    max_speed = max(speeds.max(), 1)
     coords = list(zip(lats, lons))
 
     # Static trace (faded background)
@@ -104,10 +146,8 @@ def make_trip_map(trip_gps, trip_key, true_mode, pred_mode, stats_row=None):
 
     # Animated playback using TimestampedGeoJson
     timestamps = trip_gps["timestamp"].values
-    # Convert to ISO strings for the plugin
     time_strs = pd.to_datetime(timestamps).strftime("%Y-%m-%dT%H:%M:%S").tolist()
 
-    # Build GeoJSON features: one point per GPS fix (animated marker)
     features = []
     for i in range(len(lats)):
         speed = speeds[i]
@@ -136,7 +176,6 @@ def make_trip_map(trip_gps, trip_key, true_mode, pred_mode, stats_row=None):
             },
         })
 
-    # Add animated line segments too (trail builds up over time)
     for i in range(len(lats) - 1):
         speed = speeds[i]
         t = min(speed / 5.0, 1.0)
@@ -161,7 +200,7 @@ def make_trip_map(trip_gps, trip_key, true_mode, pred_mode, stats_row=None):
 
     TimestampedGeoJson(
         {"type": "FeatureCollection", "features": features},
-        period="PT10S",         # step every 10 seconds of trip time
+        period="PT10S",
         add_last_point=True,
         auto_play=False,
         loop=False,
@@ -174,19 +213,25 @@ def make_trip_map(trip_gps, trip_key, true_mode, pred_mode, stats_row=None):
     folium.Marker(coords[0], popup="START", icon=folium.Icon(color="green")).add_to(m)
     folium.Marker(coords[-1], popup="END", icon=folium.Icon(color="red")).add_to(m)
 
-    # Title
+    # Info panel
     info = f"True: {true_mode} | Pred: {pred_mode}"
     if stats_row is not None:
         speed_avg = stats_row.get("SPEED_AVG", 0)
         total_time = stats_row.get("TOTAL_TIME", 0)
         gap_max = stats_row.get("GAP_MAX", 0)
         dist = stats_row.get("DIST_TOTAL_WGS84", 0)
+        displacement = stats_row.get("DISPLACEMENT_M", 0)
+        max_range = stats_row.get("MAX_RANGE_M", 0)
         subway_pct = stats_row.get("subway_match_pct", 0)
         bus_pct = stats_row.get("bus_match_pct", 0)
-        displacement = stats_row.get("DISPLACEMENT_M", 0)
+        metro_start = stats_row.get("METRO_DIST_START_M", float("nan"))
+        metro_end = stats_row.get("METRO_DIST_END_M", float("nan"))
         info += (f"<br>Speed avg: {speed_avg:.1f} m/s, max gap: {gap_max:.0f}s"
-                 f"<br>Duration: {total_time:.0f}s, Dist: {dist:.0f}m, Displacement: {displacement:.0f}m"
+                 f"<br>Duration: {total_time:.0f}s, Dist: {dist:.0f}m"
+                 f"<br>Displacement: {displacement:.0f}m, Max range: {max_range:.0f}m"
                  f"<br>subway_match: {subway_pct:.2f}, bus_match: {bus_pct:.2f}")
+        if not np.isnan(metro_start):
+            info += f"<br>Metro start: {metro_start:.0f}m, end: {metro_end:.0f}m"
 
     title_html = f'''
     <div style="position:fixed; top:10px; left:60px; z-index:9999;
@@ -197,14 +242,13 @@ def make_trip_map(trip_gps, trip_key, true_mode, pred_mode, stats_row=None):
     '''
     m.get_root().html.add_child(folium.Element(title_html))
 
-    # Legend
     legend_html = '''
     <div style="position:fixed; bottom:30px; left:60px; z-index:9999;
                 background:white; padding:8px; border:1px solid grey;
                 font-size:12px;">
         <b>Speed</b><br>
-        <span style="color:#0000ff;">■</span> Slow (0 m/s)&nbsp;
-        <span style="color:#ff0000;">■</span> Fast (5+ m/s)
+        <span style="color:#0000ff;">&#9632;</span> Slow (0 m/s)&nbsp;
+        <span style="color:#ff0000;">&#9632;</span> Fast (5+ m/s)
     </div>
     '''
     m.get_root().html.add_child(folium.Element(legend_html))
@@ -212,139 +256,128 @@ def make_trip_map(trip_gps, trip_key, true_mode, pred_mode, stats_row=None):
     return m
 
 
-# ── Load route features for context ──────────────────────────────
+def save_map(trip_gps, trip_key, true_mode, pred_mode, stats_row, fname, all_maps, label=None):
+    """Helper: build map, save, append to index."""
+    trip_data = trip_gps[trip_gps[gps_key] == trip_key].sort_values("timestamp")
+    if len(trip_data) == 0:
+        print(f"    {trip_key}: no GPS data found")
+        return
+    m = make_trip_map(trip_data, trip_key, true_mode, pred_mode, stats_row)
+    fpath = OUT_DIR / fname
+    m.save(str(fpath))
+    all_maps.append((label or true_mode, pred_mode, trip_key, fpath))
+    print(f"    Saved: {fpath}")
 
-routes_path = CHECKPOINT_DIR / "fit_steps" / "04_route_features.parquet"
-routes = pd.read_parquet(routes_path) if routes_path.exists() else None
-if routes is not None:
-    oof_stats = oof_stats.merge(routes, on="trip_key", how="left", suffixes=("", "_route"))
-
-stops_path = CHECKPOINT_DIR / "fit_steps" / "03_stop_features.parquet"
-stops = pd.read_parquet(stops_path) if stops_path.exists() else None
-if stops is not None:
-    # Only keep key columns to avoid bloat
-    stop_cols = ["trip_key", "MIN_DIST_METRO", "DURATION_METRO", "MIN_DIST_BUS", "DURATION_BUS"]
-    stop_cols = [c for c in stop_cols if c in stops.columns]
-    oof_stats = oof_stats.merge(stops[stop_cols], on="trip_key", how="left", suffixes=("", "_stop"))
 
 # ── Generate maps ─────────────────────────────────────────────────
 
 all_maps = []
 
-# Confusion pairs
+# Main confusion pairs — sorted by displacement (mix of stationary and moving)
 for true_mode, pred_mode, n_examples in PAIRS:
     mask = (oof_stats[true_col] == true_mode) & (oof_stats[pred_col] == pred_mode)
-    # Sort by displacement so we see a range from most stationary to moving
     confused = oof_stats[mask].sort_values("DISPLACEMENT_M", ascending=True).head(n_examples)
 
     if len(confused) == 0:
-        print(f"  No examples for {true_mode} → {pred_mode}")
+        print(f"  No examples for {true_mode} -> {pred_mode}")
         continue
 
-    print(f"\n  {true_mode} → {pred_mode}: {len(confused)} examples")
+    print(f"\n  {true_mode} -> {pred_mode}: {len(confused)} examples (sorted by displacement)")
 
     for _, row in confused.iterrows():
         trip_key = row["trip_key"]
-        trip_gps = gps[gps["KEY"] == trip_key].sort_values("timestamp")
-        if len(trip_gps) == 0:
-            print(f"    {trip_key}: no GPS data found")
-            continue
-
-        m = make_trip_map(trip_gps, trip_key, true_mode, pred_mode, row)
         fname = f"{true_mode}_to_{pred_mode}_{trip_key.replace('/', '_')}.html"
-        fpath = OUT_DIR / fname
-        m.save(str(fpath))
-        all_maps.append((true_mode, pred_mode, trip_key, fpath))
-        print(f"    Saved: {fpath}")
+        save_map(gps, trip_key, true_mode, pred_mode, row, fname, all_maps)
 
-# CAR→WALKING with displacement < 50m but total distance > 500m
-# (the ones the combined filter misses — are they really stationary?)
-special_mask = (
-    (oof_stats[true_col] == "CAR") & (oof_stats[pred_col] == "WALKING")
-    & (oof_stats["DISPLACEMENT_M"] < 50)
-    & (oof_stats["DIST_TOTAL_WGS84"] >= 500)
-)
-special = oof_stats[special_mask].sort_values("DIST_TOTAL_WGS84", ascending=False).head(10)
-print(f"\n  CAR→WALK (disp<50m, dist≥500m): {len(special)} examples")
-for _, row in special.iterrows():
-    trip_key = row["trip_key"]
-    trip_gps = gps[gps["KEY"] == trip_key].sort_values("timestamp")
-    if len(trip_gps) == 0:
-        continue
-    m = make_trip_map(trip_gps, trip_key, "CAR", "WALKING", row)
-    fname = f"CAR_WALK_disp0_dist500plus_{trip_key.replace('/', '_')}.html"
-    fpath = OUT_DIR / fname
-    m.save(str(fpath))
-    all_maps.append(("CAR (disp<50, dist≥500)", "WALKING", trip_key, fpath))
-    print(f"    Saved: {fpath} (dist={row['DIST_TOTAL_WGS84']:.0f}m, disp={row['DISPLACEMENT_M']:.0f}m)")
-
-# SUBWAY→WALKING with HIGH displacement (the ones that actually moved)
+# SUBWAY->WALKING with HIGH displacement (the trips that actually moved far)
 sub_walk_mask = (oof_stats[true_col] == "SUBWAY") & (oof_stats[pred_col] == "WALKING")
 sub_walk_moving = oof_stats[sub_walk_mask].sort_values("DISPLACEMENT_M", ascending=False).head(10)
-print(f"\n  SUBWAY→WALK (highest displacement): {len(sub_walk_moving)} examples")
+print(f"\n  SUBWAY->WALK (highest displacement): {len(sub_walk_moving)} examples")
 for _, row in sub_walk_moving.iterrows():
     trip_key = row["trip_key"]
-    trip_gps = gps[gps["KEY"] == trip_key].sort_values("timestamp")
-    if len(trip_gps) == 0:
-        continue
-    m = make_trip_map(trip_gps, trip_key, "SUBWAY", "WALKING", row)
     fname = f"SUBWAY_WALK_moving_{trip_key.replace('/', '_')}.html"
-    fpath = OUT_DIR / fname
-    m.save(str(fpath))
-    all_maps.append(("SUBWAY→WALK (moving)", "WALKING", trip_key, fpath))
-    print(f"    Saved: {fpath} (dist={row['DIST_TOTAL_WGS84']:.0f}m, disp={row['DISPLACEMENT_M']:.0f}m, range={row.get('MAX_RANGE_M', 0):.0f}m)")
+    save_map(gps, trip_key, "SUBWAY", "WALKING", row, fname, all_maps,
+             label="SUBWAY->WALK (moving)")
 
-# Random correctly classified WALKING examples (longer trips)
-walk_correct_mask = (oof_stats[true_col] == "WALKING") & (oof_stats[pred_col] == "WALKING")
-walk_correct_all = oof_stats[walk_correct_mask]
-# Filter to longer walks (> median distance) and sample randomly
-walk_long = walk_correct_all[walk_correct_all["DIST_TOTAL_WGS84"] > walk_correct_all["DIST_TOTAL_WGS84"].median()]
-walk_sample = walk_long.sample(n=min(15, len(walk_long)), random_state=42)
-print(f"\n  Correct WALKING (random, longer trips): {len(walk_sample)} examples")
-for _, row in walk_sample.iterrows():
+# SUBWAY->WALKING near metro (metro_dist_start < 300m) — these SHOULD be catchable
+if "METRO_DIST_START_M" in oof_stats.columns:
+    sub_near = oof_stats[sub_walk_mask & (oof_stats["METRO_DIST_START_M"] < 300)]
+    sub_near = sub_near.sort_values("METRO_DIST_START_M").head(5)
+    print(f"\n  SUBWAY->WALK (near metro, start<300m): {len(sub_near)} examples")
+    for _, row in sub_near.iterrows():
+        trip_key = row["trip_key"]
+        fname = f"SUBWAY_WALK_near_metro_{trip_key.replace('/', '_')}.html"
+        save_map(gps, trip_key, "SUBWAY", "WALKING", row, fname, all_maps,
+                 label="SUBWAY->WALK (near metro)")
+
+# WALKING->SUBWAY with HIGH speed (false subway predictions on fast walkers?)
+walk_sub_mask = (oof_stats[true_col] == "WALKING") & (oof_stats[pred_col] == "SUBWAY")
+walk_sub_fast = oof_stats[walk_sub_mask].sort_values("SPEED_AVG", ascending=False).head(5)
+print(f"\n  WALKING->SUBWAY (highest speed): {len(walk_sub_fast)} examples")
+for _, row in walk_sub_fast.iterrows():
     trip_key = row["trip_key"]
-    trip_gps = gps[gps["KEY"] == trip_key].sort_values("timestamp")
-    if len(trip_gps) == 0:
-        continue
-    m = make_trip_map(trip_gps, trip_key, "WALKING", "WALKING", row)
-    fname = f"CORRECT_WALKING_long_{trip_key.replace('/', '_')}.html"
-    fpath = OUT_DIR / fname
-    m.save(str(fpath))
-    all_maps.append(("WALKING (correct, long)", "WALKING", trip_key, fpath))
-    print(f"    Saved: {fpath} (dist={row['DIST_TOTAL_WGS84']:.0f}m, range={row.get('MAX_RANGE_M', 0):.0f}m)")
+    fname = f"WALK_SUBWAY_fast_{trip_key.replace('/', '_')}.html"
+    save_map(gps, trip_key, "WALKING", "SUBWAY", row, fname, all_maps,
+             label="WALKING->SUBWAY (fast)")
+
+# CAR->BUS: sorted by bus_match_pct to see if these are near bus routes
+car_bus_mask = (oof_stats[true_col] == "CAR") & (oof_stats[pred_col] == "BUS")
+if "bus_match_pct" in oof_stats.columns:
+    car_bus_high = oof_stats[car_bus_mask].sort_values("bus_match_pct", ascending=False).head(5)
+    print(f"\n  CAR->BUS (highest bus_match_pct): {len(car_bus_high)} examples")
+    for _, row in car_bus_high.iterrows():
+        trip_key = row["trip_key"]
+        fname = f"CAR_BUS_highpct_{trip_key.replace('/', '_')}.html"
+        save_map(gps, trip_key, "CAR", "BUS", row, fname, all_maps,
+                 label="CAR->BUS (high bus_pct)")
+
+# TRAIN->WALKING with high displacement (genuine train trips missed)
+train_walk_mask = (oof_stats[true_col] == "TRAIN") & (oof_stats[pred_col] == "WALKING")
+train_walk_moving = oof_stats[train_walk_mask].sort_values("DISPLACEMENT_M", ascending=False).head(5)
+print(f"\n  TRAIN->WALK (highest displacement): {len(train_walk_moving)} examples")
+for _, row in train_walk_moving.iterrows():
+    trip_key = row["trip_key"]
+    fname = f"TRAIN_WALK_moving_{trip_key.replace('/', '_')}.html"
+    save_map(gps, trip_key, "TRAIN", "WALKING", row, fname, all_maps,
+             label="TRAIN->WALK (moving)")
 
 # Correctly classified examples for comparison
 for mode in CORRECT_EXAMPLES:
     mask = (oof_stats[true_col] == mode) & (oof_stats[pred_col] == mode)
-    correct = oof_stats[mask].head(3)
+    correct = oof_stats[mask].sample(n=min(3, mask.sum()), random_state=42)
 
     print(f"\n  Correct {mode}: {len(correct)} examples")
-
     for _, row in correct.iterrows():
         trip_key = row["trip_key"]
-        trip_gps = gps[gps["KEY"] == trip_key].sort_values("timestamp")
-        if len(trip_gps) == 0:
-            continue
-
-        m = make_trip_map(trip_gps, trip_key, mode, mode, row)
         fname = f"CORRECT_{mode}_{trip_key.replace('/', '_')}.html"
-        fpath = OUT_DIR / fname
-        m.save(str(fpath))
-        all_maps.append((mode, mode, trip_key, fpath))
-        print(f"    Saved: {fpath}")
+        save_map(gps, trip_key, mode, mode, row, fname, all_maps)
 
 # ── Create index page ─────────────────────────────────────────────
 
-index_html = "<html><head><title>Error Analysis Maps</title></head><body>\n"
-index_html += "<h1>Misclassified Trip Maps</h1>\n"
-index_html += "<p>Blue = slow, Red = fast. Green marker = start, Red marker = end.</p>\n"
+index_html = """<html><head>
+<title>Error Analysis Maps — Run 22a</title>
+<style>
+body { font-family: sans-serif; max-width: 900px; margin: 40px auto; }
+h1 { border-bottom: 2px solid #333; padding-bottom: 10px; }
+h2 { color: #c00; margin-top: 30px; }
+h2.correct { color: #060; }
+li { margin: 4px 0; }
+.stats { color: #666; font-size: 0.9em; }
+</style>
+</head><body>
+<h1>Error Analysis Maps — Run 22a</h1>
+<p>Blue = slow, Red = fast. Green marker = start, Red marker = end.<br>
+Info panel shows speed, duration, displacement, max range, metro proximity.</p>
+"""
 
 current_pair = None
 for true_mode, pred_mode, trip_key, fpath in all_maps:
-    pair = f"{true_mode} → {pred_mode}"
+    pair = f"{true_mode} -> {pred_mode}"
     if pair != current_pair:
+        if current_pair is not None:
+            index_html += "</ul>\n"
         if true_mode == pred_mode:
-            index_html += f"\n<h2>Correctly classified: {true_mode}</h2>\n<ul>\n"
+            index_html += f'\n<h2 class="correct">Correctly classified: {true_mode}</h2>\n<ul>\n'
         else:
             index_html += f"\n<h2>{pair}</h2>\n<ul>\n"
         current_pair = pair
