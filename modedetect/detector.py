@@ -740,7 +740,6 @@ class ModeDetector:
             stop_cache = self._ckpt_dir / "03_stop_point_cache.npz"
         if stop_cache is not None and stop_cache.exists():
             # Check cache size matches current GPS data
-            import numpy as np
             try:
                 probe = np.load(stop_cache, mmap_mode="r")
                 cache_len = len(probe["counts"])
