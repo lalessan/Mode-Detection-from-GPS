@@ -200,6 +200,38 @@ Feature importance: METRO_DIST_END_M #13 (10.9), METRO_DIST_START_M #17 (6.4).
 
 ---
 
+## Confidence analysis (Run 22a)
+
+Added prediction confidence (max predicted probability) to both trip-level OOF and segment-level multi-modal predictions.
+
+**Trip-level OOF (Level 3, 48,388 trips):**
+
+| Threshold | Kept | Coverage | Accuracy | Macro F1 |
+|-----------|------|----------|----------|----------|
+| 0.00 | 48,388 | 100% | 89.8% | 0.7761 |
+| 0.50 | 47,402 | 98.0% | 90.7% | 0.7893 |
+| 0.70 | 43,400 | 89.7% | 93.3% | 0.8217 |
+| 0.80 | 40,578 | 83.9% | 94.7% | 0.8443 |
+| 0.90 | 35,784 | 74.0% | 96.2% | 0.8695 |
+| 0.95 | 30,837 | 63.7% | 97.3% | 0.8871 |
+
+Per-mode confidence gap (median correct - median incorrect): WALKING +0.333, BIKE +0.253, CAR +0.195, TRAMWAY +0.182, BUS +0.145, TRAIN +0.136, **SUBWAY -0.002** (model equally confident whether right or wrong).
+
+**Segment-level multi-modal (Level 4, 50,095 trips, min-confidence = lowest segment confidence):**
+
+| Threshold | Kept | Coverage | Jaccard nw | Exact nw |
+|-----------|------|----------|------------|----------|
+| 0.00 | 50,095 | 100% | 0.8197 | 76.7% |
+| 0.50 | 46,553 | 92.9% | 0.8435 | 80.2% |
+| 0.70 | 37,297 | 74.5% | 0.9032 | 88.5% |
+| 0.80 | 32,906 | 65.7% | 0.9254 | 91.5% |
+| 0.90 | 26,739 | 53.4% | 0.9510 | 94.6% |
+| 0.95 | 21,164 | 42.2% | 0.9668 | 96.5% |
+
+**Key finding**: Confidence filtering is highly effective. At 0.70 min-confidence, 74.5% of trips are kept with Jaccard excl walking 0.90 (vs 0.82 unfiltered) and exact match 88.5% (vs 76.7%). SUBWAY is the only mode where confidence does not discriminate correct from incorrect predictions.
+
+---
+
 ## Open issues
 
 1. **BUS Level 4**: Trip-level exact dropped from 71.2% to 23.1%. Segments within BUS trips get classified as CAR (BUS+CAR = 22.7%). The classifier knows BUS at trip level (OOF F1 0.68) but short segments lose the discriminative pattern.
