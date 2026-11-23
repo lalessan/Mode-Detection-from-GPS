@@ -585,11 +585,14 @@ class ModeDetector:
 
         y_pred = self._model.predict(X)
         labels = self._encoder.inverse_transform(y_pred)
+        proba = self._model.predict_proba(X)
+        confidence = proba.max(axis=1)
 
         result = pd.DataFrame({
             "trip_key": features_df["trip_key"].values,
             "segment": features_df["segment"].values,
             "predicted_mode": labels,
+            "confidence": confidence,
         })
 
         if cfg.postprocess_enabled:

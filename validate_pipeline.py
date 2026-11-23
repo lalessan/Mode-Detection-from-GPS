@@ -844,6 +844,58 @@ def _confidence_analysis(oof: pd.DataFrame):
         print(f"  {mode:<12} {c_mask.sum():>10} {med_c:>9.3f} {w_mask.sum():>8} {med_w:>9.3f} {gap:>+6.3f}")
 
 
+def _segment_confidence_analysis(seg_preds: pd.DataFrame, non_oos: pd.DataFrame):
+    """Show how Jaccard improves when filtering trips by min segment confidence."""
+    print(f"\n  --- Segment-Level Confidence Analysis ---")
+    print(f"  Trip min-confidence = lowest segment confidence across all segments in a trip.")
+    print(f"  Filtering excludes entire trips where any segment is below the threshold.\n")
+
+    # Per-trip: min confidence across segments
+    trip_conf = seg_preds.groupby("trip_key")["confidence"].agg(["min", "mean"]).reset_index()
+    trip_conf.columns = ["trip_key", "conf_min", "conf_mean"]
+    trip_conf = trip_conf.rename(columns={"trip_key": "TRIP_KEY"})
+
+    # Merge with non_oos which already has JACCARD / JACCARD_NO_WALK
+    merged = non_oos.merge(trip_conf, on="TRIP_KEY", how="left")
+
+    thresholds = [0.0, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 0.95]
+    n_total = len(merged)
+
+    print(f"  {'Threshold':>10} {'Kept':>7} {'Coverage':>9} {'Jaccard':>8} {'J no walk':>10} {'Exact':>7} {'Exact nw':>9}")
+    print("  " + "-" * 68)
+
+    for t in thresholds:
+        mask = merged["conf_min"] >= t
+        sub = merged[mask]
+        n = len(sub)
+        if n == 0:
+            continue
+        cov = n / n_total
+        jacc = sub["JACCARD"].mean()
+        jacc_nw = sub["JACCARD_NO_WALK"].mean()
+        exact = (sub["JACCARD"] == 1.0).mean() * 100
+        exact_nw = (sub["JACCARD_NO_WALK"] == 1.0).mean() * 100
+        print(f"  {t:>10.2f} {n:>7} {cov:>8.1%} {jacc:>8.4f} {jacc_nw:>10.4f} {exact:>6.1f}% {exact_nw:>8.1f}%")
+
+    # Also show using mean confidence (less strict)
+    print(f"\n  Using trip mean-confidence (less strict):\n")
+    print(f"  {'Threshold':>10} {'Kept':>7} {'Coverage':>9} {'Jaccard':>8} {'J no walk':>10} {'Exact':>7} {'Exact nw':>9}")
+    print("  " + "-" * 68)
+
+    for t in thresholds:
+        mask = merged["conf_mean"] >= t
+        sub = merged[mask]
+        n = len(sub)
+        if n == 0:
+            continue
+        cov = n / n_total
+        jacc = sub["JACCARD"].mean()
+        jacc_nw = sub["JACCARD_NO_WALK"].mean()
+        exact = (sub["JACCARD"] == 1.0).mean() * 100
+        exact_nw = (sub["JACCARD_NO_WALK"] == 1.0).mean() * 100
+        print(f"  {t:>10.2f} {n:>7} {cov:>8.1%} {jacc:>8.4f} {jacc_nw:>10.4f} {exact:>6.1f}% {exact_nw:>8.1f}%")
+
+
 # ─────────────────────────────────────────────────────────────────────
 # LEVEL 4: Multi-modal evaluation
 # ─────────────────────────────────────────────────────────────────────
@@ -1122,6 +1174,10 @@ def level4_multimodal(gps_df, trips_df, model_new):
         exact_strict = (subset["_pred_key"] == gt_key).mean() * 100
         print(f"      Exact match: {exact_strict:.1f}%")
         print()
+
+    # ── Confidence analysis (segment-level) ──
+    if "confidence" in seg_preds.columns:
+        _segment_confidence_analysis(seg_preds, non_oos)
 
     # ── Compare with student ──
     if "route_signal" in student_results:
