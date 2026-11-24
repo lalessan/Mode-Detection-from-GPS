@@ -448,6 +448,30 @@ class ModeDetector:
             result[cls] = proba[:, i]
         return result
 
+    def segment_boundaries(self) -> pd.DataFrame:
+        """Return time boundaries for each segment from the last segmented prediction.
+
+        Must be called after ``predict(..., segment=True)`` or
+        ``predict_proba(..., segment=True)``.
+
+        Returns
+        -------
+        DataFrame with columns: trip_key, segment, seg_start, seg_end, n_points.
+        """
+        if not hasattr(self, "_last_segmented_gps") or self._last_segmented_gps is None:
+            raise ModeDetectError(
+                "No segmented GPS data available. Call predict(segment=True) first."
+            )
+        cfg = self.config
+        gps_seg = self._last_segmented_gps
+        bounds = gps_seg.groupby([cfg.col_trip_key, "segment"]).agg(
+            seg_start=(cfg.col_timestamp, "min"),
+            seg_end=(cfg.col_timestamp, "max"),
+            n_points=(cfg.col_timestamp, "count"),
+        ).reset_index()
+        bounds = bounds.rename(columns={cfg.col_trip_key: "trip_key"})
+        return bounds
+
     # ── save / load ───────────────────────────────────────────────────
 
     def save(self, path: str | Path) -> Path:
@@ -712,6 +736,9 @@ class ModeDetector:
             gps_seg = pd.concat(
                 [r for r in results if len(r) > 0], ignore_index=True,
             )
+
+        # Store segmented GPS for downstream access (e.g. segment time ranges)
+        self._last_segmented_gps = gps_seg
 
         # Extract features at segment level
         stats = compute_trip_statistics(gps_seg, cfg, segment_col="segment")

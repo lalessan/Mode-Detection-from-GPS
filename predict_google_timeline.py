@@ -1,7 +1,11 @@
 """Run the trained modedetect model on Google Timeline location history.
 
-Uses Google's own activity recognition to segment trips (split on STILL
-periods) and as ground truth labels to evaluate our model's predictions.
+Proper pipeline:
+  1. Parse raw GPS (lat, lon, time) from Google Timeline JSON
+  2. Run infostop for stop detection → trips = movement between stops
+  3. Run model.predict_proba(gps, segment=True) for multi-modal prediction
+  4. For each predicted segment, look up Google's activity label as ground truth
+  5. Compare segment-level predictions vs Google labels
 
 Usage:
     # Basic — motion features only (no GTFS/OSM needed):
@@ -11,11 +15,6 @@ Usage:
     # With auto-downloaded GTFS + OSM for full feature set:
     python predict_google_timeline.py --json "Location History.json" \
         --model models/netmob25_modedetect.zip --city copenhagen --download-data
-
-    # Custom bounding box:
-    python predict_google_timeline.py --json "Location History.json" \
-        --model models/netmob25_modedetect.zip \
-        --lat-range 55.6 55.75 --lon-range 12.4 12.7
 
     # Generate maps for visual inspection:
     python predict_google_timeline.py --json "Location History.json" \
@@ -231,77 +230,181 @@ def parse_google_timeline(json_path: str, start: str = None, end: str = None,
     return df
 
 
-def segment_trips_by_still(df: pd.DataFrame, still_min_duration_s: float = 300.0,
-                           gap_max_s: float = 600.0,
-                           min_points: int = 10,
-                           min_duration_s: float = 180.0) -> pd.DataFrame:
-    """Segment GPS stream into trips by splitting on STILL periods.
+def segment_trips_by_infostop(df: pd.DataFrame,
+                               r1: float = 30.0,
+                               min_staying_time: float = 300.0,
+                               min_points: int = 10,
+                               min_duration_s: float = 180.0,
+                               gap_max_s: float = 300.0,
+                               max_range_threshold_m: float = 150.0) -> pd.DataFrame:
+    """Segment GPS stream into trips using infostop stop detection.
 
-    A STILL period is a run of consecutive records where Google's top activity
-    is STILL and the total duration exceeds still_min_duration_s. Points during
-    STILL periods are excluded (they are stops, not trips).
+    infostop detects stationary locations (stops) from raw GPS coordinates.
+    Trips are the movement periods between consecutive stops.
 
-    Also splits on large time gaps (> gap_max_s) regardless of activity, to
-    handle periods with no data.
+    Filters are aligned with ModeDetectConfig defaults:
+    - min_points=10, min_duration_s=180, gap_max_s=300, max_range=150m
+
+    Parameters
+    ----------
+    df : GPS DataFrame with latitude, longitude, timestamp columns.
+    r1 : Spatial radius for stop detection (meters). Default 30m (wider than
+         infostop's default 10m because Google Timeline has coarser resolution).
+    min_staying_time : Minimum duration at a stop to count (seconds). Default 300s.
+    min_points : Minimum GPS points per trip to keep.
+    min_duration_s : Minimum trip duration (seconds) to keep.
+
+    Returns
+    -------
+    DataFrame with trip_key column added, stop points excluded.
     """
+    import infostop
+
     df = df.sort_values("timestamp").reset_index(drop=True)
 
-    # Forward-fill google_activity for records without activity labels
-    # (44% have labels; between labeled points, the activity likely persists)
-    df["_activity_filled"] = df["google_activity"].ffill()
-
-    # Mark STILL records
-    is_still = df["_activity_filled"] == "STILL"
-
-    # Find STILL runs and filter to those lasting > threshold
-    still_run = (is_still != is_still.shift()).cumsum()
-    still_run_duration = df.groupby(still_run)["timestamp"].transform(
-        lambda s: (s.max() - s.min()).total_seconds()
+    # Remove invalid coordinates (same as model's remove_invalid_coordinates)
+    valid = (
+        df["latitude"].between(-90, 90) &
+        df["longitude"].between(-180, 180) &
+        df["latitude"].notna() & df["longitude"].notna() &
+        ~((df["latitude"] == 0) & (df["longitude"] == 0))
     )
-    # A record is part of a "real stop" if it's STILL and the run is long enough
-    is_stop = is_still & (still_run_duration >= still_min_duration_s)
+    n_invalid = (~valid).sum()
+    if n_invalid > 0:
+        df = df[valid].reset_index(drop=True)
+        logger.info("Removed %d invalid coordinates", n_invalid)
 
-    # Also check for time gaps
+    # Prepare input: [lat, lon, timestamp_seconds]
+    ts_seconds = (df["timestamp"] - pd.Timestamp("1970-01-01")) / pd.Timedelta("1s")
+    coords = np.column_stack([
+        df["latitude"].values,
+        df["longitude"].values,
+        ts_seconds.values,
+    ])
+
+    logger.info("Running infostop on %d points (r1=%.0fm, min_stay=%.0fs)...",
+                len(coords), r1, min_staying_time)
+
+    model = infostop.Infostop(
+        r1=r1,
+        r2=r1,
+        min_staying_time=min_staying_time,
+        min_size=2,
+        distance_metric="haversine",
+    )
+    labels = model.fit_predict(coords)
+
+    # labels: -1 = moving, >=0 = stop location ID
+    n_stops = len(set(labels[labels >= 0]))
+    n_moving = (labels == -1).sum()
+    logger.info("infostop: %d stop locations found, %d/%d points are moving",
+                n_stops, n_moving, len(labels))
+
+    df["_stop_label"] = labels
+
+    # ── Validate infostop stops vs Google STILL ──
+    if "google_activity" in df.columns:
+        has_google = df["google_activity"].notna()
+        is_stop = labels >= 0
+        google_still = df["google_activity"] == "STILL"
+
+        # Only compare points where Google has a label
+        g = has_google
+        n_google = g.sum()
+        if n_google > 0:
+            # Infostop says stop & Google says STILL
+            tp = (is_stop & google_still & g).sum()
+            # Infostop says stop but Google says not STILL
+            fp = (is_stop & ~google_still & g).sum()
+            # Infostop says moving but Google says STILL
+            fn = (~is_stop & google_still & g).sum()
+            # Both say moving / not still
+            tn = (~is_stop & ~google_still & g).sum()
+
+            precision = tp / (tp + fp) if (tp + fp) > 0 else 0
+            recall = tp / (tp + fn) if (tp + fn) > 0 else 0
+            f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0
+
+            logger.info("Stop validation (infostop vs Google STILL, %d labeled points):", n_google)
+            logger.info("  Precision: %.1f%% (of infostop stops, %.0f%% are Google STILL)",
+                        precision * 100, precision * 100)
+            logger.info("  Recall:    %.1f%% (of Google STILL, %.0f%% are infostop stops)",
+                        recall * 100, recall * 100)
+            logger.info("  F1:        %.3f", f1)
+            logger.info("  Confusion: TP=%d FP=%d FN=%d TN=%d", tp, fp, fn, tn)
+
+            # Also show what Google labels infostop's stops have
+            stop_google_acts = df.loc[is_stop & has_google, "google_activity"].value_counts()
+            logger.info("  Google labels at infostop stops: %s",
+                        ", ".join(f"{act}({n})" for act, n in stop_google_acts.head(5).items()))
+            move_google_acts = df.loc[~is_stop & has_google, "google_activity"].value_counts()
+            logger.info("  Google labels at infostop moving: %s",
+                        ", ".join(f"{act}({n})" for act, n in move_google_acts.head(5).items()))
+
+    # Trips = consecutive runs of -1 (moving) points.
+    # Each time we transition from stop (>=0) to moving (-1) starts a new trip.
+    is_moving = labels == -1
+
+    # Assign trip IDs: each contiguous block of moving points is a trip.
+    # Also split on large time gaps within moving segments.
     dt = df["timestamp"].diff().dt.total_seconds().fillna(0)
-    is_gap = dt > gap_max_s
+    is_time_gap = dt > gap_max_s
 
-    # Trip boundaries: either end of a stop period or a time gap
-    boundary = is_gap | (is_stop.shift(fill_value=True) & ~is_stop)
+    # Create trip boundaries: start of a moving segment, or time gap within moving
+    boundary = (is_moving & ~np.roll(is_moving, 1)) | (is_moving & is_time_gap)
+    boundary[0] = is_moving[0]  # first point
     trip_id = boundary.cumsum()
 
-    # Assign trip keys and remove stop records
+    # Only keep moving points
     df["trip_key"] = "trip_" + trip_id.astype(str)
-    df = df[~is_stop].reset_index(drop=True)
+    df = df[is_moving].reset_index(drop=True)
 
-    # Filter short/sparse trips
+    # Filter short/sparse trips and stationary trips (GPS drift)
+    from modedetect._geo import haversine_m as _hav
+
     trip_stats = df.groupby("trip_key").agg(
         n_points=("timestamp", "count"),
         duration=("timestamp", lambda s: (s.max() - s.min()).total_seconds()),
+        lat_mean=("latitude", "mean"),
+        lon_mean=("longitude", "mean"),
     )
-    valid = trip_stats[(trip_stats["n_points"] >= min_points) &
-                       (trip_stats["duration"] >= min_duration_s)].index
-    df = df[df["trip_key"].isin(valid)].reset_index(drop=True)
 
-    df.drop(columns=["_activity_filled"], inplace=True)
+    # Max range: furthest GPS point from trip centroid (same as training filter)
+    centroids = df.merge(
+        trip_stats[["lat_mean", "lon_mean"]],
+        on="trip_key",
+    )
+    centroids["_dist_to_centroid"] = _hav(
+        centroids["latitude"].values, centroids["longitude"].values,
+        centroids["lat_mean"].values, centroids["lon_mean"].values,
+    )
+    max_range = centroids.groupby("trip_key")["_dist_to_centroid"].max()
+    trip_stats["max_range_m"] = max_range
+
+    # Keep trips with enough points, duration, and movement
+    valid = trip_stats[
+        (trip_stats["n_points"] >= min_points) &
+        (trip_stats["duration"] >= min_duration_s) &
+        (trip_stats["max_range_m"] >= max_range_threshold_m)
+    ].index
+    n_stationary = ((trip_stats["max_range_m"] < max_range_threshold_m) &
+                    (trip_stats["n_points"] >= min_points)).sum()
+    df = df[df["trip_key"].isin(valid)].reset_index(drop=True)
+    if n_stationary > 0:
+        logger.info("Dropped %d stationary trips (max_range < %.0fm)", n_stationary, max_range_threshold_m)
+
+    df.drop(columns=["_stop_label"], inplace=True)
 
     n_trips = df["trip_key"].nunique()
-    logger.info("Segmented into %d trips (still_dur=%.0fs, gap=%.0fs, min_pts=%d)",
-                n_trips, still_min_duration_s, gap_max_s, min_points)
+    logger.info("Segmented into %d trips (min_pts=%d, min_dur=%.0fs)",
+                n_trips, min_points, min_duration_s)
     return df
-
-
-def google_trip_label(trip_df: pd.DataFrame) -> str | None:
-    """Determine Google's label for a trip: dominant non-STILL activity."""
-    modes = trip_df["google_mode"].dropna()
-    if len(modes) == 0:
-        return None
-    return modes.value_counts().index[0]
 
 
 def main():
     city_names = ", ".join(sorted(CITY_PRESETS.keys()))
     parser = argparse.ArgumentParser(
-        description="Predict transport modes from Google Timeline",
+        description="Predict transport modes from Google Timeline (infostop + multi-modal)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument("--json", required=True, help="Path to Location History.json")
@@ -364,14 +467,12 @@ def main():
     elif args.download_data and not preset:
         logger.warning("--download-data requires --city. Skipping data download.")
 
-    # ── Parse and segment (with checkpointing) ──
-    gps_ckpt = ckpt_dir / "gps_segmented.parquet"
-    labels_ckpt = ckpt_dir / "google_labels.parquet"
+    # ── Parse and segment with infostop (with checkpointing) ──
+    gps_ckpt = ckpt_dir / "gps_infostop.parquet"
 
-    if gps_ckpt.exists() and labels_ckpt.exists():
-        logger.info("Loading segmented GPS from checkpoint: %s", gps_ckpt)
+    if gps_ckpt.exists():
+        logger.info("Loading infostop-segmented GPS from checkpoint: %s", gps_ckpt)
         gps = pd.read_parquet(gps_ckpt)
-        google_labels = pd.read_parquet(labels_ckpt)
         logger.info("Loaded %d GPS points, %d trips", len(gps), gps["trip_key"].nunique())
     else:
         gps = parse_google_timeline(
@@ -382,20 +483,13 @@ def main():
             print("No GPS data after filtering.")
             return
 
-        gps = segment_trips_by_still(gps)
+        gps = segment_trips_by_infostop(gps)
         if gps["trip_key"].nunique() == 0:
             print("No valid trips found.")
             return
 
-        # Google ground truth per trip
-        google_labels = gps.groupby("trip_key").apply(
-            google_trip_label, include_groups=False
-        ).reset_index()
-        google_labels.columns = ["trip_key", "google_label"]
-
-        # Save checkpoints
+        # Save checkpoint
         gps.to_parquet(gps_ckpt, index=False)
-        google_labels.to_parquet(labels_ckpt, index=False)
         logger.info("Saved GPS checkpoint: %s (%d trips)", gps_ckpt, gps["trip_key"].nunique())
 
     # ── Load model ──
@@ -432,79 +526,208 @@ def main():
     model.config.col_speed_kmh = None  # compute from coords
 
     has_gtfs = model.config.gtfs_dir is not None
-    has_osm = model.config.osm_routes_dir is not None or model.config.osm_pbf_path is not None
+    has_osm = model.config.osm_routes_dir is not None or getattr(model.config, "osm_pbf_path", None) is not None
     feature_mode = "full" if (has_gtfs and has_osm) else \
                    "motion + stops" if has_gtfs else \
                    "motion + routes" if has_osm else "motion only"
     logger.info("Model loaded: %d features, classes: %s, feature mode: %s",
                 len(model._feature_list), list(model._encoder.classes_), feature_mode)
 
-    # ── Predict (with checkpointing) ──
-    preds_ckpt = ckpt_dir / "predictions.parquet"
+    # ── Multi-modal predict with segment=True (with checkpointing) ──
+    preds_ckpt = ckpt_dir / "predictions_segmented.parquet"
 
     if preds_ckpt.exists():
         logger.info("Loading predictions from checkpoint: %s", preds_ckpt)
-        preds = pd.read_parquet(preds_ckpt)
+        seg_preds = pd.read_parquet(preds_ckpt)
     else:
-        logger.info("Running prediction on %d trips...", gps["trip_key"].nunique())
-        # Use predict_proba once (avoids running the pipeline twice)
-        proba_df = model.predict_proba(gps)
+        logger.info("Running multi-modal prediction (segment=True) on %d trips...",
+                    gps["trip_key"].nunique())
+        # predict_proba with segment=True: runs PELT segmentation + per-segment classification
+        proba_df = model.predict_proba(gps, segment=True)
         proba_cols = [c for c in proba_df.columns if c not in ("trip_key", "segment")]
-        preds = proba_df[["trip_key"]].copy()
-        preds["predicted_mode"] = proba_df[proba_cols].idxmax(axis=1).values
-        preds["confidence"] = proba_df[proba_cols].max(axis=1).values
+        seg_preds = proba_df[["trip_key", "segment"]].copy()
+        seg_preds["predicted_mode"] = proba_df[proba_cols].idxmax(axis=1).values
+        seg_preds["confidence"] = proba_df[proba_cols].max(axis=1).values
 
-        # Merge with Google labels
-        preds = preds.merge(google_labels, on="trip_key", how="left")
+        # Get segment time boundaries from the model
+        seg_bounds = model.segment_boundaries()
+        seg_preds = seg_preds.merge(seg_bounds, on=["trip_key", "segment"], how="left")
 
-        # Enrich with trip stats
-        trip_stats = gps.groupby("trip_key").agg(
-            start_time=("timestamp", "first"),
-            end_time=("timestamp", "last"),
-            n_points=("timestamp", "count"),
-            duration_s=("timestamp", lambda s: (s.max() - s.min()).total_seconds()),
-            lat_start=("latitude", "first"),
-            lon_start=("longitude", "first"),
-            lat_end=("latitude", "last"),
-            lon_end=("longitude", "last"),
-        )
-        preds = preds.merge(trip_stats, on="trip_key", how="left")
-
-        # Save checkpoint
-        preds.to_parquet(preds_ckpt, index=False)
+        seg_preds.to_parquet(preds_ckpt, index=False)
         logger.info("Saved predictions checkpoint: %s", preds_ckpt)
 
+    # ── Build Google ground truth per segment ──
+    # For each segment, look up Google's activity labels during that time window
+    # and compute the dominant mode (majority vote and confidence-weighted).
+    google_labels_ckpt = ckpt_dir / "google_segment_labels.parquet"
+
+    if google_labels_ckpt.exists():
+        logger.info("Loading Google segment labels from checkpoint: %s", google_labels_ckpt)
+        google_seg_labels = pd.read_parquet(google_labels_ckpt)
+    else:
+        logger.info("Computing Google ground truth per segment...")
+        label_rows = []
+        for _, seg_row in seg_preds.iterrows():
+            tk = seg_row["trip_key"]
+            seg_start = pd.Timestamp(seg_row["seg_start"])
+            seg_end = pd.Timestamp(seg_row["seg_end"])
+
+            # Find GPS points in this trip within the segment's time window
+            trip_gps = gps[gps["trip_key"] == tk]
+            seg_gps = trip_gps[
+                (trip_gps["timestamp"] >= seg_start) &
+                (trip_gps["timestamp"] <= seg_end)
+            ]
+
+            has_mode = seg_gps["google_mode"].notna()
+            modes = seg_gps.loc[has_mode, "google_mode"]
+            confs = seg_gps.loc[has_mode, "google_confidence"]
+
+            # Simple majority vote
+            dominant = modes.value_counts().index[0] if len(modes) > 0 else None
+
+            # Confidence-weighted vote
+            dominant_conf = None
+            median_google_conf = np.nan
+            if len(modes) > 0:
+                conf_per_mode = pd.DataFrame({"mode": modes.values, "conf": confs.values})
+                weighted = conf_per_mode.groupby("mode")["conf"].sum()
+                dominant_conf = weighted.idxmax()
+                median_google_conf = confs.median()
+
+            label_rows.append({
+                "trip_key": tk,
+                "segment": seg_row["segment"],
+                "google_label": dominant,
+                "google_label_conf": dominant_conf,
+                "google_n_labeled": len(modes),
+                "google_median_conf": median_google_conf,
+            })
+        google_seg_labels = pd.DataFrame(label_rows)
+        google_seg_labels.to_parquet(google_labels_ckpt, index=False)
+        logger.info("Saved Google segment labels: %s", google_labels_ckpt)
+
+    # Merge Google labels into segment predictions
+    seg_preds = seg_preds.merge(
+        google_seg_labels, on=["trip_key", "segment"], how="left",
+        suffixes=("", "_dup"),
+    )
+    # Drop any duplicate columns from re-merge
+    seg_preds = seg_preds[[c for c in seg_preds.columns if not c.endswith("_dup")]]
+
+    # ── Build trip-level summary ──
+    trip_summary = seg_preds.groupby("trip_key").agg(
+        n_segments=("segment", "nunique"),
+        predicted_modes=("predicted_mode", lambda s: " → ".join(s.values)),
+        predicted_mode_set=("predicted_mode", lambda s: ",".join(sorted(s.unique()))),
+        dominant_predicted=("predicted_mode", lambda s: s.value_counts().index[0]),
+        min_confidence=("confidence", "min"),
+        mean_confidence=("confidence", "mean"),
+        # Google trip-level: dominant across all segments
+        google_label=("google_label", lambda s: s.dropna().value_counts().index[0] if s.notna().any() else None),
+        google_label_conf=("google_label_conf", lambda s: s.dropna().value_counts().index[0] if s.notna().any() else None),
+        google_median_conf=("google_median_conf", "median"),
+        google_mode_set=("google_label", lambda s: ",".join(sorted(s.dropna().unique())) if s.notna().any() else None),
+    ).reset_index()
+
+    # Enrich with trip stats from GPS
+    trip_stats = gps.groupby("trip_key").agg(
+        start_time=("timestamp", "first"),
+        end_time=("timestamp", "last"),
+        n_points=("timestamp", "count"),
+        duration_s=("timestamp", lambda s: (s.max() - s.min()).total_seconds()),
+    )
+    trip_summary = trip_summary.merge(trip_stats, on="trip_key", how="left")
+
     # Save CSV output
-    preds.to_csv(args.output, index=False)
-    logger.info("Saved %d predictions to %s", len(preds), args.output)
+    trip_summary.to_csv(args.output, index=False)
+    logger.info("Saved %d trip predictions to %s", len(trip_summary), args.output)
 
     # ── Print summary ──
-    n_trips = len(preds)
-    print(f"\n{'='*70}")
-    print(f"GOOGLE TIMELINE PREDICTIONS ({n_trips} trips)")
-    print(f"{'='*70}")
+    n_trips = len(trip_summary)
+    n_segs = len(seg_preds)
+    multi_modal = (trip_summary["n_segments"] > 1).sum()
 
-    # Mode distribution: our model
-    print(f"\n  Our model predictions:")
-    mode_counts = preds["predicted_mode"].value_counts()
+    print(f"\n{'='*70}")
+    print(f"GOOGLE TIMELINE — INFOSTOP + MULTI-MODAL PREDICTION")
+    print(f"{'='*70}")
+    print(f"\n  {n_trips} trips, {n_segs} segments ({multi_modal} multi-modal trips, "
+          f"avg {trip_summary['n_segments'].mean():.1f} segs/trip)")
+
+    # Mode distribution: our model (dominant per trip)
+    print(f"\n  Our model predictions (dominant mode per trip):")
+    mode_counts = trip_summary["dominant_predicted"].value_counts()
     for mode, count in mode_counts.items():
         pct = count / n_trips * 100
-        med_conf = preds[preds["predicted_mode"] == mode]["confidence"].median()
+        med_conf = trip_summary[trip_summary["dominant_predicted"] == mode]["mean_confidence"].median()
         print(f"    {mode:<12} {count:>6} ({pct:5.1f}%)  median conf: {med_conf:.3f}")
 
-    # Google label distribution
-    has_label = preds["google_label"].notna()
+    # ── Segment-level agreement ──
+    seg_has_label = seg_preds["google_label"].notna()
+    seg_labeled = seg_preds[seg_has_label]
+    n_seg_labeled = len(seg_labeled)
+    print(f"\n  === SEGMENT-LEVEL ANALYSIS ({n_seg_labeled}/{n_segs} segments with Google labels) ===")
+
+    if n_seg_labeled > 0:
+        seg_agree = (seg_labeled["predicted_mode"] == seg_labeled["google_label"]).mean()
+        print(f"  Segment agreement: {seg_agree*100:.1f}%")
+
+        print(f"\n  {'Google label':<12} {'N segs':>8} {'Agreement':>10} {'Our top prediction':>30}")
+        print("  " + "-" * 65)
+        for gl in sorted(seg_labeled["google_label"].unique()):
+            gl_mask = seg_labeled["google_label"] == gl
+            gl_n = gl_mask.sum()
+            gl_agree = (seg_labeled.loc[gl_mask, "predicted_mode"] == gl).mean()
+            top_pred = seg_labeled.loc[gl_mask, "predicted_mode"].value_counts()
+            top_str = ", ".join(f"{m}({c})" for m, c in top_pred.head(3).items())
+            print(f"  {gl:<12} {gl_n:>8} {gl_agree:>9.1%} {top_str:>30}")
+
+        # Segment-level agreement by our confidence
+        print(f"\n  Segment agreement by OUR confidence:")
+        print(f"  {'Threshold':>10} {'Kept':>7} {'Coverage':>9} {'Agreement':>10}")
+        print("  " + "-" * 40)
+        for t in [0.0, 0.5, 0.7, 0.8, 0.9]:
+            mask = seg_labeled["confidence"] >= t
+            n = mask.sum()
+            if n == 0:
+                continue
+            cov = n / n_seg_labeled
+            ag = (seg_labeled.loc[mask, "predicted_mode"] == seg_labeled.loc[mask, "google_label"]).mean()
+            print(f"  {t:>10.2f} {n:>7} {cov:>8.1%} {ag:>9.1%}")
+
+    # ── Trip-level analysis ──
+    print(f"\n  === TRIP-LEVEL ANALYSIS ===")
+
+    # Google label distribution and confidence
+    has_label = trip_summary["google_label"].notna()
     n_labeled = has_label.sum()
     print(f"\n  Google labels (available for {n_labeled}/{n_trips} trips, {n_labeled/n_trips*100:.1f}%):")
     if n_labeled > 0:
-        gl_counts = preds.loc[has_label, "google_label"].value_counts()
+        gl_counts = trip_summary.loc[has_label, "google_label"].value_counts()
         for mode, count in gl_counts.items():
-            print(f"    {mode:<12} {count:>6} ({count/n_labeled*100:5.1f}%)")
+            med_gc = trip_summary.loc[has_label & (trip_summary["google_label"] == mode), "google_median_conf"].median()
+            print(f"    {mode:<12} {count:>6} ({count/n_labeled*100:5.1f}%)  median Google conf: {med_gc:.0f}")
+
+        # Google confidence distribution
+        gc = trip_summary.loc[has_label, "google_median_conf"]
+        print(f"\n  Google confidence distribution (median per trip):")
+        print(f"    Mean: {gc.mean():.0f}, Median: {gc.median():.0f}, "
+              f"P25: {gc.quantile(0.25):.0f}, P75: {gc.quantile(0.75):.0f}")
+        print(f"    <50: {(gc < 50).mean()*100:.1f}%, <70: {(gc < 70).mean()*100:.1f}%, "
+              f">=90: {(gc >= 90).mean()*100:.1f}%")
+
+        # Majority vs confidence-weighted label agreement
+        label_agree = (trip_summary.loc[has_label, "google_label"] ==
+                       trip_summary.loc[has_label, "google_label_conf"]).mean()
+        n_differ = (trip_summary.loc[has_label, "google_label"] !=
+                    trip_summary.loc[has_label, "google_label_conf"]).sum()
+        print(f"\n  Majority vote vs confidence-weighted Google label: "
+              f"{label_agree*100:.1f}% agree ({n_differ} trips differ)")
 
     # ── Agreement analysis ──
-    labeled = preds[has_label].copy()
+    labeled = trip_summary[has_label].copy()
     if len(labeled) > 0:
-        agree = (labeled["predicted_mode"] == labeled["google_label"]).mean()
+        agree = (labeled["dominant_predicted"] == labeled["google_label"]).mean()
         print(f"\n  --- Agreement: Our model vs Google ({len(labeled)} trips) ---")
         print(f"  Overall agreement: {agree*100:.1f}%")
 
@@ -513,27 +736,25 @@ def main():
         print("  " + "-" * 65)
         for gl in sorted(labeled["google_label"].unique()):
             gl_mask = labeled["google_label"] == gl
-            gl_trips = gl_mask.sum()
-            gl_agree = (labeled.loc[gl_mask, "predicted_mode"] == gl).mean()
-            top_pred = labeled.loc[gl_mask, "predicted_mode"].value_counts()
+            gl_n = gl_mask.sum()
+            gl_agree = (labeled.loc[gl_mask, "dominant_predicted"] == gl).mean()
+            top_pred = labeled.loc[gl_mask, "dominant_predicted"].value_counts()
             top_str = ", ".join(f"{m}({c})" for m, c in top_pred.head(3).items())
-            print(f"  {gl:<12} {gl_trips:>8} {gl_agree:>9.1%} {top_str:>30}")
+            print(f"  {gl:<12} {gl_n:>8} {gl_agree:>9.1%} {top_str:>30}")
 
         # Confusion matrix
-        from sklearn.metrics import confusion_matrix, classification_report, f1_score
-        # Only use modes that exist in both
-        common_modes = sorted(set(labeled["google_label"]) & set(labeled["predicted_mode"]))
+        from sklearn.metrics import confusion_matrix, f1_score
+        common_modes = sorted(set(labeled["google_label"]) & set(labeled["dominant_predicted"]))
         both_common = labeled[labeled["google_label"].isin(common_modes) &
-                              labeled["predicted_mode"].isin(common_modes)]
+                              labeled["dominant_predicted"].isin(common_modes)]
         if len(both_common) > 0:
-            f1 = f1_score(both_common["google_label"], both_common["predicted_mode"],
+            f1 = f1_score(both_common["google_label"], both_common["dominant_predicted"],
                           average="macro", labels=common_modes)
             print(f"\n  Macro F1 (common modes): {f1:.4f}")
 
             print(f"\n  Confusion matrix (rows=Google, cols=ours):")
-            cm = confusion_matrix(both_common["google_label"], both_common["predicted_mode"],
+            cm = confusion_matrix(both_common["google_label"], both_common["dominant_predicted"],
                                   labels=common_modes)
-            # Print as percentages
             header = "  " + " " * 12 + "".join(f"{m:>10}" for m in common_modes)
             print(header)
             for i, mode in enumerate(common_modes):
@@ -543,37 +764,57 @@ def main():
                 pcts = [f"{cm[i][j]/row_sum*100:>9.1f}%" for j in range(len(common_modes))]
                 print(f"  {mode:<12}" + "".join(pcts))
 
-        # Agreement by confidence
-        print(f"\n  --- Agreement by confidence threshold ---")
+        # Agreement by OUR confidence (mean confidence per trip)
+        print(f"\n  --- Agreement by OUR confidence threshold ---")
         print(f"  {'Threshold':>10} {'Kept':>7} {'Coverage':>9} {'Agreement':>10}")
         print("  " + "-" * 40)
         for t in [0.0, 0.3, 0.5, 0.7, 0.8, 0.9, 0.95]:
-            mask = labeled["confidence"] >= t
+            mask = labeled["mean_confidence"] >= t
             n = mask.sum()
             if n == 0:
                 continue
             cov = n / len(labeled)
-            ag = (labeled.loc[mask, "predicted_mode"] == labeled.loc[mask, "google_label"]).mean()
+            ag = (labeled.loc[mask, "dominant_predicted"] == labeled.loc[mask, "google_label"]).mean()
             print(f"  {t:>10.2f} {n:>7} {cov:>8.1%} {ag:>9.1%}")
 
-    # ── Filtered analysis: only trips where our model predicts a Google-available mode ──
+        # Agreement by GOOGLE confidence (median per trip)
+        print(f"\n  --- Agreement by GOOGLE confidence threshold ---")
+        print(f"  {'Threshold':>10} {'Kept':>7} {'Coverage':>9} {'Agreement':>10}")
+        print("  " + "-" * 40)
+        for t in [0, 30, 50, 70, 80, 90]:
+            mask = labeled["google_median_conf"] >= t
+            n = mask.sum()
+            if n == 0:
+                continue
+            cov = n / len(labeled)
+            ag = (labeled.loc[mask, "dominant_predicted"] == labeled.loc[mask, "google_label"]).mean()
+            print(f"  {t:>10} {n:>7} {cov:>8.1%} {ag:>9.1%}")
+
+        # Agreement when BOTH are confident
+        print(f"\n  --- Agreement when both confident (ours >= 0.7 AND Google >= 70) ---")
+        both_conf = labeled[(labeled["mean_confidence"] >= 0.7) & (labeled["google_median_conf"] >= 70)]
+        if len(both_conf) > 0:
+            ag_both = (both_conf["dominant_predicted"] == both_conf["google_label"]).mean()
+            print(f"  {len(both_conf)} trips ({len(both_conf)/len(labeled)*100:.1f}% coverage), "
+                  f"agreement: {ag_both*100:.1f}%")
+
+    # ── Filtered analysis: only trips where our dominant mode is in Google's label set ──
     if len(labeled) > 0:
         google_modes = set(labeled["google_label"].unique())
-        filtered = labeled[labeled["predicted_mode"].isin(google_modes)].copy()
+        filtered = labeled[labeled["dominant_predicted"].isin(google_modes)].copy()
         n_filtered = len(filtered)
-        n_pt = labeled[~labeled["predicted_mode"].isin(google_modes)]
+        n_excluded = len(labeled) - n_filtered
 
         print(f"\n  --- Filtered: only trips where we predict {sorted(google_modes)} ---")
         print(f"  {n_filtered}/{len(labeled)} trips ({n_filtered/len(labeled)*100:.1f}%) — "
-              f"excluded {len(n_pt)} where we predict public transport")
+              f"excluded {n_excluded} where we predict public transport")
 
         if n_filtered > 0:
-            agree_f = (filtered["predicted_mode"] == filtered["google_label"]).mean()
+            agree_f = (filtered["dominant_predicted"] == filtered["google_label"]).mean()
             print(f"  Agreement (filtered): {agree_f*100:.1f}%")
 
-            from sklearn.metrics import f1_score as _f1
-            f1_f = _f1(filtered["google_label"], filtered["predicted_mode"],
-                        average="macro", labels=sorted(google_modes))
+            f1_f = f1_score(filtered["google_label"], filtered["dominant_predicted"],
+                            average="macro", labels=sorted(google_modes))
             print(f"  Macro F1 (filtered): {f1_f:.4f}")
 
             print(f"\n  {'Google label':<12} {'N':>6} {'Agreement':>10} {'Our predictions':>30}")
@@ -583,8 +824,8 @@ def main():
                 gl_n = gl_mask.sum()
                 if gl_n == 0:
                     continue
-                gl_agree = (filtered.loc[gl_mask, "predicted_mode"] == gl).mean()
-                top_pred = filtered.loc[gl_mask, "predicted_mode"].value_counts()
+                gl_agree = (filtered.loc[gl_mask, "dominant_predicted"] == gl).mean()
+                top_pred = filtered.loc[gl_mask, "dominant_predicted"].value_counts()
                 top_str = ", ".join(f"{m}({c})" for m, c in top_pred.head(3).items())
                 print(f"  {gl:<12} {gl_n:>6} {gl_agree:>9.1%} {top_str:>30}")
 
@@ -593,68 +834,108 @@ def main():
             print(f"  {'Threshold':>10} {'Kept':>7} {'Coverage':>9} {'Agreement':>10}")
             print("  " + "-" * 40)
             for t in [0.0, 0.3, 0.5, 0.7, 0.8, 0.9, 0.95]:
-                mask = filtered["confidence"] >= t
+                mask = filtered["mean_confidence"] >= t
                 n = mask.sum()
                 if n == 0:
                     continue
                 cov = n / n_filtered
-                ag = (filtered.loc[mask, "predicted_mode"] == filtered.loc[mask, "google_label"]).mean()
+                ag = (filtered.loc[mask, "dominant_predicted"] == filtered.loc[mask, "google_label"]).mean()
                 print(f"  {t:>10.2f} {n:>7} {cov:>8.1%} {ag:>9.1%}")
 
         # What does Google say about trips we predict as public transport?
         print(f"\n  --- Trips we predict as public transport (not in Google's labels) ---")
         pt_modes = ["SUBWAY", "TRAIN", "BUS", "TRAMWAY"]
         for pm in pt_modes:
-            pm_mask = labeled["predicted_mode"] == pm
+            pm_mask = labeled["dominant_predicted"] == pm
             if pm_mask.sum() == 0:
                 continue
             gl_dist = labeled.loc[pm_mask, "google_label"].value_counts()
             gl_str = ", ".join(f"{m}({c})" for m, c in gl_dist.head(4).items())
-            med_conf = labeled.loc[pm_mask, "confidence"].median()
+            med_conf = labeled.loc[pm_mask, "mean_confidence"].median()
             print(f"  We say {pm:<8} ({pm_mask.sum():>4} trips, med conf {med_conf:.3f}): "
                   f"Google says {gl_str}")
 
     # Confidence stats
     print(f"\n  Confidence distribution:")
-    print(f"    Mean: {preds['confidence'].mean():.3f}, Median: {preds['confidence'].median():.3f}")
-    print(f"    <0.5: {(preds['confidence'] < 0.5).mean()*100:.1f}%, "
-          f"<0.7: {(preds['confidence'] < 0.7).mean()*100:.1f}%")
+    print(f"    Mean: {trip_summary['mean_confidence'].mean():.3f}, "
+          f"Median: {trip_summary['mean_confidence'].median():.3f}")
+    print(f"    <0.5: {(trip_summary['mean_confidence'] < 0.5).mean()*100:.1f}%, "
+          f"<0.7: {(trip_summary['mean_confidence'] < 0.7).mean()*100:.1f}%")
+
+    # ── Multi-modal trip details ──
+    if multi_modal > 0:
+        print(f"\n  --- Multi-modal trips ({multi_modal} trips) ---")
+        multi_trips = trip_summary[trip_summary["n_segments"] > 1]
+        multi_labeled = multi_trips[multi_trips["google_label"].notna()]
+        if len(multi_labeled) > 0:
+            print(f"  Labeled: {len(multi_labeled)}")
+            # Show predicted mode sequences for multi-modal trips
+            print(f"  Top predicted sequences:")
+            seq_counts = multi_labeled["predicted_modes"].value_counts().head(10)
+            for seq, count in seq_counts.items():
+                print(f"    {seq:<40} {count:>4}")
+
+            # Mode set comparison: does our set of modes overlap with Google's?
+            multi_w_google_set = multi_labeled[multi_labeled["google_mode_set"].notna()]
+            if len(multi_w_google_set) > 0:
+                overlaps = []
+                for _, row in multi_w_google_set.iterrows():
+                    our_set = set(row["predicted_mode_set"].split(","))
+                    gl_set = set(row["google_mode_set"].split(","))
+                    overlaps.append(len(our_set & gl_set) / max(len(our_set | gl_set), 1))
+                print(f"  Mode set Jaccard (our modes vs Google modes): "
+                      f"{np.mean(overlaps):.3f} (n={len(overlaps)})")
 
     # ── Maps ──
     if args.maps:
-        _generate_maps(gps, preds, args.maps)
+        _generate_maps(gps, seg_preds, trip_summary, args.maps)
 
 
-def _generate_maps(gps: pd.DataFrame, preds: pd.DataFrame, map_dir: str):
-    """Generate folium maps for interesting trips."""
+def _generate_maps(gps: pd.DataFrame, seg_preds: pd.DataFrame,
+                    trip_summary: pd.DataFrame, map_dir: str):
+    """Generate folium maps for interesting trips with segment coloring."""
     import folium
 
     out = Path(map_dir)
     out.mkdir(exist_ok=True, parents=True)
 
-    # Pick trips: disagreements, high-conf, low-conf, random
-    has_label = preds["google_label"].notna()
-    labeled = preds[has_label]
+    MODE_COLORS = {
+        "WALKING": "#2ecc71", "BIKE": "#3498db", "CAR": "#e74c3c",
+        "BUS": "#f39c12", "SUBWAY": "#9b59b6", "TRAIN": "#1abc9c",
+        "TRAMWAY": "#e67e22",
+    }
+
+    labeled = trip_summary[trip_summary["google_label"].notna()]
 
     selected = []
-    # Disagreements (most interesting)
-    disagree = labeled[labeled["predicted_mode"] != labeled["google_label"]]
-    if len(disagree) > 0:
-        selected.append(("disagree", disagree.sample(n=min(10, len(disagree)), random_state=42)))
-    # High confidence agreements
-    agree = labeled[labeled["predicted_mode"] == labeled["google_label"]]
+    # Multi-modal trips (most interesting)
+    multi_labeled = labeled[labeled["n_segments"] > 1]
+    if len(multi_labeled) > 0:
+        sample = multi_labeled.sample(n=min(10, len(multi_labeled)), random_state=42)
+        selected.append(("multi_modal", sample["trip_key"].values))
+
+    # Single-modal disagreements
+    single_labeled = labeled[labeled["n_segments"] == 1]
+    single_disagree = single_labeled[single_labeled["dominant_predicted"] != single_labeled["google_label"]]
+    if len(single_disagree) > 0:
+        sample = single_disagree.sample(n=min(5, len(single_disagree)), random_state=42)
+        selected.append(("single_disagree", sample["trip_key"].values))
+
+    # High-confidence agreements
+    agree = labeled[labeled["dominant_predicted"] == labeled["google_label"]]
     if len(agree) > 0:
-        selected.append(("agree_high", agree.nlargest(5, "confidence")))
-    # Low confidence
-    selected.append(("low_conf", preds.nsmallest(5, "confidence")))
+        top_agree = agree.nlargest(5, "mean_confidence")
+        selected.append(("agree_high", top_agree["trip_key"].values))
 
     maps_index = []
-    for group, subset in selected:
-        for _, row in subset.iterrows():
-            trip_key = row["trip_key"]
-            trip_gps = gps[gps["trip_key"] == trip_key].sort_values("timestamp")
+    for group, trip_keys in selected:
+        for tk in trip_keys:
+            trip_gps = gps[gps["trip_key"] == tk].sort_values("timestamp")
             if len(trip_gps) < 2:
                 continue
+
+            trip_seg_preds = seg_preds[seg_preds["trip_key"] == tk].sort_values("segment")
+            trip_info = trip_summary[trip_summary["trip_key"] == tk].iloc[0]
 
             lats = trip_gps["latitude"].values
             lons = trip_gps["longitude"].values
@@ -664,59 +945,76 @@ def _generate_maps(gps: pd.DataFrame, preds: pd.DataFrame, map_dir: str):
                 attr="Esri",
             )
 
-            # Color by speed
-            from modedetect._geo import haversine_m
-            dists = haversine_m(lats[:-1], lons[:-1], lats[1:], lons[1:])
-            dts = np.diff(trip_gps["timestamp"].values) / np.timedelta64(1, "s")
-            dts[dts == 0] = 1
-            speeds = np.append(dists / dts, 0)
+            # Color GPS trace by predicted segment mode
+            # Need to reconstruct which points belong to which segment
+            n_segs = len(trip_seg_preds)
+            n_pts = len(trip_gps)
+            if n_segs == 1:
+                # All points = one segment
+                color = MODE_COLORS.get(trip_seg_preds.iloc[0]["predicted_mode"], "#999")
+                coords = list(zip(lats, lons))
+                folium.PolyLine(coords, color=color, weight=4, opacity=0.8).add_to(m)
+            else:
+                # Split points roughly by segment (equal splits as approximation)
+                pts_per_seg = n_pts // n_segs
+                for seg_idx, (_, srow) in enumerate(trip_seg_preds.iterrows()):
+                    start_i = seg_idx * pts_per_seg
+                    end_i = (seg_idx + 1) * pts_per_seg if seg_idx < n_segs - 1 else n_pts
+                    seg_lats = lats[start_i:end_i + 1]  # overlap for continuity
+                    seg_lons = lons[start_i:end_i + 1]
+                    color = MODE_COLORS.get(srow["predicted_mode"], "#999")
+                    if len(seg_lats) >= 2:
+                        coords = list(zip(seg_lats, seg_lons))
+                        folium.PolyLine(coords, color=color, weight=4, opacity=0.8).add_to(m)
 
-            coords = list(zip(lats, lons))
-            for i in range(len(coords) - 1):
-                t = min(speeds[i] / 15.0, 1.0)
-                r, b = int(255 * t), int(255 * (1 - t))
-                color = f"#{r:02x}00{b:02x}"
-                folium.PolyLine([coords[i], coords[i+1]], color=color, weight=3, opacity=0.6).add_to(m)
+            folium.Marker([lats[0], lons[0]], popup="START", icon=folium.Icon(color="green")).add_to(m)
+            folium.Marker([lats[-1], lons[-1]], popup="END", icon=folium.Icon(color="red")).add_to(m)
 
-            folium.Marker(coords[0], popup="START", icon=folium.Icon(color="green")).add_to(m)
-            folium.Marker(coords[-1], popup="END", icon=folium.Icon(color="red")).add_to(m)
+            # Build info panel
+            modes_str = trip_info["predicted_modes"]
+            confs_str = " / ".join(f"{c:.2f}" for c in trip_seg_preds["confidence"].values)
+            gl = trip_info.get("google_label", "N/A")
+            dur = trip_info.get("duration_s", 0)
+            start_time = trip_info.get("start_time", "")
 
-            our_mode = row["predicted_mode"]
-            conf = row["confidence"]
-            gl = row.get("google_label", "N/A")
-            dur = row.get("duration_s", 0)
-            start = row.get("start_time", "")
-            match_str = "AGREE" if our_mode == gl else "DISAGREE"
+            # Legend
+            legend_items = "".join(
+                f'<span style="color:{c}">■</span> {m} '
+                for m, c in MODE_COLORS.items()
+            )
+
             title_html = f'''
             <div style="position:fixed; top:10px; left:60px; z-index:9999;
                         background:white; padding:10px; border:2px solid black;
-                        font-size:14px; font-family:monospace;">
-                <b>{trip_key}</b> [{match_str}]<br>
-                Our model: <b>{our_mode}</b> (conf: {conf:.3f})<br>
+                        font-size:13px; font-family:monospace; max-width:500px;">
+                <b>{tk}</b> [{group}]<br>
+                Our model: <b>{modes_str}</b><br>
+                Confidence: {confs_str}<br>
                 Google: <b>{gl}</b><br>
-                {start}<br>
-                Duration: {dur/60:.0f} min, Points: {len(trip_gps)}
+                {start_time}<br>
+                Duration: {dur/60:.0f} min, Points: {n_pts}, Segments: {n_segs}<br>
+                <small>{legend_items}</small>
             </div>
             '''
             m.get_root().html.add_child(folium.Element(title_html))
 
-            fname = f"{group}_{our_mode}_vs_{gl}_{trip_key}.html"
+            fname = f"{group}_{tk}.html"
             m.save(str(out / fname))
-            maps_index.append((group, trip_key, our_mode, gl, conf, fname))
+            maps_index.append((group, tk, modes_str, gl,
+                             trip_seg_preds["confidence"].min(), fname))
 
     # Index page
     index = "<html><head><style>body{font-family:sans-serif;max-width:900px;margin:40px auto}</style></head><body>\n"
-    index += "<h1>Google Timeline: Our Model vs Google Labels</h1>\n"
+    index += "<h1>Google Timeline: Infostop + Multi-Modal Prediction</h1>\n"
     current_group = None
     for group, tk, our, gl, conf, fname in maps_index:
         if group != current_group:
-            labels = {"disagree": "Disagreements (our model vs Google)",
-                      "agree_high": "Agreements (high confidence)",
-                      "low_conf": "Low confidence predictions"}
+            labels = {"multi_disagree": "Multi-modal trips with disagreements",
+                      "single_disagree": "Single-segment disagreements",
+                      "agree_high": "High-confidence agreements"}
             index += f"\n<h2>{labels.get(group, group)}</h2>\n<ul>\n"
             current_group = group
-        match = "==" if our == gl else "!="
-        index += f'<li><a href="{fname}">{tk}: ours={our} {match} google={gl} (conf={conf:.3f})</a></li>\n'
+        index += f'<li><a href="{fname}">{tk}: ours={our} | google={gl} (min_conf={conf:.3f})</a></li>\n'
     index += "</ul></body></html>"
     (out / "index.html").write_text(index)
     logger.info("Maps saved to %s/ (%d maps)", out, len(maps_index))
