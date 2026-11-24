@@ -89,11 +89,15 @@ CITY_PRESETS = {
 
 
 def download_gtfs(city_preset: dict, out_dir: Path) -> Path | None:
-    """Download and extract GTFS data for a city."""
+    """Download GTFS data for a city.
+
+    The model's load_gtfs_stops() expects .zip files inside the directory,
+    so we save the downloaded zip as-is (not extracted).
+    """
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    # Check if already downloaded
-    if (out_dir / "stops.txt").exists():
+    # Check if already downloaded (look for .zip files)
+    if list(out_dir.glob("*.zip")):
         logger.info("GTFS already downloaded in %s", out_dir)
         return out_dir
 
@@ -106,11 +110,12 @@ def download_gtfs(city_preset: dict, out_dir: Path) -> Path | None:
             logger.warning("Failed to download GTFS: %s", e)
             continue
 
-        # Extract zip
+        # Verify it's a valid zip and save it (not extracted)
         try:
-            with zipfile.ZipFile(io.BytesIO(resp.content)) as zf:
-                zf.extractall(out_dir)
-            logger.info("GTFS extracted to %s (%d files)", out_dir, len(list(out_dir.iterdir())))
+            zipfile.ZipFile(io.BytesIO(resp.content))  # validate
+            zip_path = out_dir / "gtfs.zip"
+            zip_path.write_bytes(resp.content)
+            logger.info("GTFS saved to %s (%.1f MB)", zip_path, len(resp.content) / 1e6)
             return out_dir
         except zipfile.BadZipFile:
             logger.warning("Downloaded file is not a valid zip")
