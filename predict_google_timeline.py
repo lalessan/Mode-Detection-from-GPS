@@ -44,7 +44,7 @@ CITY_PRESETS = {
         "bbox": (55.55, 55.80, 12.30, 12.70),
         "gtfs_urls": [
             # Rejseplanen (all Danish public transport)
-            "https://transitfeeds.com/p/rejseplanen/705/latest/download",
+            "https://www.rejseplanen.info/labs/GTFS.zip",
         ],
         "osm_pbf_url": "https://download.geofabrik.de/europe/denmark-latest.osm.pbf",
     },
