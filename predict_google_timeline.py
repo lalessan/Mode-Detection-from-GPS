@@ -509,14 +509,24 @@ def main():
         )
         logger.info("OSM routes configured: %s", osm_routes_dir)
     elif args.download_data and preset and preset.get("osm_pbf_url"):
-        # PBF downloaded but routes not yet extracted — let model handle it
+        # PBF downloaded but routes not yet extracted — extract now
         pbf_path = data_dir / "osm" / preset["osm_pbf_url"].split("/")[-1]
-        if pbf_path.exists():
+        routes_out = data_dir / "osm_routes"
+        if pbf_path.exists() and not routes_out.exists():
             model.config = ModeDetectConfig(
-                **{**model.config.__dict__, "osm_pbf_path": pbf_path,
-                   "osm_routes_dir": data_dir / "osm_routes"}
+                **{**model.config.__dict__, "osm_pbf_path": pbf_path}
             )
-            logger.info("OSM PBF configured: %s (routes will be extracted)", pbf_path)
+            # Override column names before prepare_osm (needs col_latitude/col_longitude)
+            model.config.col_latitude = "latitude"
+            model.config.col_longitude = "longitude"
+            logger.info("Extracting OSM routes from %s ...", pbf_path)
+            model.prepare_osm(gps, output_dir=routes_out)
+            logger.info("OSM routes extracted to %s", routes_out)
+        elif routes_out.exists():
+            model.config = ModeDetectConfig(
+                **{**model.config.__dict__, "osm_routes_dir": routes_out}
+            )
+            logger.info("OSM routes already extracted: %s", routes_out)
 
     # Override column names to match our Google Timeline GPS format
     model.config.col_latitude = "latitude"
