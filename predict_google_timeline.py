@@ -433,6 +433,98 @@ def segment_trips_by_infostop(df: pd.DataFrame,
     return df
 
 
+def filter_unreliable_trips(df: pd.DataFrame,
+                            max_jump_m: float = 2000.0,
+                            max_speed_kmh: float = 500.0,
+                            min_points: int = 20,
+                            max_median_interval_s: float = 120.0,
+                            jumpback_dist_m: float = 2000.0,
+                            jumpback_return_m: float = 500.0) -> pd.DataFrame:
+    """Remove trips with GPS quality issues.
+
+    Filters:
+    1. Max jump: any consecutive pair > max_jump_m apart
+    2. Max speed: any point-to-point speed > max_speed_kmh
+    3. Jump-back: trajectory goes > jumpback_dist_m away then returns
+       within jumpback_return_m of a previous position (cell tower bouncing)
+    4. Min points: fewer than min_points GPS points
+    5. Sparse sampling: median inter-point interval > max_median_interval_s
+    """
+    from modedetect._geo import haversine_m as _hav
+
+    n_before = df["trip_key"].nunique()
+    bad_keys = set()
+    reasons = {"max_jump": 0, "max_speed": 0, "jumpback": 0,
+               "min_points": 0, "sparse": 0}
+
+    for tk, trip in df.groupby("trip_key"):
+        trip = trip.sort_values("timestamp")
+        n = len(trip)
+
+        # Min points
+        if n < min_points:
+            bad_keys.add(tk)
+            reasons["min_points"] += 1
+            continue
+
+        lats = trip["latitude"].values
+        lons = trip["longitude"].values
+        ts = trip["timestamp"].values
+
+        # Consecutive distances and speeds
+        dists = _hav(lats[:-1], lons[:-1], lats[1:], lons[1:])
+        dt = np.diff(ts.astype("int64") / 1e9)  # seconds
+
+        # Max jump distance
+        if dists.max() > max_jump_m:
+            bad_keys.add(tk)
+            reasons["max_jump"] += 1
+            continue
+
+        # Max speed
+        with np.errstate(divide="ignore", invalid="ignore"):
+            speeds_kmh = np.where(dt > 0, dists / dt * 3.6, 0)
+        if speeds_kmh.max() > max_speed_kmh:
+            bad_keys.add(tk)
+            reasons["max_speed"] += 1
+            continue
+
+        # Sparse sampling
+        if np.median(dt) > max_median_interval_s:
+            bad_keys.add(tk)
+            reasons["sparse"] += 1
+            continue
+
+        # Jump-back detection: check if any point is far from a previous
+        # point but a later point returns close to the earlier one
+        has_jumpback = False
+        for i in range(1, n - 1):
+            d_from_prev = _hav(lats[i - 1], lons[i - 1], lats[i], lons[i])
+            if d_from_prev > jumpback_dist_m:
+                # Check if any subsequent point returns near point i-1
+                d_returns = _hav(lats[i - 1], lons[i - 1],
+                                 lats[i + 1:], lons[i + 1:])
+                if d_returns.min() < jumpback_return_m:
+                    has_jumpback = True
+                    break
+        if has_jumpback:
+            bad_keys.add(tk)
+            reasons["jumpback"] += 1
+            continue
+
+    df = df[~df["trip_key"].isin(bad_keys)].reset_index(drop=True)
+    n_after = df["trip_key"].nunique()
+    n_removed = n_before - n_after
+
+    logger.info("Trip quality filter: removed %d/%d trips (kept %d)",
+                n_removed, n_before, n_after)
+    for reason, count in sorted(reasons.items()):
+        if count > 0:
+            logger.info("  %s: %d trips", reason, count)
+
+    return df
+
+
 def main():
     city_names = ", ".join(sorted(CITY_PRESETS.keys()))
     parser = argparse.ArgumentParser(
@@ -518,6 +610,12 @@ def main():
         gps = segment_trips_by_infostop(gps)
         if gps["trip_key"].nunique() == 0:
             print("No valid trips found.")
+            return
+
+        # Quality filter: remove unreliable trips
+        gps = filter_unreliable_trips(gps)
+        if gps["trip_key"].nunique() == 0:
+            print("No valid trips after quality filter.")
             return
 
         # Save checkpoint
