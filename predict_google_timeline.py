@@ -578,9 +578,14 @@ def main():
     # ── Multi-modal predict with segment=True (with checkpointing) ──
     preds_ckpt = ckpt_dir / "predictions_segmented.parquet"
 
+    gps_filtered_ckpt = ckpt_dir / "gps_filtered.parquet"
+
     if preds_ckpt.exists():
         logger.info("Loading predictions from checkpoint: %s", preds_ckpt)
         seg_preds = pd.read_parquet(preds_ckpt)
+        if gps_filtered_ckpt.exists():
+            gps = pd.read_parquet(gps_filtered_ckpt)
+            logger.info("Loaded filtered GPS: %d points", len(gps))
     else:
         logger.info("Running multi-modal prediction (segment=True) on %d trips...",
                     gps["trip_key"].nunique())
@@ -591,8 +596,16 @@ def main():
         seg_preds["predicted_mode"] = proba_df[proba_cols].idxmax(axis=1).values
         seg_preds["confidence"] = proba_df[proba_cols].max(axis=1).values
 
-        # Get GPS→segment mapping and compute Google labels per segment
+        # Get GPS→segment mapping (filtered by model: speed outliers removed)
         seg_gps = model.segmented_gps()
+
+        # Use filtered GPS for maps and future analysis
+        gps = seg_gps
+        gps.to_parquet(gps_filtered_ckpt, index=False)
+        logger.info("Saved filtered GPS: %d points (%d removed by model)",
+                    len(gps), len(pd.read_parquet(ckpt_dir / "gps_infostop.parquet")) - len(gps))
+
+        # Compute Google labels per segment
         has_mode = seg_gps["google_mode"].notna()
         labeled_gps = seg_gps[has_mode]
 
