@@ -436,7 +436,7 @@ def segment_trips_by_infostop(df: pd.DataFrame,
 def filter_unreliable_trips(df: pd.DataFrame,
                             max_jump_m: float = 2000.0,
                             max_speed_kmh: float = 500.0,
-                            min_points: int = 20,
+                            min_points: int = 10,
                             max_median_interval_s: float = 120.0,
                             jumpback_dist_m: float = 2000.0,
                             jumpback_return_m: float = 500.0) -> pd.DataFrame:
@@ -948,6 +948,54 @@ def main():
             n_match = evaluable.loc[pm_mask, "_match"].sum()
             print(f"  We say {pm:<8} ({pm_mask.sum():>4} trips, med conf {med_conf:.3f}, "
                   f"{n_match} match): Google says {gl_str}")
+
+    # ── Verifiable-only analysis ──
+    # Exclude trips where we predict modes Google can't label (SUBWAY, TRAIN, TRAMWAY)
+    # These are unverifiable, not necessarily wrong.
+    if n_eval > 0:
+        unverifiable_modes = {"SUBWAY", "TRAIN", "TRAMWAY"}
+        verifiable = evaluable[~evaluable["dominant_predicted"].isin(unverifiable_modes)].copy()
+        n_unverifiable = n_eval - len(verifiable)
+
+        print(f"\n  === VERIFIABLE ONLY (excluding our SUBWAY/TRAIN/TRAMWAY predictions) ===")
+        print(f"  {len(verifiable)}/{n_eval} trips ({n_unverifiable} unverifiable excluded)")
+
+        if len(verifiable) > 0:
+            v_agree = verifiable["_match"].mean()
+            print(f"  Agreement: {v_agree*100:.1f}%")
+
+            # Confusion matrix
+            v_raw_types = sorted(verifiable["google_activity_raw"].unique())
+            v_pred_modes = sorted(verifiable["dominant_predicted"].unique())
+            print(f"\n  Confusion matrix (rows=Google raw type, cols=our prediction):")
+            header = "  " + " " * 25 + "".join(f"{m:>9}" for m in v_pred_modes) + "   match%"
+            print(header)
+            print("  " + "-" * (25 + 9 * len(v_pred_modes) + 9))
+            for gt in v_raw_types:
+                gt_mask = verifiable["google_activity_raw"] == gt
+                gt_n = gt_mask.sum()
+                gt_match = verifiable.loc[gt_mask, "_match"].mean()
+                accepts = GOOGLE_ACCEPTS.get(gt, set())
+                counts = []
+                for pm in v_pred_modes:
+                    c = ((verifiable["google_activity_raw"] == gt) &
+                         (verifiable["dominant_predicted"] == pm)).sum()
+                    marker = "*" if pm in accepts else " "
+                    counts.append(f"{c:>8}{marker}")
+                print(f"  {gt:<25}" + "".join(counts) + f"  {gt_match:>5.1%}")
+
+            # Agreement by confidence
+            print(f"\n  Agreement by OUR confidence (verifiable):")
+            print(f"  {'Threshold':>10} {'Kept':>7} {'Coverage':>9} {'Agreement':>10}")
+            print("  " + "-" * 40)
+            for t in [0.0, 0.5, 0.7, 0.8, 0.9, 0.95]:
+                mask = verifiable["mean_confidence"] >= t
+                n = mask.sum()
+                if n == 0:
+                    continue
+                cov = n / len(verifiable)
+                ag = verifiable.loc[mask, "_match"].mean()
+                print(f"  {t:>10.2f} {n:>7} {cov:>8.1%} {ag:>9.1%}")
 
     # Confidence stats
     print(f"\n  Confidence distribution:")
