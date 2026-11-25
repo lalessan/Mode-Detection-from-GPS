@@ -232,6 +232,83 @@ Per-mode confidence gap (median correct - median incorrect): WALKING +0.333, BIK
 
 ---
 
+## Google Timeline validation (Copenhagen, infostop pipeline)
+
+Validation of the Paris-trained model (Run 22a) on personal Google Timeline data (~1.2M records, 2014-2020, Copenhagen). Proper pipeline: infostop for stop detection → multi-modal prediction (PELT + per-segment classification) → compare against Google's activity labels per segment.
+
+### Pipeline
+
+1. Parse raw GPS from Google Timeline JSON (320K records in Copenhagen bbox)
+2. **infostop** stop detection (r1=30m, min_staying_time=300s) → 677 stops, 1500 trips
+3. Filters aligned with training: min_points=10, min_duration=180s, gap=300s, max_range=150m (dropped 152 stationary trips)
+4. `model.predict_proba(gps, segment=True)` → 1716 segments (213 multi-modal trips, avg 1.1 segs/trip)
+5. Per-segment Google label assignment using time windows from `segment_boundaries()`
+
+### Infostop vs Google STILL validation
+
+| Metric | Value |
+|--------|-------|
+| Precision | 67.2% (of infostop stops, 67% are Google STILL) |
+| Recall | 91.3% (of Google STILL, 91% are infostop stops) |
+| F1 | 0.774 |
+
+False positives mostly TILTING(13.5K) and UNKNOWN(6.1K) — ambiguous activities, not real movement. High recall means infostop catches nearly all stationary periods.
+
+### Google label limitations
+
+Google only provides 3 transport modes: WALKING (72%), BIKE (17%), CAR (11%). No public transport labels (SUBWAY, TRAIN, BUS). Google confidence is high: median 95, 69% above 90.
+
+### Run 1: Motion features only (no GTFS/OSM)
+
+| Level | Metric | Value |
+|-------|--------|-------|
+| Segment | Agreement | 36.1% |
+| Segment | BIKE agreement | 20.0% |
+| Segment | CAR agreement | 42.5% |
+| Segment | WALKING agreement | 39.1% |
+| Trip | Overall agreement | 36.3% |
+| Trip | Filtered (BIKE/CAR/WALK only) | 64.2% |
+| Trip | Filtered + conf ≥ 0.7 | 69.5% |
+
+SUBWAY over-prediction: 409 trips predicted SUBWAY, Google says WALKING(320), BIKE(55), CAR(34).
+
+### Run 2: OSM routes only (no GTFS)
+
+| Level | Metric | Value |
+|-------|--------|-------|
+| Trip | Overall agreement | 31.8% (**worse**) |
+| Trip | Filtered (BIKE/CAR/WALK only) | 60.5% (**worse**) |
+| Trip | SUBWAY predictions | 450 (**more**) |
+
+OSM route features made things **worse**. Copenhagen's dense transit infrastructure means route-matching finds bus/train/subway routes near everything, including walking trips.
+
+### Run 3: Full features (GTFS + OSM)
+
+| Level | Metric | Value |
+|-------|--------|-------|
+| Segment | Agreement | 37.7% |
+| Segment | BIKE agreement | 32.5% |
+| Segment | CAR agreement | 31.6% |
+| Segment | WALKING agreement | 39.9% |
+| Trip | Overall agreement | 36.0% |
+| Trip | Filtered (BIKE/CAR/WALK only) | 52.9% |
+| Trip | Filtered + conf ≥ 0.7 | 58.1% |
+| Trip | SUBWAY predictions | 160 |
+| Trip | TRAIN predictions | 294 |
+
+**GTFS stop features fixed SUBWAY** (419 → 160 predictions). Trips far from metro stations are no longer misclassified. But **TRAIN became the new problem** (294 trips, high confidence 0.846, mostly wrong). Overall filtered agreement dropped because OSM route features add noise in Copenhagen.
+
+### Key findings
+
+1. **SUBWAY over-prediction fixed by GTFS stop proximity** — metro endpoint distance is discriminative
+2. **OSM route features hurt in Copenhagen** — trained on Paris density, doesn't transfer
+3. **Google confidence is high** (median 95) — disagreements aren't from Google uncertainty
+4. **Confidence filtering helps**: at ≥0.7, agreement rises from 36% to 44% (overall) and 60% to 66% (filtered)
+5. **Model trained on Paris has transferability limitations** — transit infrastructure density differs between cities
+6. **BIKE is hard**: 32% agreement (full features), confused with CAR (40%) and WALKING (19%)
+
+---
+
 ## Open issues
 
 1. **BUS Level 4**: Trip-level exact dropped from 71.2% to 23.1%. Segments within BUS trips get classified as CAR (BUS+CAR = 22.7%). The classifier knows BUS at trip level (OOF F1 0.68) but short segments lose the discriminative pattern.
