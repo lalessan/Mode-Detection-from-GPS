@@ -232,9 +232,16 @@ Per-mode confidence gap (median correct - median incorrect): WALKING +0.333, BIK
 
 ---
 
-## Google Timeline validation (Copenhagen, infostop pipeline)
+---
+---
 
-Validation of the Paris-trained model (Run 22a) on personal Google Timeline data (~1.2M records, 2014-2020, Copenhagen). Proper pipeline: infostop for stop detection → multi-modal prediction (PELT + per-segment classification) → compare against Google's activity labels per segment.
+# Google Timeline Validation (Copenhagen)
+
+Validation of the Paris-trained model (Run 22a) on personal Google Timeline data (~1.2M records, 2014–2020, Copenhagen). Tests real-world transferability: different city, different data source, no ground truth labels — only Google's activity recognition for comparison.
+
+---
+
+## Setup
 
 ### Pipeline
 
@@ -258,7 +265,9 @@ False positives mostly TILTING(13.5K) and UNKNOWN(6.1K) — ambiguous activities
 
 Google only provides 3 transport modes: WALKING (72%), BIKE (17%), CAR (11%). No public transport labels (SUBWAY, TRAIN, BUS). Google confidence is high: median 95, 69% above 90.
 
-### Run 1: Motion features only (no GTFS/OSM)
+---
+
+## GT-Run 1: Motion features only (no GTFS/OSM)
 
 | Level | Metric | Value |
 |-------|--------|-------|
@@ -272,7 +281,9 @@ Google only provides 3 transport modes: WALKING (72%), BIKE (17%), CAR (11%). No
 
 SUBWAY over-prediction: 409 trips predicted SUBWAY, Google says WALKING(320), BIKE(55), CAR(34).
 
-### Run 2: OSM routes only (no GTFS)
+---
+
+## GT-Run 2: OSM routes only (no GTFS)
 
 | Level | Metric | Value |
 |-------|--------|-------|
@@ -282,7 +293,9 @@ SUBWAY over-prediction: 409 trips predicted SUBWAY, Google says WALKING(320), BI
 
 OSM route features made things **worse**. Copenhagen's dense transit infrastructure means route-matching finds bus/train/subway routes near everything, including walking trips.
 
-### Run 3: Full features (GTFS + OSM)
+---
+
+## GT-Run 3: Full features (GTFS + OSM)
 
 | Level | Metric | Value |
 |-------|--------|-------|
@@ -298,7 +311,9 @@ OSM route features made things **worse**. Copenhagen's dense transit infrastruct
 
 **GTFS stop features fixed SUBWAY** (419 → 160 predictions). Trips far from metro stations are no longer misclassified. But **TRAIN became the new problem** (294 trips, high confidence 0.846, mostly wrong). Overall filtered agreement dropped because OSM route features add noise in Copenhagen.
 
-### Key findings
+---
+
+## Key findings
 
 1. **SUBWAY over-prediction fixed by GTFS stop proximity** — metro endpoint distance is discriminative
 2. **OSM route features hurt in Copenhagen** — trained on Paris density, doesn't transfer
