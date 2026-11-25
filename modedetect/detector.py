@@ -448,29 +448,21 @@ class ModeDetector:
             result[cls] = proba[:, i]
         return result
 
-    def segment_boundaries(self) -> pd.DataFrame:
-        """Return time boundaries for each segment from the last segmented prediction.
+    def segmented_gps(self) -> pd.DataFrame:
+        """Return the GPS DataFrame with segment assignments from the last segmented prediction.
 
         Must be called after ``predict(..., segment=True)`` or
         ``predict_proba(..., segment=True)``.
 
         Returns
         -------
-        DataFrame with columns: trip_key, segment, seg_start, seg_end, n_points.
+        DataFrame: the input GPS data with an added ``segment`` column (int).
         """
         if not hasattr(self, "_last_segmented_gps") or self._last_segmented_gps is None:
             raise ModeDetectError(
                 "No segmented GPS data available. Call predict(segment=True) first."
             )
-        cfg = self.config
-        gps_seg = self._last_segmented_gps
-        bounds = gps_seg.groupby([cfg.col_trip_key, "segment"]).agg(
-            seg_start=(cfg.col_timestamp, "min"),
-            seg_end=(cfg.col_timestamp, "max"),
-            n_points=(cfg.col_timestamp, "count"),
-        ).reset_index()
-        bounds = bounds.rename(columns={cfg.col_trip_key: "trip_key"})
-        return bounds
+        return self._last_segmented_gps
 
     # ── save / load ───────────────────────────────────────────────────
 

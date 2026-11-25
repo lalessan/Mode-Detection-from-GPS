@@ -249,7 +249,7 @@ Validation of the Paris-trained model (Run 22a) on personal Google Timeline data
 2. **infostop** stop detection (r1=30m, min_staying_time=300s) → 677 stops, 1500 trips
 3. Filters aligned with training: min_points=10, min_duration=180s, gap=300s, max_range=150m (dropped 152 stationary trips)
 4. `model.predict_proba(gps, segment=True)` → 1716 segments (213 multi-modal trips, avg 1.1 segs/trip)
-5. Per-segment Google label assignment using time windows from `segment_boundaries()`
+5. Per-segment Google label assignment via `segmented_gps()` (direct GPS→segment mapping)
 
 ### Infostop vs Google STILL validation
 

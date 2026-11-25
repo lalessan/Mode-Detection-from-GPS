@@ -161,20 +161,47 @@ def download_osm_pbf(city_preset: dict, out_dir: Path) -> Path | None:
 #   IN_FOUR_WHEELER_VEHICLE, IN_CAR, IN_TWO_WHEELER_VEHICLE, IN_BUS,
 #   EXITING_VEHICLE
 
+# Simple mapping (used only for parsing/grouping, NOT for evaluation)
 GOOGLE_TO_MODE = {
     "IN_VEHICLE": "CAR",
     "IN_ROAD_VEHICLE": "CAR",
     "IN_FOUR_WHEELER_VEHICLE": "CAR",
     "IN_CAR": "CAR",
-    "IN_TWO_WHEELER_VEHICLE": "CAR",
     "IN_BUS": "BUS",
     "IN_RAIL_VEHICLE": "TRAIN",
     "ON_FOOT": "WALKING",
     "WALKING": "WALKING",
-    "RUNNING": "WALKING",
     "ON_BICYCLE": "BIKE",
 }
-# STILL, TILTING, UNKNOWN, EXITING_VEHICLE → not a transport mode
+
+# ── Flexible evaluation matching ──────────────────────────────────
+# For each Google activity type, which of OUR predictions count as correct?
+GOOGLE_ACCEPTS = {
+    "IN_VEHICLE": {"CAR", "BUS"},               # generic vehicle → CAR or BUS both ok
+    "IN_ROAD_VEHICLE": {"CAR", "BUS"},
+    "IN_FOUR_WHEELER_VEHICLE": {"CAR", "BUS"},
+    "IN_CAR": {"CAR"},
+    "IN_BUS": {"BUS"},
+    "IN_RAIL_VEHICLE": {"TRAIN", "SUBWAY", "TRAMWAY"},  # any rail mode ok
+    "ON_FOOT": {"WALKING"},
+    "WALKING": {"WALKING"},
+    "ON_BICYCLE": {"BIKE"},
+}
+
+# Excluded from evaluation entirely
+GOOGLE_EXCLUDE = {
+    "IN_TWO_WHEELER_VEHICLE",  # no matching mode in our model
+    "RUNNING",                  # ambiguous
+    "STILL", "TILTING", "UNKNOWN", "EXITING_VEHICLE",  # not transport modes
+}
+
+
+def is_match(google_activity: str, predicted_mode: str) -> bool:
+    """Check if a prediction is correct given the Google raw activity type."""
+    accepted = GOOGLE_ACCEPTS.get(google_activity)
+    if accepted is None:
+        return False
+    return predicted_mode in accepted
 
 
 def parse_google_timeline(json_path: str, start: str = None, end: str = None,
@@ -564,71 +591,23 @@ def main():
         seg_preds["predicted_mode"] = proba_df[proba_cols].idxmax(axis=1).values
         seg_preds["confidence"] = proba_df[proba_cols].max(axis=1).values
 
-        # Get segment time boundaries from the model
-        seg_bounds = model.segment_boundaries()
-        seg_preds = seg_preds.merge(seg_bounds, on=["trip_key", "segment"], how="left")
+        # Get GPS→segment mapping and compute Google labels per segment
+        seg_gps = model.segmented_gps()
+        has_mode = seg_gps["google_mode"].notna()
+        labeled_gps = seg_gps[has_mode]
+
+        # Majority vote for mapped mode and raw activity per segment
+        google_labels = labeled_gps.groupby(["trip_key", "segment"]).agg(
+            google_label=("google_mode", lambda s: s.value_counts().index[0]),
+            google_activity_raw=("google_activity", lambda s: s.value_counts().index[0]),
+            google_n_labeled=("google_mode", "count"),
+            google_median_conf=("google_confidence", "median"),
+        ).reset_index()
+
+        seg_preds = seg_preds.merge(google_labels, on=["trip_key", "segment"], how="left")
 
         seg_preds.to_parquet(preds_ckpt, index=False)
         logger.info("Saved predictions checkpoint: %s", preds_ckpt)
-
-    # ── Build Google ground truth per segment ──
-    # For each segment, look up Google's activity labels during that time window
-    # and compute the dominant mode (majority vote and confidence-weighted).
-    google_labels_ckpt = ckpt_dir / "google_segment_labels.parquet"
-
-    if google_labels_ckpt.exists():
-        logger.info("Loading Google segment labels from checkpoint: %s", google_labels_ckpt)
-        google_seg_labels = pd.read_parquet(google_labels_ckpt)
-    else:
-        logger.info("Computing Google ground truth per segment...")
-        label_rows = []
-        for _, seg_row in seg_preds.iterrows():
-            tk = seg_row["trip_key"]
-            seg_start = pd.Timestamp(seg_row["seg_start"])
-            seg_end = pd.Timestamp(seg_row["seg_end"])
-
-            # Find GPS points in this trip within the segment's time window
-            trip_gps = gps[gps["trip_key"] == tk]
-            seg_gps = trip_gps[
-                (trip_gps["timestamp"] >= seg_start) &
-                (trip_gps["timestamp"] <= seg_end)
-            ]
-
-            has_mode = seg_gps["google_mode"].notna()
-            modes = seg_gps.loc[has_mode, "google_mode"]
-            confs = seg_gps.loc[has_mode, "google_confidence"]
-
-            # Simple majority vote
-            dominant = modes.value_counts().index[0] if len(modes) > 0 else None
-
-            # Confidence-weighted vote
-            dominant_conf = None
-            median_google_conf = np.nan
-            if len(modes) > 0:
-                conf_per_mode = pd.DataFrame({"mode": modes.values, "conf": confs.values})
-                weighted = conf_per_mode.groupby("mode")["conf"].sum()
-                dominant_conf = weighted.idxmax()
-                median_google_conf = confs.median()
-
-            label_rows.append({
-                "trip_key": tk,
-                "segment": seg_row["segment"],
-                "google_label": dominant,
-                "google_label_conf": dominant_conf,
-                "google_n_labeled": len(modes),
-                "google_median_conf": median_google_conf,
-            })
-        google_seg_labels = pd.DataFrame(label_rows)
-        google_seg_labels.to_parquet(google_labels_ckpt, index=False)
-        logger.info("Saved Google segment labels: %s", google_labels_ckpt)
-
-    # Merge Google labels into segment predictions
-    seg_preds = seg_preds.merge(
-        google_seg_labels, on=["trip_key", "segment"], how="left",
-        suffixes=("", "_dup"),
-    )
-    # Drop any duplicate columns from re-merge
-    seg_preds = seg_preds[[c for c in seg_preds.columns if not c.endswith("_dup")]]
 
     # ── Build trip-level summary ──
     trip_summary = seg_preds.groupby("trip_key").agg(
@@ -640,7 +619,7 @@ def main():
         mean_confidence=("confidence", "mean"),
         # Google trip-level: dominant across all segments
         google_label=("google_label", lambda s: s.dropna().value_counts().index[0] if s.notna().any() else None),
-        google_label_conf=("google_label_conf", lambda s: s.dropna().value_counts().index[0] if s.notna().any() else None),
+        google_activity_raw=("google_activity_raw", lambda s: s.dropna().value_counts().index[0] if s.notna().any() else None),
         google_median_conf=("google_median_conf", "median"),
         google_mode_set=("google_label", lambda s: ",".join(sorted(s.dropna().unique())) if s.notna().any() else None),
     ).reset_index()
@@ -677,198 +656,187 @@ def main():
         med_conf = trip_summary[trip_summary["dominant_predicted"] == mode]["mean_confidence"].median()
         print(f"    {mode:<12} {count:>6} ({pct:5.1f}%)  median conf: {med_conf:.3f}")
 
-    # ── Segment-level agreement ──
-    seg_has_label = seg_preds["google_label"].notna()
-    seg_labeled = seg_preds[seg_has_label]
-    n_seg_labeled = len(seg_labeled)
-    print(f"\n  === SEGMENT-LEVEL ANALYSIS ({n_seg_labeled}/{n_segs} segments with Google labels) ===")
+    # ── Segment-level agreement (flexible matching) ──
+    # Exclude segments with Google types not in GOOGLE_ACCEPTS
+    seg_has_raw = seg_preds["google_activity_raw"].notna()
+    seg_evaluable = seg_preds[
+        seg_has_raw & ~seg_preds["google_activity_raw"].isin(GOOGLE_EXCLUDE)
+    ].copy()
+    seg_evaluable["_match"] = seg_evaluable.apply(
+        lambda r: is_match(r["google_activity_raw"], r["predicted_mode"]), axis=1
+    )
+    n_seg_eval = len(seg_evaluable)
+    n_seg_excluded = seg_has_raw.sum() - n_seg_eval
+    print(f"\n  === SEGMENT-LEVEL ANALYSIS ({n_seg_eval}/{n_segs} segments evaluable, "
+          f"{n_seg_excluded} excluded [TWO_WHEELER/RUNNING/etc]) ===")
 
-    if n_seg_labeled > 0:
-        seg_agree = (seg_labeled["predicted_mode"] == seg_labeled["google_label"]).mean()
-        print(f"  Segment agreement: {seg_agree*100:.1f}%")
+    if n_seg_eval > 0:
+        seg_agree = seg_evaluable["_match"].mean()
+        print(f"  Segment agreement (flexible): {seg_agree*100:.1f}%")
 
-        print(f"\n  {'Google label':<12} {'N segs':>8} {'Agreement':>10} {'Our top prediction':>30}")
-        print("  " + "-" * 65)
-        for gl in sorted(seg_labeled["google_label"].unique()):
-            gl_mask = seg_labeled["google_label"] == gl
-            gl_n = gl_mask.sum()
-            gl_agree = (seg_labeled.loc[gl_mask, "predicted_mode"] == gl).mean()
-            top_pred = seg_labeled.loc[gl_mask, "predicted_mode"].value_counts()
-            top_str = ", ".join(f"{m}({c})" for m, c in top_pred.head(3).items())
-            print(f"  {gl:<12} {gl_n:>8} {gl_agree:>9.1%} {top_str:>30}")
+        # Confusion matrix: rows = raw Google types, cols = our predicted modes
+        raw_types = sorted(seg_evaluable["google_activity_raw"].unique())
+        pred_modes = sorted(seg_evaluable["predicted_mode"].unique())
+        print(f"\n  Confusion matrix (rows=Google raw type, cols=our prediction):")
+        header = "  " + " " * 25 + "".join(f"{m:>9}" for m in pred_modes) + "   match%"
+        print(header)
+        print("  " + "-" * (25 + 9 * len(pred_modes) + 9))
+        for gt in raw_types:
+            gt_mask = seg_evaluable["google_activity_raw"] == gt
+            gt_n = gt_mask.sum()
+            gt_match = seg_evaluable.loc[gt_mask, "_match"].mean()
+            accepts = GOOGLE_ACCEPTS.get(gt, set())
+            counts = []
+            for pm in pred_modes:
+                c = ((seg_evaluable["google_activity_raw"] == gt) &
+                     (seg_evaluable["predicted_mode"] == pm)).sum()
+                # Mark accepted predictions
+                marker = "*" if pm in accepts else " "
+                counts.append(f"{c:>8}{marker}")
+            print(f"  {gt:<25}" + "".join(counts) + f"  {gt_match:>5.1%}")
+        print(f"\n  (* = accepted as correct match)")
 
-        # Segment-level agreement by our confidence
+        # Per raw Google type breakdown
+        print(f"\n  {'Google type':<25} {'N segs':>8} {'Match%':>8} {'Accepted predictions':>30}")
+        print("  " + "-" * 75)
+        for gt in raw_types:
+            gt_mask = seg_evaluable["google_activity_raw"] == gt
+            gt_n = gt_mask.sum()
+            gt_match = seg_evaluable.loc[gt_mask, "_match"].mean()
+            top_pred = seg_evaluable.loc[gt_mask, "predicted_mode"].value_counts()
+            top_str = ", ".join(f"{m}({c})" for m, c in top_pred.head(4).items())
+            print(f"  {gt:<25} {gt_n:>8} {gt_match:>7.1%} {top_str:>30}")
+
+        # Segment agreement by our confidence
         print(f"\n  Segment agreement by OUR confidence:")
         print(f"  {'Threshold':>10} {'Kept':>7} {'Coverage':>9} {'Agreement':>10}")
         print("  " + "-" * 40)
         for t in [0.0, 0.5, 0.7, 0.8, 0.9]:
-            mask = seg_labeled["confidence"] >= t
+            mask = seg_evaluable["confidence"] >= t
             n = mask.sum()
             if n == 0:
                 continue
-            cov = n / n_seg_labeled
-            ag = (seg_labeled.loc[mask, "predicted_mode"] == seg_labeled.loc[mask, "google_label"]).mean()
+            cov = n / n_seg_eval
+            ag = seg_evaluable.loc[mask, "_match"].mean()
             print(f"  {t:>10.2f} {n:>7} {cov:>8.1%} {ag:>9.1%}")
 
     # ── Trip-level analysis ──
     print(f"\n  === TRIP-LEVEL ANALYSIS ===")
 
-    # Google label distribution and confidence
+    # Google label distribution (raw types)
+    has_raw = trip_summary["google_activity_raw"].notna()
     has_label = trip_summary["google_label"].notna()
     n_labeled = has_label.sum()
-    print(f"\n  Google labels (available for {n_labeled}/{n_trips} trips, {n_labeled/n_trips*100:.1f}%):")
-    if n_labeled > 0:
-        gl_counts = trip_summary.loc[has_label, "google_label"].value_counts()
-        for mode, count in gl_counts.items():
-            med_gc = trip_summary.loc[has_label & (trip_summary["google_label"] == mode), "google_median_conf"].median()
-            print(f"    {mode:<12} {count:>6} ({count/n_labeled*100:5.1f}%)  median Google conf: {med_gc:.0f}")
+
+    print(f"\n  Google raw activity distribution ({n_labeled}/{n_trips} trips with labels):")
+    if has_raw.any():
+        raw_counts = trip_summary.loc[has_raw, "google_activity_raw"].value_counts()
+        for act, count in raw_counts.items():
+            excluded = " [EXCLUDED]" if act in GOOGLE_EXCLUDE else ""
+            med_gc = trip_summary.loc[has_raw & (trip_summary["google_activity_raw"] == act), "google_median_conf"].median()
+            print(f"    {act:<30} {count:>6} ({count/has_raw.sum()*100:5.1f}%)  median conf: {med_gc:.0f}{excluded}")
 
         # Google confidence distribution
         gc = trip_summary.loc[has_label, "google_median_conf"]
         print(f"\n  Google confidence distribution (median per trip):")
         print(f"    Mean: {gc.mean():.0f}, Median: {gc.median():.0f}, "
               f"P25: {gc.quantile(0.25):.0f}, P75: {gc.quantile(0.75):.0f}")
-        print(f"    <50: {(gc < 50).mean()*100:.1f}%, <70: {(gc < 70).mean()*100:.1f}%, "
-              f">=90: {(gc >= 90).mean()*100:.1f}%")
 
-        # Majority vs confidence-weighted label agreement
-        label_agree = (trip_summary.loc[has_label, "google_label"] ==
-                       trip_summary.loc[has_label, "google_label_conf"]).mean()
-        n_differ = (trip_summary.loc[has_label, "google_label"] !=
-                    trip_summary.loc[has_label, "google_label_conf"]).sum()
-        print(f"\n  Majority vote vs confidence-weighted Google label: "
-              f"{label_agree*100:.1f}% agree ({n_differ} trips differ)")
+    # ── Agreement analysis (flexible matching, excluding certain types) ──
+    evaluable = trip_summary[
+        has_raw & ~trip_summary["google_activity_raw"].isin(GOOGLE_EXCLUDE)
+    ].copy()
+    evaluable["_match"] = evaluable.apply(
+        lambda r: is_match(r["google_activity_raw"], r["dominant_predicted"]), axis=1
+    )
+    n_eval = len(evaluable)
+    n_excluded_trips = has_raw.sum() - n_eval
 
-    # ── Agreement analysis ──
-    labeled = trip_summary[has_label].copy()
-    if len(labeled) > 0:
-        agree = (labeled["dominant_predicted"] == labeled["google_label"]).mean()
-        print(f"\n  --- Agreement: Our model vs Google ({len(labeled)} trips) ---")
-        print(f"  Overall agreement: {agree*100:.1f}%")
+    if n_eval > 0:
+        agree = evaluable["_match"].mean()
+        print(f"\n  --- Agreement: Our model vs Google ({n_eval} evaluable trips, "
+              f"{n_excluded_trips} excluded) ---")
+        print(f"  Overall agreement (flexible): {agree*100:.1f}%")
 
-        # Per Google-mode agreement
-        print(f"\n  {'Google label':<12} {'N trips':>8} {'Agreement':>10} {'Our top prediction':>30}")
-        print("  " + "-" * 65)
-        for gl in sorted(labeled["google_label"].unique()):
-            gl_mask = labeled["google_label"] == gl
-            gl_n = gl_mask.sum()
-            gl_agree = (labeled.loc[gl_mask, "dominant_predicted"] == gl).mean()
-            top_pred = labeled.loc[gl_mask, "dominant_predicted"].value_counts()
-            top_str = ", ".join(f"{m}({c})" for m, c in top_pred.head(3).items())
-            print(f"  {gl:<12} {gl_n:>8} {gl_agree:>9.1%} {top_str:>30}")
+        # Confusion matrix: rows = raw Google types, cols = our predicted modes
+        raw_types = sorted(evaluable["google_activity_raw"].unique())
+        pred_modes = sorted(evaluable["dominant_predicted"].unique())
+        print(f"\n  Confusion matrix (rows=Google raw type, cols=our prediction):")
+        header = "  " + " " * 25 + "".join(f"{m:>9}" for m in pred_modes) + "   match%"
+        print(header)
+        print("  " + "-" * (25 + 9 * len(pred_modes) + 9))
+        for gt in raw_types:
+            gt_mask = evaluable["google_activity_raw"] == gt
+            gt_n = gt_mask.sum()
+            gt_match = evaluable.loc[gt_mask, "_match"].mean()
+            accepts = GOOGLE_ACCEPTS.get(gt, set())
+            counts = []
+            for pm in pred_modes:
+                c = ((evaluable["google_activity_raw"] == gt) &
+                     (evaluable["dominant_predicted"] == pm)).sum()
+                marker = "*" if pm in accepts else " "
+                counts.append(f"{c:>8}{marker}")
+            print(f"  {gt:<25}" + "".join(counts) + f"  {gt_match:>5.1%}")
+        print(f"\n  (* = accepted as correct match)")
 
-        # Confusion matrix
-        from sklearn.metrics import confusion_matrix, f1_score
-        common_modes = sorted(set(labeled["google_label"]) & set(labeled["dominant_predicted"]))
-        both_common = labeled[labeled["google_label"].isin(common_modes) &
-                              labeled["dominant_predicted"].isin(common_modes)]
-        if len(both_common) > 0:
-            f1 = f1_score(both_common["google_label"], both_common["dominant_predicted"],
-                          average="macro", labels=common_modes)
-            print(f"\n  Macro F1 (common modes): {f1:.4f}")
+        # Per raw Google type breakdown
+        print(f"\n  {'Google type':<25} {'N trips':>8} {'Match%':>8} {'Our predictions':>30}")
+        print("  " + "-" * 75)
+        for gt in raw_types:
+            gt_mask = evaluable["google_activity_raw"] == gt
+            gt_n = gt_mask.sum()
+            gt_match = evaluable.loc[gt_mask, "_match"].mean()
+            top_pred = evaluable.loc[gt_mask, "dominant_predicted"].value_counts()
+            top_str = ", ".join(f"{m}({c})" for m, c in top_pred.head(4).items())
+            print(f"  {gt:<25} {gt_n:>8} {gt_match:>7.1%} {top_str:>30}")
 
-            print(f"\n  Confusion matrix (rows=Google, cols=ours):")
-            cm = confusion_matrix(both_common["google_label"], both_common["dominant_predicted"],
-                                  labels=common_modes)
-            header = "  " + " " * 12 + "".join(f"{m:>10}" for m in common_modes)
-            print(header)
-            for i, mode in enumerate(common_modes):
-                row_sum = cm[i].sum()
-                if row_sum == 0:
-                    continue
-                pcts = [f"{cm[i][j]/row_sum*100:>9.1f}%" for j in range(len(common_modes))]
-                print(f"  {mode:<12}" + "".join(pcts))
-
-        # Agreement by OUR confidence (mean confidence per trip)
+        # Agreement by OUR confidence
         print(f"\n  --- Agreement by OUR confidence threshold ---")
         print(f"  {'Threshold':>10} {'Kept':>7} {'Coverage':>9} {'Agreement':>10}")
         print("  " + "-" * 40)
         for t in [0.0, 0.3, 0.5, 0.7, 0.8, 0.9, 0.95]:
-            mask = labeled["mean_confidence"] >= t
+            mask = evaluable["mean_confidence"] >= t
             n = mask.sum()
             if n == 0:
                 continue
-            cov = n / len(labeled)
-            ag = (labeled.loc[mask, "dominant_predicted"] == labeled.loc[mask, "google_label"]).mean()
+            cov = n / n_eval
+            ag = evaluable.loc[mask, "_match"].mean()
             print(f"  {t:>10.2f} {n:>7} {cov:>8.1%} {ag:>9.1%}")
 
-        # Agreement by GOOGLE confidence (median per trip)
+        # Agreement by GOOGLE confidence
         print(f"\n  --- Agreement by GOOGLE confidence threshold ---")
         print(f"  {'Threshold':>10} {'Kept':>7} {'Coverage':>9} {'Agreement':>10}")
         print("  " + "-" * 40)
         for t in [0, 30, 50, 70, 80, 90]:
-            mask = labeled["google_median_conf"] >= t
+            mask = evaluable["google_median_conf"] >= t
             n = mask.sum()
             if n == 0:
                 continue
-            cov = n / len(labeled)
-            ag = (labeled.loc[mask, "dominant_predicted"] == labeled.loc[mask, "google_label"]).mean()
+            cov = n / n_eval
+            ag = evaluable.loc[mask, "_match"].mean()
             print(f"  {t:>10} {n:>7} {cov:>8.1%} {ag:>9.1%}")
 
         # Agreement when BOTH are confident
         print(f"\n  --- Agreement when both confident (ours >= 0.7 AND Google >= 70) ---")
-        both_conf = labeled[(labeled["mean_confidence"] >= 0.7) & (labeled["google_median_conf"] >= 70)]
+        both_conf = evaluable[(evaluable["mean_confidence"] >= 0.7) & (evaluable["google_median_conf"] >= 70)]
         if len(both_conf) > 0:
-            ag_both = (both_conf["dominant_predicted"] == both_conf["google_label"]).mean()
-            print(f"  {len(both_conf)} trips ({len(both_conf)/len(labeled)*100:.1f}% coverage), "
+            ag_both = both_conf["_match"].mean()
+            print(f"  {len(both_conf)} trips ({len(both_conf)/n_eval*100:.1f}% coverage), "
                   f"agreement: {ag_both*100:.1f}%")
 
-    # ── Filtered analysis: only trips where our dominant mode is in Google's label set ──
-    if len(labeled) > 0:
-        google_modes = set(labeled["google_label"].unique())
-        filtered = labeled[labeled["dominant_predicted"].isin(google_modes)].copy()
-        n_filtered = len(filtered)
-        n_excluded = len(labeled) - n_filtered
-
-        print(f"\n  --- Filtered: only trips where we predict {sorted(google_modes)} ---")
-        print(f"  {n_filtered}/{len(labeled)} trips ({n_filtered/len(labeled)*100:.1f}%) — "
-              f"excluded {n_excluded} where we predict public transport")
-
-        if n_filtered > 0:
-            agree_f = (filtered["dominant_predicted"] == filtered["google_label"]).mean()
-            print(f"  Agreement (filtered): {agree_f*100:.1f}%")
-
-            f1_f = f1_score(filtered["google_label"], filtered["dominant_predicted"],
-                            average="macro", labels=sorted(google_modes))
-            print(f"  Macro F1 (filtered): {f1_f:.4f}")
-
-            print(f"\n  {'Google label':<12} {'N':>6} {'Agreement':>10} {'Our predictions':>30}")
-            print("  " + "-" * 62)
-            for gl in sorted(google_modes):
-                gl_mask = filtered["google_label"] == gl
-                gl_n = gl_mask.sum()
-                if gl_n == 0:
-                    continue
-                gl_agree = (filtered.loc[gl_mask, "dominant_predicted"] == gl).mean()
-                top_pred = filtered.loc[gl_mask, "dominant_predicted"].value_counts()
-                top_str = ", ".join(f"{m}({c})" for m, c in top_pred.head(3).items())
-                print(f"  {gl:<12} {gl_n:>6} {gl_agree:>9.1%} {top_str:>30}")
-
-            # Agreement by confidence (filtered)
-            print(f"\n  Agreement by confidence (filtered):")
-            print(f"  {'Threshold':>10} {'Kept':>7} {'Coverage':>9} {'Agreement':>10}")
-            print("  " + "-" * 40)
-            for t in [0.0, 0.3, 0.5, 0.7, 0.8, 0.9, 0.95]:
-                mask = filtered["mean_confidence"] >= t
-                n = mask.sum()
-                if n == 0:
-                    continue
-                cov = n / n_filtered
-                ag = (filtered.loc[mask, "dominant_predicted"] == filtered.loc[mask, "google_label"]).mean()
-                print(f"  {t:>10.2f} {n:>7} {cov:>8.1%} {ag:>9.1%}")
-
         # What does Google say about trips we predict as public transport?
-        print(f"\n  --- Trips we predict as public transport (not in Google's labels) ---")
+        print(f"\n  --- Our public transport predictions vs Google ---")
         pt_modes = ["SUBWAY", "TRAIN", "BUS", "TRAMWAY"]
         for pm in pt_modes:
-            pm_mask = labeled["dominant_predicted"] == pm
+            pm_mask = evaluable["dominant_predicted"] == pm
             if pm_mask.sum() == 0:
                 continue
-            gl_dist = labeled.loc[pm_mask, "google_label"].value_counts()
+            gl_dist = evaluable.loc[pm_mask, "google_activity_raw"].value_counts()
             gl_str = ", ".join(f"{m}({c})" for m, c in gl_dist.head(4).items())
-            med_conf = labeled.loc[pm_mask, "mean_confidence"].median()
-            print(f"  We say {pm:<8} ({pm_mask.sum():>4} trips, med conf {med_conf:.3f}): "
-                  f"Google says {gl_str}")
+            med_conf = evaluable.loc[pm_mask, "mean_confidence"].median()
+            n_match = evaluable.loc[pm_mask, "_match"].sum()
+            print(f"  We say {pm:<8} ({pm_mask.sum():>4} trips, med conf {med_conf:.3f}, "
+                  f"{n_match} match): Google says {gl_str}")
 
     # Confidence stats
     print(f"\n  Confidence distribution:")
