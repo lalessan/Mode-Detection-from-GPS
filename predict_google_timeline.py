@@ -891,24 +891,19 @@ def _generate_maps(gps: pd.DataFrame, seg_preds: pd.DataFrame,
     labeled = trip_summary[trip_summary["google_label"].notna()]
 
     selected = []
-    # Multi-modal trips (most interesting)
+    # Top confident predictions per mode (most useful for inspection)
+    for mode in ["SUBWAY", "TRAIN", "BUS", "CAR", "BIKE", "WALKING"]:
+        mode_trips = labeled[labeled["dominant_predicted"] == mode]
+        if len(mode_trips) == 0:
+            continue
+        top = mode_trips.nlargest(min(10, len(mode_trips)), "mean_confidence")
+        selected.append((f"top_{mode}", top["trip_key"].values))
+
+    # Multi-modal trips
     multi_labeled = labeled[labeled["n_segments"] > 1]
     if len(multi_labeled) > 0:
         sample = multi_labeled.sample(n=min(10, len(multi_labeled)), random_state=42)
         selected.append(("multi_modal", sample["trip_key"].values))
-
-    # Single-modal disagreements
-    single_labeled = labeled[labeled["n_segments"] == 1]
-    single_disagree = single_labeled[single_labeled["dominant_predicted"] != single_labeled["google_label"]]
-    if len(single_disagree) > 0:
-        sample = single_disagree.sample(n=min(5, len(single_disagree)), random_state=42)
-        selected.append(("single_disagree", sample["trip_key"].values))
-
-    # High-confidence agreements
-    agree = labeled[labeled["dominant_predicted"] == labeled["google_label"]]
-    if len(agree) > 0:
-        top_agree = agree.nlargest(5, "mean_confidence")
-        selected.append(("agree_high", top_agree["trip_key"].values))
 
     maps_index = []
     for group, trip_keys in selected:
@@ -956,7 +951,8 @@ def _generate_maps(gps: pd.DataFrame, seg_preds: pd.DataFrame,
             # Build info panel
             modes_str = trip_info["predicted_modes"]
             confs_str = " / ".join(f"{c:.2f}" for c in trip_seg_preds["confidence"].values)
-            gl = trip_info.get("google_label", "N/A")
+            gl = trip_info.get("google_activity_raw", trip_info.get("google_label", "N/A"))
+            gl_mapped = trip_info.get("google_label", "N/A")
             dur = trip_info.get("duration_s", 0)
             start_time = trip_info.get("start_time", "")
 
@@ -973,7 +969,7 @@ def _generate_maps(gps: pd.DataFrame, seg_preds: pd.DataFrame,
                 <b>{tk}</b> [{group}]<br>
                 Our model: <b>{modes_str}</b><br>
                 Confidence: {confs_str}<br>
-                Google: <b>{gl}</b><br>
+                Google: <b>{gl}</b> ({gl_mapped})<br>
                 {start_time}<br>
                 Duration: {dur/60:.0f} min, Points: {n_pts}, Segments: {n_segs}<br>
                 <small>{legend_items}</small>
@@ -992,9 +988,15 @@ def _generate_maps(gps: pd.DataFrame, seg_preds: pd.DataFrame,
     current_group = None
     for group, tk, our, gl, conf, fname in maps_index:
         if group != current_group:
-            labels = {"multi_disagree": "Multi-modal trips with disagreements",
-                      "single_disagree": "Single-segment disagreements",
-                      "agree_high": "High-confidence agreements"}
+            labels = {
+                "top_SUBWAY": "Top SUBWAY predictions (by confidence)",
+                "top_TRAIN": "Top TRAIN predictions (by confidence)",
+                "top_BUS": "Top BUS predictions (by confidence)",
+                "top_CAR": "Top CAR predictions (by confidence)",
+                "top_BIKE": "Top BIKE predictions (by confidence)",
+                "top_WALKING": "Top WALKING predictions (by confidence)",
+                "multi_modal": "Multi-modal trips (random sample)",
+            }
             index += f"\n<h2>{labels.get(group, group)}</h2>\n<ul>\n"
             current_group = group
         index += f'<li><a href="{fname}">{tk}: ours={our} | google={gl} (min_conf={conf:.3f})</a></li>\n'
