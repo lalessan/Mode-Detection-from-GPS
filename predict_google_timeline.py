@@ -575,18 +575,30 @@ def main():
             logger.info("Using %s bbox: lat [%.2f, %.2f], lon [%.2f, %.2f]",
                         args.city, *bbox)
 
-    # ── Download GTFS + OSM if requested ──
+    # ── GTFS + OSM data: auto-detect existing, download if requested ──
     data_dir = Path(f"data_{args.city}") if args.city else Path("data_timeline")
     gtfs_dir = Path(args.gtfs_dir) if args.gtfs_dir else None
     osm_routes_dir = Path(args.osm_dir) if args.osm_dir else None
 
+    # Auto-detect existing data for this city
+    if preset and gtfs_dir is None:
+        candidate = data_dir / "gtfs"
+        if candidate.exists() and list(candidate.glob("*.zip")):
+            gtfs_dir = candidate
+            logger.info("Auto-detected GTFS data: %s", gtfs_dir)
+    if preset and osm_routes_dir is None:
+        candidate = data_dir / "osm_routes"
+        if candidate.exists():
+            osm_routes_dir = candidate
+            logger.info("Auto-detected OSM routes: %s", osm_routes_dir)
+
+    # Download missing data if requested
     if args.download_data and preset:
         if gtfs_dir is None:
             gtfs_dir = download_gtfs(preset, data_dir / "gtfs")
         if osm_routes_dir is None:
             pbf_path = download_osm_pbf(preset, data_dir / "osm")
             if pbf_path is not None:
-                # Extract routes from PBF (done by the model later)
                 osm_routes_dir = data_dir / "osm_routes"
     elif args.download_data and not preset:
         logger.warning("--download-data requires --city. Skipping data download.")
