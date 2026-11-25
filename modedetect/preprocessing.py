@@ -156,15 +156,50 @@ def filter_speed_outliers_predict(
     max_speed_ms: float,
     config: ModeDetectConfig,
     speed_col: str = "speed_ms",
+    max_iterations: int = 10,
 ) -> pd.DataFrame:
-    """For predict(): remove individual GPS points exceeding the speed ceiling."""
+    """For predict(): iteratively remove GPS points exceeding the speed ceiling.
+
+    A single pass is insufficient because removing a jump point makes its
+    neighbours adjacent — their implied speed may now also exceed the ceiling.
+    We iterate: remove the worst offenders, recompute speed from the new
+    consecutive points, and repeat until clean or *max_iterations* is reached.
+    """
+    from ._geo import haversine_m
+
     if speed_col not in df.columns:
         return df
-    exceeds = df[speed_col] > max_speed_ms
-    n_removed = int(exceeds.sum())
-    if n_removed > 0:
-        logger.info("Removed %d GPS points exceeding speed ceiling of %.1f m/s.", n_removed, max_speed_ms)
-    return df.loc[~exceeds].copy()
+
+    total_removed = 0
+    for iteration in range(max_iterations):
+        exceeds = df[speed_col] > max_speed_ms
+        n_bad = int(exceeds.sum())
+        if n_bad == 0:
+            break
+        total_removed += n_bad
+        df = df.loc[~exceeds].copy()
+
+        # Recompute speed from new consecutive points (per trip)
+        lat = df[config.col_latitude].astype("float64")
+        lon = df[config.col_longitude].astype("float64")
+        ts = df[config.col_timestamp]
+
+        dist = haversine_m(lat.shift(1).values, lon.shift(1).values,
+                           lat.values, lon.values)
+        dt = ts.diff().dt.total_seconds().values
+        speed = np.divide(dist, dt, out=np.full(len(dist), np.nan),
+                          where=(dt > 0) & np.isfinite(dt))
+
+        # Reset speed at trip boundaries (first point of each trip)
+        trip_boundary = df[config.col_trip_key] != df[config.col_trip_key].shift(1)
+        speed[trip_boundary.values] = np.nan
+
+        df[speed_col] = speed
+
+    if total_removed > 0:
+        logger.info("Removed %d GPS points exceeding speed ceiling of %.1f m/s (%d iterations).",
+                    total_removed, max_speed_ms, iteration + 1)
+    return df
 
 
 # ── Trip filtering (point count, duration) ───────────────────────────
