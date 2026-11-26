@@ -304,13 +304,15 @@ def compute_stop_features(
     has_route_type = stops_df is not None and "route_type_set" in stops_df.columns
     cache_path = Path(point_cache_path) if point_cache_path is not None else None
 
-    # Per-mode radii make old caches invalid — check config hash
+    # Per-mode radii and stop count make old caches invalid — check config hash
     _dr = config.stop_search_radius_m
+    _n_stops = len(stops_df) if stops_df is not None else 0
     cache_config_key = (
         f"t{getattr(config, 'tram_stop_radius_m', _dr)}"
         f"_m{getattr(config, 'metro_stop_radius_m', _dr)}"
         f"_r{getattr(config, 'rail_stop_radius_m', _dr)}"
         f"_b{getattr(config, 'bus_stop_radius_m', _dr)}"
+        f"_s{_n_stops}"
     )
 
     cache_loaded = False
@@ -731,6 +733,11 @@ def compute_bus_route_sequence_features(
 def load_gtfs_stops(gtfs_dir: Path) -> pd.DataFrame:
     """Load and merge stop data from GTFS zip files in a directory.
 
+    Uses ``parent_station`` grouping when available: child stops (platforms,
+    entrances) inherit their parent station's coordinates and route types are
+    aggregated at the station level.  This avoids inflating stop counts for
+    stations with many sub-stops (e.g. metro stations with 10+ entrances).
+
     Returns a DataFrame with ``stop_id``, ``stop_lat``, ``stop_lon``,
     ``route_type_set``, and ``bus_route_id_set`` columns.
     """
@@ -766,6 +773,38 @@ def load_gtfs_stops(gtfs_dir: Path) -> pd.DataFrame:
 
     stops = pd.concat(all_stops, ignore_index=True).drop_duplicates(subset=["stop_id"])
 
+    # ── Parent station grouping ──────────────────────────────────────
+    # Map each stop to station_key = parent_station if available, else stop_id.
+    # Then collapse child stops into one row per physical station.
+    has_parent = "parent_station" in stops.columns
+    if has_parent:
+        parent = stops["parent_station"].replace("", pd.NA)
+        stops["station_key"] = parent.fillna(stops["stop_id"])
+    else:
+        stops["station_key"] = stops["stop_id"]
+
+    # For each station_key, pick the parent row's coordinates (if it exists),
+    # otherwise use the first child's coordinates.
+    station_coords = (
+        stops.sort_values("stop_id")  # deterministic
+        .groupby("station_key", sort=False)
+        .agg(stop_lat=("stop_lat", "first"), stop_lon=("stop_lon", "first"))
+        .reset_index()
+    )
+    # Prefer the parent's own coordinates when the parent is itself a stop
+    if has_parent:
+        parent_rows = stops[stops["stop_id"] == stops["station_key"]][
+            ["stop_id", "stop_lat", "stop_lon"]
+        ].rename(columns={"stop_id": "station_key",
+                          "stop_lat": "plat", "stop_lon": "plon"})
+        station_coords = station_coords.merge(parent_rows, on="station_key", how="left")
+        mask = station_coords["plat"].notna()
+        station_coords.loc[mask, "stop_lat"] = station_coords.loc[mask, "plat"]
+        station_coords.loc[mask, "stop_lon"] = station_coords.loc[mask, "plon"]
+        station_coords = station_coords.drop(columns=["plat", "plon"])
+
+    n_before = len(stops)
+
     # Build stop → route_type and stop → bus_route_id mappings
     if all_stop_times and all_routes and all_trips:
         st = pd.concat(all_stop_times, ignore_index=True).drop_duplicates()
@@ -773,38 +812,52 @@ def load_gtfs_stops(gtfs_dir: Path) -> pd.DataFrame:
         trips = pd.concat(all_trips, ignore_index=True).drop_duplicates()
 
         stop_routes = st.merge(trips, on="trip_id").merge(routes[["route_id", "route_type"]], on="route_id")
-        route_type_sets = stop_routes.groupby("stop_id")["route_type"].apply(
-            lambda x: list(set(x))
-        ).reset_index()
-        route_type_sets.columns = ["stop_id", "route_type_set"]
 
-        stops = stops.merge(route_type_sets, on="stop_id", how="left")
-        stops["route_type_set"] = stops["route_type_set"].apply(
+        # Attach station_key to stop-route pairs
+        stop_key_map = stops[["stop_id", "station_key"]]
+        stop_routes = stop_routes.merge(stop_key_map, on="stop_id", how="left")
+
+        # Aggregate route types at station level
+        route_type_sets = stop_routes.groupby("station_key")["route_type"].apply(
+            lambda x: sorted(set(int(v) for v in x))
+        ).reset_index()
+        route_type_sets.columns = ["station_key", "route_type_set"]
+
+        station_coords = station_coords.merge(route_type_sets, on="station_key", how="left")
+        station_coords["route_type_set"] = station_coords["route_type_set"].apply(
             lambda x: x if isinstance(x, list) else []
         )
 
-        # Bus route IDs per stop (route_type == 3)
+        # Bus route IDs per station (route_type == 3)
         bus_routes = stop_routes[stop_routes["route_type"] == 3]
         if not bus_routes.empty:
-            bus_route_sets = bus_routes.groupby("stop_id")["route_id"].apply(
+            bus_route_sets = bus_routes.groupby("station_key")["route_id"].apply(
                 lambda x: list(set(x.astype(str)))
             ).reset_index()
-            bus_route_sets.columns = ["stop_id", "bus_route_id_set"]
-            stops = stops.merge(bus_route_sets, on="stop_id", how="left")
+            bus_route_sets.columns = ["station_key", "bus_route_id_set"]
+            station_coords = station_coords.merge(bus_route_sets, on="station_key", how="left")
         else:
-            stops["bus_route_id_set"] = np.nan
-        stops["bus_route_id_set"] = stops["bus_route_id_set"].apply(
+            station_coords["bus_route_id_set"] = np.nan
+        station_coords["bus_route_id_set"] = station_coords["bus_route_id_set"].apply(
             lambda x: x if isinstance(x, list) else []
         )
     else:
-        stops["route_type_set"] = [[] for _ in range(len(stops))]
-        stops["bus_route_id_set"] = [[] for _ in range(len(stops))]
+        station_coords["route_type_set"] = [[] for _ in range(len(station_coords))]
+        station_coords["bus_route_id_set"] = [[] for _ in range(len(station_coords))]
+
+    # Rename station_key → stop_id for downstream compatibility
+    station_coords = station_coords.rename(columns={"station_key": "stop_id"})
 
     required = {"stop_id", "stop_lat", "stop_lon"}
-    if not required.issubset(stops.columns):
-        raise ValueError(f"GTFS stops missing columns: {required - set(stops.columns)}")
+    if not required.issubset(station_coords.columns):
+        raise ValueError(f"GTFS stops missing columns: {required - set(station_coords.columns)}")
 
-    return stops[["stop_id", "stop_lat", "stop_lon", "route_type_set", "bus_route_id_set"]]
+    n_after = len(station_coords)
+    if n_after < n_before:
+        logger.info("Parent-station grouping: %d child stops → %d stations (%.0f%% reduction)",
+                     n_before, n_after, 100 * (1 - n_after / n_before))
+
+    return station_coords[["stop_id", "stop_lat", "stop_lon", "route_type_set", "bus_route_id_set"]]
 
 
 # ── Metro endpoint features ────────────────────────────────────────
