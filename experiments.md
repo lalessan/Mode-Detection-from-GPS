@@ -325,23 +325,58 @@ Training impact: `METRO_DIST_EP_MAX_M` → rank #11 importance (gain 15.7). SUBW
 
 ---
 
+## GT-Run 6: Station endpoint constraint (post-processing Rule 0)
+
+Added hard post-processing constraint: SUBWAY/TRAIN/TRAMWAY predictions are rejected when endpoints are too far from stations. Applied at the probability level — zeroes out the constrained class and renormalizes, so `idxmax()` picks the next-best mode.
+
+Thresholds: SUBWAY 500m, TRAIN 1000m, TRAMWAY 300m (from nearest station to both start and end points via `{MODE}_DIST_EP_MAX_M`).
+
+Affected 2903 segment×mode combinations (many segments constrained for multiple modes).
+
+| Metric | GT-Run 5 | GT-Run 6 | Delta |
+|--------|----------|----------|-------|
+| Overall agreement | 44.9% | **47.5%** | **+2.6pp** |
+| Verifiable only | 59.2% | 54.8% | −4.4pp |
+| Verifiable coverage | 893 (76%) | **1021 (87%)** | **+11pp** |
+| Verifiable + conf ≥ 0.7 | 64.8% | 57.0% | −7.8pp |
+| Verifiable + conf ≥ 0.8 | 69.5% | 56.5% | −13.0pp |
+| SUBWAY predictions | 82 | **53** (−35%) |  |
+| TRAIN predictions | 206 | **110** (−47%) |  |
+| BUS predictions | 20 | **38** (+90%) |  |
+| CAR predictions | 261 | **356** (+36%) |  |
+| IN_VEHICLE match | 42.1% | **64.2%** | **+22pp** |
+| ON_FOOT match | 47.7% | 48.6% | +0.9pp |
+| ON_BICYCLE match | 34.9% | 35.4% | +0.5pp |
+
+**Key observations:**
+- **IN_VEHICLE matching jumped 42→64%**: Many false TRAIN predictions correctly reassigned to CAR.
+- **SUBWAY cut by 35%, TRAIN by 47%**: Endpoint constraint is effective at removing physically impossible predictions.
+- **BUS doubled (20→38)**: Ex-SUBWAY/TRAIN segments now assigned to BUS where bus features support it.
+- **Verifiable agreement dropped (59.2→54.8%)**: More trips are now verifiable (1021 vs 893), but the new CAR predictions include many wrong ones (ON_BICYCLE→CAR, ON_FOOT→CAR).
+- **High-confidence verifiable dropped sharply (69.5→56.5%)**: Renormalized confidences after zeroing rail modes are inflated — a segment may show 0.95 for CAR just because TRAIN was zeroed, not because it's truly confident.
+
+**Verdict:** Overall agreement improved (+2.6pp), and the constraint makes physically sensible predictions. But confidence scores are no longer well-calibrated after renormalization — high-confidence filtering is less effective. The ON_BICYCLE→CAR confusion (72/212 trips) is now the biggest problem for verifiable trips.
+
+---
+
 ## Key findings
 
 1. **GPS quality filter is essential**: Google Timeline has cell tower bouncing (jumps of 6–13km), sparse sampling (~60s), and teleportation artefacts. Removed 287/1500 trips (19%).
 2. **Iterative speed filter**: Single-pass speed filtering misses cascading jumps. Iterating (remove outliers → recompute speed → repeat) catches more.
-3. **Endpoint distance features work**: `METRO_DIST_EP_MAX_M` became rank #11 feature, reduced SUBWAY predictions by 43%.
-4. **TRAIN over-prediction persists**: 206 trips (17%), `TRAIN_DIST_EP_MAX_M` is only rank #28 — train stations are more spread out than metro, so the endpoint constraint is weaker.
+3. **Endpoint distance features work**: `METRO_DIST_EP_MAX_M` became rank #11 feature, reduced SUBWAY predictions by 43% (GT-Run 5).
+4. **Hard endpoint constraint highly effective**: Post-processing Rule 0 (GT-Run 6) cut SUBWAY by 35% and TRAIN by 47% further. IN_VEHICLE match jumped 42→64%.
 5. **Google labels are coarse**: Only 3 types (ON_FOOT 74%, ON_BICYCLE 18%, IN_VEHICLE 8%). No rail or bus labels. This limits what we can validate.
 6. **Google confidence is high** (median 96) — disagreements aren't from Google uncertainty.
-7. **ON_BICYCLE weakest** (47.7% verifiable match): 46/212 bike trips predicted as CAR. Likely a Paris→Copenhagen transferability gap.
-8. **Confidence filtering effective**: Verifiable agreement rises from 59.2% → 69.5% at conf ≥ 0.8.
+7. **ON_BICYCLE weakest** (35.4% match): 72/212 bike trips predicted as CAR. Likely a Paris→Copenhagen transferability gap. Worsened after endpoint constraint pushed ex-TRAIN segments to CAR.
+8. **Confidence calibration breaks after proba renormalization**: After zeroing constrained modes, renormalized confidences are inflated. High-confidence filtering lost effectiveness (69.5→56.5% at ≥0.8).
 
 ---
 
 ## Open issues
 
-1. **TRAIN over-prediction**: 206 trips predicted TRAIN, mostly Google ON_FOOT. Train endpoint features not yet strong enough.
-2. **ON_FOOT → CAR misclassification**: 170/870 ON_FOOT trips predicted as CAR. Possibly remaining GPS noise creating high apparent speeds.
-3. **BUS Level 4 (Paris training)**: Trip-level exact dropped from 71.2% to 23.1%. Short segments lose the discriminative stopping pattern.
-4. **SUBWAY OOF F1 dropped to 0.41**: Model is now conservative about SUBWAY — good for reducing false positives but hurts recall on real subway trips.
-5. **Note on Level 3 comparison**: Original uses 80/20 split (10,637 test trips), modedetect uses OOF on 48,388 trips. OOF is a harder evaluation.
+1. **ON_BICYCLE → CAR confusion**: 72/212 bike trips predicted CAR (34%). Biggest source of error in verifiable trips. Paris→Copenhagen transferability gap (cycling infrastructure, speeds).
+2. **ON_FOOT → CAR misclassification**: 219/870 ON_FOOT trips predicted as CAR (25%). Worsened after endpoint constraint redirected ex-TRAIN to CAR.
+3. **Confidence calibration after renormalization**: Zeroing constrained modes inflates remaining probabilities. Need original (pre-renorm) confidence for filtering, or recalibrate.
+4. **BUS Level 4 (Paris training)**: Trip-level exact dropped from 71.2% to 23.1%. Short segments lose the discriminative stopping pattern.
+5. **SUBWAY OOF F1 dropped to 0.41**: Model conservative about SUBWAY — good for reducing false positives but hurts recall on real subway trips.
+6. **Note on Level 3 comparison**: Original uses 80/20 split (10,637 test trips), modedetect uses OOF on 48,388 trips. OOF is a harder evaluation.
