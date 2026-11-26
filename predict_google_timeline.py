@@ -1048,8 +1048,9 @@ def main():
 
 def _generate_maps(gps: pd.DataFrame, seg_preds: pd.DataFrame,
                     trip_summary: pd.DataFrame, map_dir: str):
-    """Generate folium maps for interesting trips with segment coloring."""
+    """Generate folium maps with animated playback and segment coloring."""
     import folium
+    from folium.plugins import TimestampedGeoJson
 
     out = Path(map_dir)
     out.mkdir(exist_ok=True, parents=True)
@@ -1059,6 +1060,13 @@ def _generate_maps(gps: pd.DataFrame, seg_preds: pd.DataFrame,
         "BUS": "#f39c12", "SUBWAY": "#9b59b6", "TRAIN": "#1abc9c",
         "TRAMWAY": "#e67e22",
     }
+
+    # Convert timestamps to Copenhagen local time
+    try:
+        import zoneinfo
+        cph_tz = zoneinfo.ZoneInfo("Europe/Copenhagen")
+    except Exception:
+        cph_tz = None
 
     labeled = trip_summary[trip_summary["google_label"].notna()]
 
@@ -1089,33 +1097,105 @@ def _generate_maps(gps: pd.DataFrame, seg_preds: pd.DataFrame,
 
             lats = trip_gps["latitude"].values
             lons = trip_gps["longitude"].values
+            timestamps = trip_gps["timestamp"].values
+            n_segs = len(trip_seg_preds)
+            n_pts = len(trip_gps)
+
             m = folium.Map(
                 location=[np.median(lats), np.median(lons)], zoom_start=14,
                 tiles="https://server.arcgisonline.com/ArcGIS/rest/services/World_Street_Map/MapServer/tile/{z}/{y}/{x}",
                 attr="Esri",
             )
 
-            # Color GPS trace by predicted segment mode
-            # Need to reconstruct which points belong to which segment
-            n_segs = len(trip_seg_preds)
-            n_pts = len(trip_gps)
-            if n_segs == 1:
-                # All points = one segment
-                color = MODE_COLORS.get(trip_seg_preds.iloc[0]["predicted_mode"], "#999")
-                coords = list(zip(lats, lons))
-                folium.PolyLine(coords, color=color, weight=4, opacity=0.8).add_to(m)
+            # Assign each GPS point to its segment
+            if "segment" in trip_gps.columns:
+                pt_segments = trip_gps["segment"].values
             else:
-                # Split points roughly by segment (equal splits as approximation)
+                # Fall back to equal splits
                 pts_per_seg = n_pts // n_segs
-                for seg_idx, (_, srow) in enumerate(trip_seg_preds.iterrows()):
-                    start_i = seg_idx * pts_per_seg
-                    end_i = (seg_idx + 1) * pts_per_seg if seg_idx < n_segs - 1 else n_pts
-                    seg_lats = lats[start_i:end_i + 1]  # overlap for continuity
-                    seg_lons = lons[start_i:end_i + 1]
-                    color = MODE_COLORS.get(srow["predicted_mode"], "#999")
-                    if len(seg_lats) >= 2:
-                        coords = list(zip(seg_lats, seg_lons))
-                        folium.PolyLine(coords, color=color, weight=4, opacity=0.8).add_to(m)
+                pt_segments = np.array([min(i // pts_per_seg, n_segs - 1) for i in range(n_pts)])
+
+            # Build segment mode lookup
+            seg_mode_map = dict(zip(trip_seg_preds["segment"].values,
+                                     trip_seg_preds["predicted_mode"].values))
+
+            # Static trace colored by segment mode (faint background)
+            for seg_id in sorted(set(pt_segments)):
+                seg_mask = pt_segments == seg_id
+                seg_lats = lats[seg_mask]
+                seg_lons = lons[seg_mask]
+                mode = seg_mode_map.get(seg_id, "WALKING")
+                color = MODE_COLORS.get(mode, "#999")
+                if len(seg_lats) >= 2:
+                    coords = list(zip(seg_lats, seg_lons))
+                    folium.PolyLine(coords, color=color, weight=3, opacity=0.3).add_to(m)
+
+            # Compute speeds for color coding
+            speeds = np.zeros(n_pts)
+            for i in range(1, n_pts):
+                dlat = np.radians(lats[i] - lats[i-1])
+                dlon = np.radians(lons[i] - lons[i-1])
+                a = (np.sin(dlat/2)**2 +
+                     np.cos(np.radians(lats[i-1])) * np.cos(np.radians(lats[i])) *
+                     np.sin(dlon/2)**2)
+                dist = 6371000 * 2 * np.arcsin(np.sqrt(a))
+                dt = (timestamps[i] - timestamps[i-1]) / np.timedelta64(1, 's')
+                speeds[i] = dist / dt if dt > 0 else 0
+
+            # Convert timestamps to local time strings
+            ts_local = pd.to_datetime(timestamps)
+            if cph_tz is not None:
+                ts_local = ts_local.tz_localize("UTC").tz_convert(cph_tz)
+            time_strs = ts_local.strftime("%Y-%m-%dT%H:%M:%S").tolist()
+
+            # Animated playback: points + lines colored by speed
+            features = []
+            for i in range(n_pts):
+                speed = speeds[i]
+                t = min(speed / 5.0, 1.0)  # 0=slow(blue), 1=fast(red)
+                r, b = int(255 * t), int(255 * (1 - t))
+                color = f"#{r:02x}00{b:02x}"
+                seg_id = pt_segments[i]
+                mode = seg_mode_map.get(seg_id, "?")
+                features.append({
+                    "type": "Feature",
+                    "geometry": {"type": "Point",
+                                 "coordinates": [float(lons[i]), float(lats[i])]},
+                    "properties": {
+                        "time": time_strs[i],
+                        "style": {"color": color},
+                        "icon": "circle",
+                        "iconstyle": {"fillColor": color, "fillOpacity": 0.8,
+                                      "stroke": "true", "radius": 6},
+                        "popup": f"{time_strs[i]}<br>Speed: {speed:.1f} m/s ({speed*3.6:.0f} km/h)<br>Mode: {mode}",
+                    },
+                })
+            for i in range(n_pts - 1):
+                speed = speeds[i]
+                t = min(speed / 5.0, 1.0)
+                r, b = int(255 * t), int(255 * (1 - t))
+                color = f"#{r:02x}00{b:02x}"
+                features.append({
+                    "type": "Feature",
+                    "geometry": {"type": "LineString",
+                                 "coordinates": [[float(lons[i]), float(lats[i])],
+                                                 [float(lons[i+1]), float(lats[i+1])]]},
+                    "properties": {
+                        "time": time_strs[i],
+                        "style": {"color": color, "weight": 4, "opacity": 0.8},
+                    },
+                })
+
+            TimestampedGeoJson(
+                {"type": "FeatureCollection", "features": features},
+                period="PT10S",
+                add_last_point=True,
+                auto_play=False,
+                loop=False,
+                max_speed=10,
+                loop_button=True,
+                time_slider_drag_update=True,
+            ).add_to(m)
 
             folium.Marker([lats[0], lons[0]], popup="START", icon=folium.Icon(color="green")).add_to(m)
             folium.Marker([lats[-1], lons[-1]], popup="END", icon=folium.Icon(color="red")).add_to(m)
@@ -1126,12 +1206,20 @@ def _generate_maps(gps: pd.DataFrame, seg_preds: pd.DataFrame,
             gl = trip_info.get("google_activity_raw", trip_info.get("google_label", "N/A"))
             gl_mapped = trip_info.get("google_label", "N/A")
             dur = trip_info.get("duration_s", 0)
-            start_time = trip_info.get("start_time", "")
+
+            # Show start time in local time
+            start_ts = trip_info.get("start_time", "")
+            if cph_tz is not None and pd.notna(start_ts):
+                try:
+                    start_ts = pd.Timestamp(start_ts).tz_localize("UTC").tz_convert(cph_tz)
+                except Exception:
+                    pass
+            start_time_str = str(start_ts)
 
             # Legend
             legend_items = "".join(
-                f'<span style="color:{c}">■</span> {m} '
-                for m, c in MODE_COLORS.items()
+                f'<span style="color:{c}">■</span> {md} '
+                for md, c in MODE_COLORS.items()
             )
 
             title_html = f'''
@@ -1142,8 +1230,9 @@ def _generate_maps(gps: pd.DataFrame, seg_preds: pd.DataFrame,
                 Our model: <b>{modes_str}</b><br>
                 Confidence: {confs_str}<br>
                 Google: <b>{gl}</b> ({gl_mapped})<br>
-                {start_time}<br>
+                {start_time_str} (Copenhagen)<br>
                 Duration: {dur/60:.0f} min, Points: {n_pts}, Segments: {n_segs}<br>
+                Speed: <span style="color:#0000ff">■</span>slow → <span style="color:#ff0000">■</span>fast<br>
                 <small>{legend_items}</small>
             </div>
             '''
