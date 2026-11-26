@@ -816,33 +816,29 @@ def compute_metro_endpoint_features(
     config: "ModeDetectConfig",
     segment_col: str | None = None,
 ) -> pd.DataFrame | None:
-    """Distance from trip start/end to nearest metro station.
+    """Distance from trip start/end to nearest metro/train/tram station.
 
-    Returns a DataFrame with trip_key (+ segment if applicable) and:
-    - METRO_DIST_START_M: distance from first GPS point to nearest metro stop
-    - METRO_DIST_END_M: distance from last GPS point to nearest metro stop
+    For each rail mode with stops in the GTFS data, computes:
+    - {MODE}_DIST_START_M: distance from first GPS point to nearest stop
+    - {MODE}_DIST_END_M: distance from last GPS point to nearest stop
+    - {MODE}_DIST_EP_MAX_M: max(start, end) — both endpoints must be near a station
 
-    Returns None if no metro stops found in GTFS data.
+    Modes: METRO (route_type 1), TRAIN (route_type 2), TRAM (route_type 0).
+
+    Returns None if no rail stops found in GTFS data.
     """
-    # Filter to metro stops (route_type 1)
     if "route_type_set" not in stops_df.columns:
         return None
-    metro_mask = stops_df["route_type_set"].apply(lambda s: 1 in s if isinstance(s, list) else False)
-    metro_stops = stops_df[metro_mask]
-    if metro_stops.empty:
-        logger.info("No metro stops found in GTFS — skipping metro endpoint features.")
-        return None
 
-    logger.info("Computing metro endpoint features (%d metro stops)...", len(metro_stops))
-
-    metro_rad = np.radians(metro_stops[["stop_lat", "stop_lon"]].values)
-    metro_tree = BallTree(metro_rad, metric="haversine")
+    # Rail mode types: (route_type, prefix)
+    rail_modes = [(1, "METRO"), (2, "TRAIN"), (0, "TRAM")]
 
     key_col = config.col_trip_key
     lat_col = config.col_latitude
     lon_col = config.col_longitude
     group_cols = [key_col] if segment_col is None else [key_col, segment_col]
 
+    # Get trip start/end points (compute once, reuse for all modes)
     grouped = gps_df.groupby(group_cols, sort=False, observed=True)
     first_pts = grouped.agg({lat_col: "first", lon_col: "first"})
     last_pts = grouped.agg({lat_col: "last", lon_col: "last"})
@@ -850,12 +846,36 @@ def compute_metro_endpoint_features(
     first_rad = np.radians(first_pts[[lat_col, lon_col]].astype("float64").values)
     last_rad = np.radians(last_pts[[lat_col, lon_col]].astype("float64").values)
 
-    dist_start, _ = metro_tree.query(first_rad, k=1)
-    dist_end, _ = metro_tree.query(last_rad, k=1)
-
     result = first_pts.reset_index()[group_cols].copy()
-    result["METRO_DIST_START_M"] = dist_start.ravel() * EARTH_RADIUS_M
-    result["METRO_DIST_END_M"] = dist_end.ravel() * EARTH_RADIUS_M
+    n_features = 0
+
+    for route_type, prefix in rail_modes:
+        mask = stops_df["route_type_set"].apply(
+            lambda s: route_type in s if isinstance(s, list) else False
+        )
+        mode_stops = stops_df[mask]
+        if mode_stops.empty:
+            continue
+
+        mode_rad = np.radians(mode_stops[["stop_lat", "stop_lon"]].values)
+        mode_tree = BallTree(mode_rad, metric="haversine")
+
+        dist_start, _ = mode_tree.query(first_rad, k=1)
+        dist_end, _ = mode_tree.query(last_rad, k=1)
+
+        start_m = dist_start.ravel() * EARTH_RADIUS_M
+        end_m = dist_end.ravel() * EARTH_RADIUS_M
+
+        result[f"{prefix}_DIST_START_M"] = start_m
+        result[f"{prefix}_DIST_END_M"] = end_m
+        result[f"{prefix}_DIST_EP_MAX_M"] = np.maximum(start_m, end_m)
+        n_features += 3
+
+        logger.info("Computing %s endpoint features (%d stops)...", prefix, len(mode_stops))
+
+    if n_features == 0:
+        logger.info("No rail stops found in GTFS — skipping endpoint features.")
+        return None
 
     # Rename trip_key column if needed
     if key_col != "trip_key":
