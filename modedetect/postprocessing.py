@@ -17,6 +17,46 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# Station endpoint constraint thresholds (meters)
+EP_THRESHOLDS = {
+    "SUBWAY":  ("METRO_DIST_EP_MAX_M", 500.0),
+    "TRAIN":   ("TRAIN_DIST_EP_MAX_M", 1000.0),
+    "TRAMWAY": ("TRAM_DIST_EP_MAX_M",  300.0),
+}
+
+
+def postprocess_proba(
+    proba: np.ndarray,
+    features_df: pd.DataFrame,
+    class_names: list[str],
+) -> np.ndarray:
+    """Apply endpoint constraints to probability matrix.
+
+    For SUBWAY/TRAIN/TRAMWAY: if endpoints are too far from stations,
+    zero out that class probability and renormalize.
+    """
+    proba = proba.copy()
+    n_total = 0
+    for mode, (ep_col, max_dist) in EP_THRESHOLDS.items():
+        if ep_col not in features_df.columns:
+            continue
+        if mode not in class_names:
+            continue
+        mode_idx = class_names.index(mode)
+        too_far = (features_df[ep_col] > max_dist) & features_df[ep_col].notna()
+        mask = too_far.values
+        n = mask.sum()
+        if n > 0:
+            proba[mask, mode_idx] = 0.0
+            # Renormalize rows
+            row_sums = proba[mask].sum(axis=1, keepdims=True)
+            row_sums[row_sums == 0] = 1.0  # avoid division by zero
+            proba[mask] = proba[mask] / row_sums
+            n_total += n
+    if n_total > 0:
+        logger.info("Post-processing (proba): zeroed constrained modes for %d segments", n_total)
+    return proba
+
 
 def postprocess_segments(
     predictions: pd.DataFrame,
@@ -70,11 +110,6 @@ def postprocess_segments(
     # ── Rule 0: Station endpoint constraint ────────────────────────
     # A SUBWAY/TRAIN/TRAM segment must start AND end near a station.
     # If not, reassign to the next-best class from predict_proba.
-    EP_THRESHOLDS = {
-        "SUBWAY":  ("METRO_DIST_EP_MAX_M", 500.0),
-        "TRAIN":   ("TRAIN_DIST_EP_MAX_M", 1000.0),
-        "TRAMWAY": ("TRAM_DIST_EP_MAX_M",  300.0),
-    }
     n_rule0 = 0
     for mode, (ep_col, max_dist) in EP_THRESHOLDS.items():
         if ep_col not in df.columns:

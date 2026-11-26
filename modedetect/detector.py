@@ -443,6 +443,12 @@ class ModeDetector:
         X = features_df.reindex(columns=self._feature_list, fill_value=0)
         proba = self._model.predict_proba(X)
 
+        # Apply post-processing constraints to probabilities
+        if cfg.postprocess_enabled and segment:
+            from .postprocessing import postprocess_proba
+            proba = postprocess_proba(proba, features_df,
+                                      list(self._encoder.classes_))
+
         result = features_df[id_cols].copy()
         for i, cls in enumerate(self._encoder.classes_):
             result[cls] = proba[:, i]
