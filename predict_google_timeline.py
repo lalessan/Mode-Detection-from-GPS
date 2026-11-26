@@ -1145,7 +1145,9 @@ def _generate_maps(gps: pd.DataFrame, seg_preds: pd.DataFrame,
             # Convert timestamps to local time strings
             ts_local = pd.to_datetime(timestamps)
             if cph_tz is not None:
-                ts_local = ts_local.tz_localize("UTC").tz_convert(cph_tz)
+                if ts_local.tz is None:
+                    ts_local = ts_local.tz_localize("UTC")
+                ts_local = ts_local.tz_convert(cph_tz)
             time_strs = ts_local.strftime("%Y-%m-%dT%H:%M:%S").tolist()
 
             # Animated playback: points + lines colored by speed
