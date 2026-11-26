@@ -613,7 +613,9 @@ class ModeDetector:
 
         if cfg.postprocess_enabled:
             from .postprocessing import postprocess_segments
-            result = postprocess_segments(result, features_df, cfg)
+            result = postprocess_segments(result, features_df, cfg,
+                                          proba=proba,
+                                          class_names=list(self._encoder.classes_))
 
         return result
 

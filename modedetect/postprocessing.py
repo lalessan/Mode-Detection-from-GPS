@@ -22,6 +22,8 @@ def postprocess_segments(
     predictions: pd.DataFrame,
     features_df: pd.DataFrame,
     config: ModeDetectConfig,
+    proba: np.ndarray | None = None,
+    class_names: list[str] | None = None,
 ) -> pd.DataFrame:
     """Apply post-processing heuristics to segment predictions.
 
@@ -30,6 +32,8 @@ def postprocess_segments(
     predictions : DataFrame with trip_key, segment, predicted_mode
     features_df : DataFrame with trip_key, segment, plus feature columns
     config : ModeDetectConfig
+    proba : (n_segments, n_classes) probability matrix from XGBoost (optional)
+    class_names : list of class names matching proba columns (optional)
 
     Returns
     -------
@@ -46,7 +50,8 @@ def postprocess_segments(
     feat_cols = []
     for col in ["bus_match_pct", "BUS_SEQ_STOPS", "BUS_SEQ_ROUTES",
                  "DURATION_BUS", "MIN_DIST_BUS", "SPEED_AVG", "GPS_POINTS",
-                 "TOTAL_TIME"]:
+                 "TOTAL_TIME",
+                 "METRO_DIST_EP_MAX_M", "TRAIN_DIST_EP_MAX_M", "TRAM_DIST_EP_MAX_M"]:
         if col in features_df.columns:
             feat_cols.append(col)
 
@@ -61,6 +66,40 @@ def postprocess_segments(
     )
 
     n_reclassified = 0
+
+    # ── Rule 0: Station endpoint constraint ────────────────────────
+    # A SUBWAY/TRAIN/TRAM segment must start AND end near a station.
+    # If not, reassign to the next-best class from predict_proba.
+    EP_THRESHOLDS = {
+        "SUBWAY":  ("METRO_DIST_EP_MAX_M", 500.0),
+        "TRAIN":   ("TRAIN_DIST_EP_MAX_M", 1000.0),
+        "TRAMWAY": ("TRAM_DIST_EP_MAX_M",  300.0),
+    }
+    n_rule0 = 0
+    for mode, (ep_col, max_dist) in EP_THRESHOLDS.items():
+        if ep_col not in df.columns:
+            continue
+        mode_mask = df["predicted_mode"] == mode
+        too_far = df[ep_col] > max_dist
+        override_mask = mode_mask & too_far & df[ep_col].notna()
+        n_override = override_mask.sum()
+        if n_override > 0 and proba is not None and class_names is not None:
+            # Reassign to next-best class (exclude the current mode)
+            mode_idx = class_names.index(mode)
+            for iloc_pos in np.where(override_mask.values)[0]:
+                p = proba[iloc_pos].copy()
+                p[mode_idx] = 0  # exclude current mode
+                next_best = class_names[np.argmax(p)]
+                df.iloc[iloc_pos, df.columns.get_loc("predicted_mode")] = next_best
+            n_rule0 += n_override
+        elif n_override > 0:
+            # No proba available — fall back to WALKING
+            df.loc[override_mask, "predicted_mode"] = "WALKING"
+            n_rule0 += n_override
+
+    n_reclassified += n_rule0
+    if n_rule0 > 0:
+        logger.info("Post-processing rule 0 (endpoint constraint): %d segments overridden", n_rule0)
 
     # ── Rule 1: CAR → BUS based on bus route evidence ────────────────
     car_mask = df["predicted_mode"] == "CAR"
