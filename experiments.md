@@ -248,8 +248,15 @@ Validation of the Paris-trained model (Run 22a) on personal Google Timeline data
 1. Parse raw GPS from Google Timeline JSON (320K records in Copenhagen bbox)
 2. **infostop** stop detection (r1=30m, min_staying_time=300s) → 677 stops, 1500 trips
 3. Filters aligned with training: min_points=10, min_duration=180s, gap=300s, max_range=150m (dropped 152 stationary trips)
-4. `model.predict_proba(gps, segment=True)` → 1716 segments (213 multi-modal trips, avg 1.1 segs/trip)
-5. Per-segment Google label assignment via `segmented_gps()` (direct GPS→segment mapping)
+4. **Trip quality filter**: max_jump=2km, max_speed=500km/h, jump-back detection, sparse sampling (median interval >120s). Removed 287/1500 trips (kept 1213)
+5. `model.predict_proba(gps, segment=True)` → segments with iterative speed filter
+6. Per-segment Google label assignment via `segmented_gps()` (direct GPS→segment mapping)
+
+### Evaluation methodology
+
+- **Flexible matching**: IN_VEHICLE accepts CAR or BUS; IN_RAIL_VEHICLE accepts TRAIN, SUBWAY, TRAMWAY
+- **Excluded from eval**: IN_TWO_WHEELER_VEHICLE, RUNNING
+- **Verifiable only**: excludes trips where we predict SUBWAY/TRAIN/TRAMWAY (Google has no rail labels)
 
 ### Infostop vs Google STILL validation
 
@@ -267,65 +274,74 @@ Google only provides 3 transport modes: WALKING (72%), BIKE (17%), CAR (11%). No
 
 ---
 
-## GT-Run 1: Motion features only (no GTFS/OSM)
+## GT-Run 1–3: Initial experiments (old model, before quality filter)
 
-| Level | Metric | Value |
-|-------|--------|-------|
-| Segment | Agreement | 36.1% |
-| Segment | BIKE agreement | 20.0% |
-| Segment | CAR agreement | 42.5% |
-| Segment | WALKING agreement | 39.1% |
-| Trip | Overall agreement | 36.3% |
-| Trip | Filtered (BIKE/CAR/WALK only) | 64.2% |
-| Trip | Filtered + conf ≥ 0.7 | 69.5% |
+These runs used the original model (47 features, no endpoint constraints) and no trip quality filter.
 
-SUBWAY over-prediction: 409 trips predicted SUBWAY, Google says WALKING(320), BIKE(55), CAR(34).
+| Run | Features | Overall | Verifiable | SUBWAY pred. | Notes |
+|-----|----------|---------|------------|-------------|-------|
+| GT-1 | Motion only | 36.3% | 64.2% | 409 | Baseline |
+| GT-2 | OSM routes only | 31.8% | 60.5% | 450 | OSM hurt — dense transit in Copenhagen |
+| GT-3 | Full (GTFS+OSM) | 36.0% | 52.9% | 160 | GTFS fixed SUBWAY, OSM added noise |
 
 ---
 
-## GT-Run 2: OSM routes only (no GTFS)
+## GT-Run 4: Quality filter + old model (full features)
 
-| Level | Metric | Value |
-|-------|--------|-------|
-| Trip | Overall agreement | 31.8% (**worse**) |
-| Trip | Filtered (BIKE/CAR/WALK only) | 60.5% (**worse**) |
-| Trip | SUBWAY predictions | 450 (**more**) |
+Added trip quality filter (max_jump=2km, max_speed=500km/h, jump-back, sparse). 1500 → 1213 trips.
 
-OSM route features made things **worse**. Copenhagen's dense transit infrastructure means route-matching finds bus/train/subway routes near everything, including walking trips.
+| Metric | Value |
+|--------|-------|
+| Overall agreement | 42.6% |
+| Verifiable only | 56.7% |
+| Verifiable + conf ≥ 0.7 | 62.1% |
+| SUBWAY predictions | 145 |
+| TRAIN predictions | 154 |
+
+Quality filter removed the worst GPS noise but didn't improve verifiable agreement much — the main bottleneck is SUBWAY/TRAIN over-prediction.
 
 ---
 
-## GT-Run 3: Full features (GTFS + OSM)
+## GT-Run 5: Retrained model with endpoint features (full features)
 
-| Level | Metric | Value |
-|-------|--------|-------|
-| Segment | Agreement | 37.7% |
-| Segment | BIKE agreement | 32.5% |
-| Segment | CAR agreement | 31.6% |
-| Segment | WALKING agreement | 39.9% |
-| Trip | Overall agreement | 36.0% |
-| Trip | Filtered (BIKE/CAR/WALK only) | 52.9% |
-| Trip | Filtered + conf ≥ 0.7 | 58.1% |
-| Trip | SUBWAY predictions | 160 |
-| Trip | TRAIN predictions | 294 |
+Retrained on Paris with new features:
+- `{METRO,TRAIN,TRAM}_DIST_START_M`, `_DIST_END_M`, `_DIST_EP_MAX_M`
+- EP_MAX = max(start, end) distance — both endpoints must be near a station
+- 70 features total (up from 63)
 
-**GTFS stop features fixed SUBWAY** (419 → 160 predictions). Trips far from metro stations are no longer misclassified. But **TRAIN became the new problem** (294 trips, high confidence 0.846, mostly wrong). Overall filtered agreement dropped because OSM route features add noise in Copenhagen.
+Training impact: `METRO_DIST_EP_MAX_M` → rank #11 importance (gain 15.7). SUBWAY OOF F1 dropped 0.66→0.41 (model more conservative). All other modes improved.
+
+| Metric | GT-Run 4 (old) | GT-Run 5 (new) |
+|--------|----------------|----------------|
+| Overall agreement | 42.6% | **44.9%** |
+| Verifiable only | 56.7% | **59.2%** |
+| Verifiable + conf ≥ 0.7 | 62.1% | **64.8%** |
+| Verifiable + conf ≥ 0.8 | 60.9% | **69.5%** |
+| SUBWAY predictions | 145 | **82** (−43%) |
+| TRAIN predictions | 154 | 206 (+34%) |
+| IN_VEHICLE match (verif.) | 56.9% | **60.6%** |
+| ON_FOOT match (verif.) | 59.3% | **61.8%** |
+| ON_BICYCLE match (verif.) | 46.4% | **47.7%** |
 
 ---
 
 ## Key findings
 
-1. **SUBWAY over-prediction fixed by GTFS stop proximity** — metro endpoint distance is discriminative
-2. **OSM route features hurt in Copenhagen** — trained on Paris density, doesn't transfer
-3. **Google confidence is high** (median 95) — disagreements aren't from Google uncertainty
-4. **Confidence filtering helps**: at ≥0.7, agreement rises from 36% to 44% (overall) and 60% to 66% (filtered)
-5. **Model trained on Paris has transferability limitations** — transit infrastructure density differs between cities
-6. **BIKE is hard**: 32% agreement (full features), confused with CAR (40%) and WALKING (19%)
+1. **GPS quality filter is essential**: Google Timeline has cell tower bouncing (jumps of 6–13km), sparse sampling (~60s), and teleportation artefacts. Removed 287/1500 trips (19%).
+2. **Iterative speed filter**: Single-pass speed filtering misses cascading jumps. Iterating (remove outliers → recompute speed → repeat) catches more.
+3. **Endpoint distance features work**: `METRO_DIST_EP_MAX_M` became rank #11 feature, reduced SUBWAY predictions by 43%.
+4. **TRAIN over-prediction persists**: 206 trips (17%), `TRAIN_DIST_EP_MAX_M` is only rank #28 — train stations are more spread out than metro, so the endpoint constraint is weaker.
+5. **Google labels are coarse**: Only 3 types (ON_FOOT 74%, ON_BICYCLE 18%, IN_VEHICLE 8%). No rail or bus labels. This limits what we can validate.
+6. **Google confidence is high** (median 96) — disagreements aren't from Google uncertainty.
+7. **ON_BICYCLE weakest** (47.7% verifiable match): 46/212 bike trips predicted as CAR. Likely a Paris→Copenhagen transferability gap.
+8. **Confidence filtering effective**: Verifiable agreement rises from 59.2% → 69.5% at conf ≥ 0.8.
 
 ---
 
 ## Open issues
 
-1. **BUS Level 4**: Trip-level exact dropped from 71.2% to 23.1%. Segments within BUS trips get classified as CAR (BUS+CAR = 22.7%). The classifier knows BUS at trip level (OOF F1 0.68) but short segments lose the discriminative pattern.
-
-2. **Note on Level 3 comparison**: Original uses 80/20 split (10,637 test trips), modedetect uses OOF on 50,378 trips. OOF is a harder evaluation — every trip is tested on a fold that didn't see it. The comparison is not perfectly apples-to-apples.
+1. **TRAIN over-prediction**: 206 trips predicted TRAIN, mostly Google ON_FOOT. Train endpoint features not yet strong enough.
+2. **ON_FOOT → CAR misclassification**: 170/870 ON_FOOT trips predicted as CAR. Possibly remaining GPS noise creating high apparent speeds.
+3. **BUS Level 4 (Paris training)**: Trip-level exact dropped from 71.2% to 23.1%. Short segments lose the discriminative stopping pattern.
+4. **SUBWAY OOF F1 dropped to 0.41**: Model is now conservative about SUBWAY — good for reducing false positives but hurts recall on real subway trips.
+5. **Note on Level 3 comparison**: Original uses 80/20 split (10,637 test trips), modedetect uses OOF on 48,388 trips. OOF is a harder evaluation.
