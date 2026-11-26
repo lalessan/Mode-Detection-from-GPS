@@ -675,6 +675,7 @@ def main():
     model.config.col_longitude = "longitude"
     model.config.col_timestamp = "timestamp"
     model.config.col_trip_key = "trip_key"
+    model.config.postprocess_enabled = True
     model.config.col_speed_kmh = None  # compute from coords
 
     has_gtfs = model.config.gtfs_dir is not None
