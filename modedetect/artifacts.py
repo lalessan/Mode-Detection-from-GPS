@@ -38,6 +38,7 @@ def save_bundle(
     speed_thresholds: dict[str, float],
     is_multimodal: bool,
     dataset_stats: dict | None = None,
+    hierarchical_models: dict | None = None,
 ) -> Path:
     """Save all model artifacts into a single .zip file.
 
@@ -50,9 +51,10 @@ def save_bundle(
     with tempfile.TemporaryDirectory() as tmpdir:
         tmp = Path(tmpdir)
 
-        # XGBoost model
-        model_path = tmp / "model.ubj"
-        model.save_model(str(model_path))
+        # XGBoost model (flat — may be None for hierarchical-only)
+        if model is not None:
+            model_path = tmp / "model.ubj"
+            model.save_model(str(model_path))
 
         # Label encoder
         encoder_path = tmp / "label_encoder.joblib"
@@ -72,10 +74,22 @@ def save_bundle(
         })
         _write_json(tmp / "speed_thresholds.json", speed_thresholds)
 
+        # Hierarchical models
+        is_hierarchical = hierarchical_models is not None
+        if is_hierarchical:
+            for stage in ("stage1", "stage2a", "stage2b"):
+                hm = hierarchical_models[f"model_{stage}"]
+                hm.save_model(str(tmp / f"model_{stage}.ubj"))
+                joblib.dump(hierarchical_models[f"encoder_{stage}"],
+                           tmp / f"encoder_{stage}.joblib")
+                _write_json(tmp / f"feature_list_{stage}.json",
+                           hierarchical_models[f"feature_list_{stage}"])
+
         # Metadata
         metadata = {
             "created_at": datetime.now(timezone.utc).isoformat(),
             "is_multimodal": is_multimodal,
+            "hierarchical": is_hierarchical,
             "n_features": len(feature_list),
             "n_classes": len(encoder.classes_),
             "classes": encoder.classes_.tolist(),
@@ -110,9 +124,12 @@ def load_bundle(path: str | Path) -> dict:
         with zipfile.ZipFile(path, "r") as zf:
             zf.extractall(tmp)
 
-        # XGBoost model
-        model = XGBClassifier()
-        model.load_model(str(tmp / "model.ubj"))
+        # XGBoost model (may not exist for hierarchical-only bundles)
+        model = None
+        model_path = tmp / "model.ubj"
+        if model_path.exists():
+            model = XGBClassifier()
+            model.load_model(str(model_path))
 
         # Label encoder
         encoder = joblib.load(tmp / "label_encoder.joblib")
@@ -134,6 +151,19 @@ def load_bundle(path: str | Path) -> dict:
         # Metadata
         metadata = _read_json(tmp / "metadata.json")
 
+        # Hierarchical models
+        hierarchical_models = None
+        if metadata.get("hierarchical", False):
+            hierarchical_models = {}
+            for stage in ("stage1", "stage2a", "stage2b"):
+                m = XGBClassifier()
+                m.load_model(str(tmp / f"model_{stage}.ubj"))
+                hierarchical_models[f"model_{stage}"] = m
+                hierarchical_models[f"encoder_{stage}"] = joblib.load(
+                    tmp / f"encoder_{stage}.joblib")
+                hierarchical_models[f"feature_list_{stage}"] = _read_json(
+                    tmp / f"feature_list_{stage}.json")
+
     return {
         "model": model,
         "encoder": encoder,
@@ -144,6 +174,7 @@ def load_bundle(path: str | Path) -> dict:
         "speed_thresholds": speed_thresholds,
         "is_multimodal": metadata.get("is_multimodal", False),
         "metadata": metadata,
+        "hierarchical_models": hierarchical_models,
     }
 
 

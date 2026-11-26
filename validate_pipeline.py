@@ -365,7 +365,7 @@ def load_raw_gps(max_files=None):
     return gps_df, trips_df
 
 
-def run_modedetect_pipeline(gps_df, trips_df):
+def run_modedetect_pipeline(gps_df, trips_df, hierarchical=False):
     """Run the modedetect package on the raw GPS data.
 
     Expects gps_df to already have KEY and timestamp columns
@@ -373,7 +373,8 @@ def run_modedetect_pipeline(gps_df, trips_df):
     """
     print()
     print("=" * 60)
-    print("Running modedetect pipeline...")
+    model_type = "hierarchical" if hierarchical else "flat"
+    print(f"Running modedetect pipeline ({model_type})...")
     print("=" * 60)
 
     from modedetect import ModeDetector, ModeDetectConfig
@@ -397,6 +398,7 @@ def run_modedetect_pipeline(gps_df, trips_df):
         n_folds=5,
         n_jobs=15,
         random_state=0,
+        hierarchical=hierarchical,
     )
 
     print(f"  GPS: {gps_df.shape}, Trips: {trips_df.shape}")
@@ -1205,6 +1207,8 @@ def main():
     parser = argparse.ArgumentParser(description="Validate modedetect pipeline")
     parser.add_argument("--clean", action="store_true",
                         help="Delete model/prediction checkpoints to force retraining")
+    parser.add_argument("--hierarchical", action="store_true",
+                        help="Train hierarchical model (non-motorized/motorized → subclass)")
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(name)s — %(message)s")
@@ -1311,7 +1315,8 @@ def main():
         model_new.config.gtfs_dir = GTFS_DIR
         model_new.config.osm_routes_dir = OSM_ROUTES_DIR
     else:
-        model_new = run_modedetect_pipeline(gps_df, trips_df)
+        model_new = run_modedetect_pipeline(gps_df, trips_df,
+                                            hierarchical=args.hierarchical)
         import shutil
         if Path("models/netmob25_modedetect.zip").exists():
             shutil.copy("models/netmob25_modedetect.zip", model_ckpt)

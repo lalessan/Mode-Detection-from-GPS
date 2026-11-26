@@ -129,6 +129,18 @@ class ModeDetector:
         self._max_speed_ms: float | None = None
         self._is_multimodal: bool = False
 
+        # Hierarchical model state (3 stages)
+        self._hierarchical: bool = False
+        self._model_stage1: XGBClassifier | None = None
+        self._model_stage2a: XGBClassifier | None = None
+        self._model_stage2b: XGBClassifier | None = None
+        self._encoder_stage1: LabelEncoder | None = None
+        self._encoder_stage2a: LabelEncoder | None = None
+        self._encoder_stage2b: LabelEncoder | None = None
+        self._feature_list_stage1: list[str] | None = None
+        self._feature_list_stage2a: list[str] | None = None
+        self._feature_list_stage2b: list[str] | None = None
+
         # Lazy-loaded external resources
         self._stop_tree = None
         self._stop_df: pd.DataFrame | None = None
@@ -136,6 +148,10 @@ class ModeDetector:
 
     @property
     def is_fitted(self) -> bool:
+        if self._hierarchical:
+            return (self._model_stage1 is not None and
+                    self._model_stage2a is not None and
+                    self._model_stage2b is not None)
         return self._model is not None and self._feature_list is not None
 
     # ── fit ───────────────────────────────────────────────────────────
@@ -440,6 +456,9 @@ class ModeDetector:
             features_df = self._extract_trip_features(gps, cfg)
             id_cols = ["trip_key"]
 
+        if self._hierarchical:
+            return self._predict_hierarchical_proba(features_df, id_cols, cfg, segment)
+
         X = features_df.reindex(columns=self._feature_list, fill_value=0)
         proba = self._model.predict_proba(X)
 
@@ -452,6 +471,59 @@ class ModeDetector:
         result = features_df[id_cols].copy()
         for i, cls in enumerate(self._encoder.classes_):
             result[cls] = proba[:, i]
+        return result
+
+    def _predict_hierarchical_proba(
+        self,
+        features_df: pd.DataFrame,
+        id_cols: list[str],
+        cfg,
+        segment: bool,
+    ) -> pd.DataFrame:
+        """Predict using the 3-stage hierarchical model.
+
+        Returns DataFrame with trip_key (+ segment) + one column per 7 classes,
+        with probabilities computed as P(stage1) * P(stage2).
+        """
+        from .config import is_proximity_feature
+
+        n = len(features_df)
+
+        # Stage 1: NON_MOTORIZED vs MOTORIZED (movement features only)
+        X1 = features_df.reindex(columns=self._feature_list_stage1, fill_value=0)
+        proba1 = self._model_stage1.predict_proba(X1)
+        s1_classes = list(self._encoder_stage1.classes_)
+        nm_idx = s1_classes.index("NON_MOTORIZED")
+        m_idx = s1_classes.index("MOTORIZED")
+        p_nm = proba1[:, nm_idx]
+        p_m = proba1[:, m_idx]
+
+        # Stage 2a: WALKING vs BIKE (movement features only)
+        X2a = features_df.reindex(columns=self._feature_list_stage2a, fill_value=0)
+        proba2a = self._model_stage2a.predict_proba(X2a)
+        s2a_classes = list(self._encoder_stage2a.classes_)
+
+        # Stage 2b: BUS/CAR/SUBWAY/TRAIN/TRAMWAY (all features)
+        X2b = features_df.reindex(columns=self._feature_list_stage2b, fill_value=0)
+        proba2b = self._model_stage2b.predict_proba(X2b)
+        s2b_classes = list(self._encoder_stage2b.classes_)
+
+        # Apply post-processing constraints to stage 2b probabilities
+        if cfg.postprocess_enabled and segment:
+            from .postprocessing import postprocess_proba
+            proba2b = postprocess_proba(proba2b, features_df, s2b_classes)
+
+        # Combine: P(class) = P(group) * P(class | group)
+        all_classes = sorted(s2a_classes + s2b_classes)
+        result = features_df[id_cols].copy()
+        for cls in all_classes:
+            if cls in s2a_classes:
+                ci = s2a_classes.index(cls)
+                result[cls] = p_nm * proba2a[:, ci]
+            else:
+                ci = s2b_classes.index(cls)
+                result[cls] = p_m * proba2b[:, ci]
+
         return result
 
     def segmented_gps(self) -> pd.DataFrame:
@@ -475,6 +547,19 @@ class ModeDetector:
     def save(self, path: str | Path) -> Path:
         """Save the trained model as a .zip artifact bundle."""
         self._check_fitted()
+        hierarchical_models = None
+        if self._hierarchical:
+            hierarchical_models = {
+                "model_stage1": self._model_stage1,
+                "model_stage2a": self._model_stage2a,
+                "model_stage2b": self._model_stage2b,
+                "encoder_stage1": self._encoder_stage1,
+                "encoder_stage2a": self._encoder_stage2a,
+                "encoder_stage2b": self._encoder_stage2b,
+                "feature_list_stage1": self._feature_list_stage1,
+                "feature_list_stage2a": self._feature_list_stage2a,
+                "feature_list_stage2b": self._feature_list_stage2b,
+            }
         return artifacts.save_bundle(
             path=path,
             model=self._model,
@@ -485,6 +570,7 @@ class ModeDetector:
             optimal_stop_percentiles=self._optimal_stop_percentiles,
             speed_thresholds=self._speed_thresholds,
             is_multimodal=self._is_multimodal,
+            hierarchical_models=hierarchical_models,
         )
 
     @classmethod
@@ -501,15 +587,31 @@ class ModeDetector:
         detector._speed_thresholds = bundle["speed_thresholds"]
         detector._is_multimodal = bundle["is_multimodal"]
 
+        # Load hierarchical models if present
+        hm = bundle.get("hierarchical_models")
+        if hm:
+            detector._hierarchical = True
+            detector._model_stage1 = hm["model_stage1"]
+            detector._model_stage2a = hm["model_stage2a"]
+            detector._model_stage2b = hm["model_stage2b"]
+            detector._encoder_stage1 = hm["encoder_stage1"]
+            detector._encoder_stage2a = hm["encoder_stage2a"]
+            detector._encoder_stage2b = hm["encoder_stage2b"]
+            detector._feature_list_stage1 = hm["feature_list_stage1"]
+            detector._feature_list_stage2a = hm["feature_list_stage2a"]
+            detector._feature_list_stage2b = hm["feature_list_stage2b"]
+
         # Compute max speed from thresholds
         if detector._speed_thresholds:
             detector._max_speed_ms = max(detector._speed_thresholds.values())
 
+        model_type = "hierarchical" if detector._hierarchical else "flat"
         logger.info(
-            "Loaded model: %d features, %d classes, multimodal=%s",
+            "Loaded model: %d features, %d classes, multimodal=%s, type=%s",
             len(detector._feature_list),
             len(detector._encoder.classes_),
             detector._is_multimodal,
+            model_type,
         )
         return detector
 
@@ -816,6 +918,12 @@ class ModeDetector:
 
     def _train_model(self, merged: pd.DataFrame, cfg: ModeDetectConfig) -> None:
         """Train XGBoost with optional forward feature selection + K-fold CV."""
+        if cfg.hierarchical:
+            return self._train_model_hierarchical(merged, cfg)
+        return self._train_model_flat(merged, cfg)
+
+    def _train_model_flat(self, merged: pd.DataFrame, cfg: ModeDetectConfig) -> None:
+        """Train a single multi-class XGBoost model (original approach)."""
         from sklearn.metrics import f1_score
         from sklearn.model_selection import train_test_split
 
@@ -913,6 +1021,189 @@ class ModeDetector:
         self._oof_predictions = pd.DataFrame(oof_dict)
         oof_f1 = f1_score(y, oof_preds, average="macro")
         logger.info("Best fold macro F1: %.4f, OOF macro F1: %.4f", best_f1, oof_f1)
+
+    def _train_model_hierarchical(self, merged: pd.DataFrame, cfg: ModeDetectConfig) -> None:
+        """Train a 3-stage hierarchical model.
+
+        Stage 1: NON_MOTORIZED vs MOTORIZED (movement features only)
+        Stage 2a: WALKING vs BIKE (movement features only)
+        Stage 2b: BUS/CAR/SUBWAY/TRAIN/TRAMWAY (all features)
+        """
+        from sklearn.metrics import f1_score
+        from .config import NONMOTORIZED_MODES, MOTORIZED_MODES, is_proximity_feature
+
+        mode_col = cfg.col_main_mode
+        merged = merged.dropna(subset=[mode_col])
+
+        exclude = {"trip_key", mode_col, "segment", "main_mode", cfg.col_main_mode, cfg.col_trip_key}
+        all_feature_cols = [c for c in merged.columns if c not in exclude]
+        movement_cols = [c for c in all_feature_cols if not is_proximity_feature(c)]
+
+        logger.info("Hierarchical model: %d movement features, %d total features",
+                     len(movement_cols), len(all_feature_cols))
+
+        trip_keys = merged["trip_key"].values if "trip_key" in merged.columns else merged[cfg.col_trip_key].values
+        has_segment = "segment" in merged.columns
+
+        # ── Stage 1: NON_MOTORIZED vs MOTORIZED ──────────────────────
+        logger.info("=== Stage 1: NON_MOTORIZED vs MOTORIZED ===")
+        stage1_label = merged[mode_col].map(
+            lambda m: "NON_MOTORIZED" if m in NONMOTORIZED_MODES else "MOTORIZED"
+        ).values
+
+        s1_model, s1_encoder, s1_oof_preds, s1_oof_conf = self._train_single_stage(
+            merged[movement_cols].values, stage1_label, movement_cols, cfg, "Stage 1")
+        self._model_stage1 = s1_model
+        self._encoder_stage1 = s1_encoder
+        self._feature_list_stage1 = movement_cols
+
+        s1_labels = s1_encoder.inverse_transform(s1_oof_preds)
+        s1_acc = np.mean(s1_labels == stage1_label)
+        logger.info("Stage 1 OOF accuracy: %.4f", s1_acc)
+
+        # ── Stage 2a: WALKING vs BIKE ────────────────────────────────
+        logger.info("=== Stage 2a: WALKING vs BIKE ===")
+        nm_mask = merged[mode_col].isin(NONMOTORIZED_MODES).values
+        nm_labels = merged[mode_col].values[nm_mask]
+
+        s2a_model, s2a_encoder, s2a_oof_preds, s2a_oof_conf = self._train_single_stage(
+            merged[movement_cols].values[nm_mask], nm_labels, movement_cols, cfg, "Stage 2a")
+        self._model_stage2a = s2a_model
+        self._encoder_stage2a = s2a_encoder
+        self._feature_list_stage2a = movement_cols
+
+        s2a_labels = s2a_encoder.inverse_transform(s2a_oof_preds)
+        s2a_f1 = f1_score(nm_labels, s2a_labels, average="macro")
+        logger.info("Stage 2a OOF macro F1: %.4f (%d samples)", s2a_f1, nm_mask.sum())
+
+        # ── Stage 2b: BUS/CAR/SUBWAY/TRAIN/TRAMWAY ───────────────────
+        logger.info("=== Stage 2b: BUS/CAR/SUBWAY/TRAIN/TRAMWAY ===")
+        m_mask = merged[mode_col].isin(MOTORIZED_MODES).values
+        m_labels = merged[mode_col].values[m_mask]
+
+        s2b_model, s2b_encoder, s2b_oof_preds, s2b_oof_conf = self._train_single_stage(
+            merged[all_feature_cols].values[m_mask], m_labels, all_feature_cols, cfg, "Stage 2b")
+        self._model_stage2b = s2b_model
+        self._encoder_stage2b = s2b_encoder
+        self._feature_list_stage2b = all_feature_cols
+
+        s2b_labels = s2b_encoder.inverse_transform(s2b_oof_preds)
+        s2b_f1 = f1_score(m_labels, s2b_labels, average="macro")
+        logger.info("Stage 2b OOF macro F1: %.4f (%d samples)", s2b_f1, m_mask.sum())
+
+        self._hierarchical = True
+
+        # ── Combined OOF predictions ──────────────────────────────────
+        # Cascade: Stage 1 routes to 2a or 2b
+        all_true = merged[mode_col].values
+        all_pred = np.empty(len(all_true), dtype=object)
+        all_conf = np.full(len(all_true), np.nan)
+
+        # For non-motorized true samples
+        nm_pred_stage1 = s1_labels[nm_mask]
+        nm_idx = np.where(nm_mask)[0]
+        for i, idx in enumerate(nm_idx):
+            if nm_pred_stage1[i] == "NON_MOTORIZED":
+                all_pred[idx] = s2a_labels[i]
+                all_conf[idx] = s1_oof_conf[idx] * s2a_oof_conf[i]
+            else:
+                # Stage 1 misclassified as MOTORIZED — Stage 2b wasn't trained on this sample
+                # Use the most common motorized mode as fallback
+                all_pred[idx] = "CAR"
+                all_conf[idx] = s1_oof_conf[idx] * 0.5
+
+        # For motorized true samples
+        m_pred_stage1 = s1_labels[m_mask]
+        m_idx = np.where(m_mask)[0]
+        s2b_i = 0
+        for i, idx in enumerate(m_idx):
+            if m_pred_stage1[i] == "MOTORIZED":
+                all_pred[idx] = s2b_labels[s2b_i]
+                all_conf[idx] = s1_oof_conf[idx] * s2b_oof_conf[s2b_i]
+            else:
+                # Stage 1 misclassified as NON_MOTORIZED
+                all_pred[idx] = "WALKING"
+                all_conf[idx] = s1_oof_conf[idx] * 0.5
+            s2b_i += 1
+
+        # Also create a flat encoder for the 7-class output
+        self._encoder = LabelEncoder()
+        self._encoder.fit(list(NONMOTORIZED_MODES | MOTORIZED_MODES))
+        self._feature_list = all_feature_cols  # used by is_fitted check
+
+        oof_dict = {
+            "trip_key": trip_keys,
+            "true_label": all_true,
+            "pred_label": all_pred,
+            "confidence": all_conf,
+        }
+        if has_segment:
+            oof_dict["segment"] = merged["segment"].values
+        self._oof_predictions = pd.DataFrame(oof_dict)
+
+        combined_f1 = f1_score(all_true, all_pred, average="macro")
+        logger.info("Combined OOF macro F1: %.4f", combined_f1)
+
+    def _train_single_stage(
+        self,
+        X: np.ndarray,
+        labels: np.ndarray,
+        feature_cols: list[str],
+        cfg: ModeDetectConfig,
+        stage_name: str,
+    ) -> tuple[XGBClassifier, LabelEncoder, np.ndarray, np.ndarray]:
+        """Train one XGBoost stage with K-fold CV. Returns (model, encoder, oof_preds, oof_conf)."""
+        from sklearn.metrics import f1_score
+
+        encoder = LabelEncoder()
+        y = encoder.fit_transform(labels)
+        n_classes = len(encoder.classes_)
+
+        objective = "binary:logistic" if n_classes == 2 else "multi:softprob"
+        xgb_kwargs = {
+            "objective": objective,
+            "tree_method": "hist",
+            "random_state": cfg.random_state,
+            "eval_metric": "logloss" if n_classes == 2 else "mlogloss",
+        }
+        if n_classes > 2:
+            xgb_kwargs["num_class"] = n_classes
+        n_jobs = cfg.n_jobs if cfg.n_jobs != -1 else os.cpu_count()
+        xgb_kwargs["n_jobs"] = n_jobs
+        if cfg.xgb_params:
+            xgb_kwargs.update({k: v for k, v in cfg.xgb_params.items()
+                               if k not in ("objective", "num_class", "eval_metric")})
+
+        sample_weights = None
+        if cfg.class_weight == "balanced":
+            from sklearn.utils.class_weight import compute_sample_weight
+            sample_weights = compute_sample_weight("balanced", y)
+
+        skf = StratifiedKFold(n_splits=cfg.n_folds, shuffle=True, random_state=cfg.random_state)
+        best_f1 = -1.0
+        best_model = None
+        oof_preds = np.full(len(y), -1, dtype=int)
+        oof_conf = np.full(len(y), np.nan)
+
+        for fold, (train_idx, val_idx) in enumerate(skf.split(X, y)):
+            clf = XGBClassifier(**xgb_kwargs)
+            fit_kwargs = {}
+            if sample_weights is not None:
+                fit_kwargs["sample_weight"] = sample_weights[train_idx]
+            clf.fit(X[train_idx], y[train_idx], **fit_kwargs)
+
+            y_pred = clf.predict(X[val_idx])
+            oof_preds[val_idx] = y_pred
+            proba = clf.predict_proba(X[val_idx])
+            oof_conf[val_idx] = proba.max(axis=1)
+            f1 = f1_score(y[val_idx], y_pred, average="macro")
+            logger.info("%s fold %d/%d — macro F1: %.4f", stage_name, fold + 1, cfg.n_folds, f1)
+
+            if f1 > best_f1:
+                best_f1 = f1
+                best_model = clf
+
+        return best_model, encoder, oof_preds, oof_conf
 
     def _forward_feature_selection(
         self,

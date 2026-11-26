@@ -110,5 +110,27 @@ class ModeDetectConfig:
     # ── Post-processing ────────────────────────────────────────────────
     postprocess_enabled: bool = False  # apply heuristic fixes after segment classification
 
+    # ── Hierarchical model ───────────────────────────────────────────
+    hierarchical: bool = False  # True = 3-stage model (non-motorized/motorized → subclass)
+
     # ── Parallelism ───────────────────────────────────────────────────
     n_jobs: int = 1  # 1 = single-process; -1 = all cores
+
+
+# ── Hierarchical mode groupings ──────────────────────────────────────
+NONMOTORIZED_MODES = {"WALKING", "BIKE"}
+MOTORIZED_MODES = {"BUS", "CAR", "SUBWAY", "TRAIN", "TRAMWAY"}
+
+
+def is_proximity_feature(col: str) -> bool:
+    """Return True if the column is a proximity/infrastructure feature."""
+    PROXIMITY_EXACT = {
+        "bus_match_pct", "tram_match_pct", "train_match_pct", "subway_match_pct",
+    }
+    PROXIMITY_PREFIXES = (
+        "STOPS_NUM_", "STOPS_MINDIST_", "STOPS_CLOSEST_",
+        "MIN_DIST_", "DURATION_TRAM", "DURATION_METRO", "DURATION_RAIL", "DURATION_BUS",
+        "BUS_SEQ_",
+        "METRO_DIST_", "TRAIN_DIST_", "TRAM_DIST_",
+    )
+    return col in PROXIMITY_EXACT or any(col.startswith(p) for p in PROXIMITY_PREFIXES)
