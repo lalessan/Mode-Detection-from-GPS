@@ -852,6 +852,8 @@ class ModeDetector:
         if hasattr(self, '_ckpt_dir') and self._ckpt_dir is not None:
             stop_cache = self._ckpt_dir / "03_stop_point_cache.npz"
         if stop_cache is not None and stop_cache.exists():
+            # Ensure stop resources loaded so cache key (which includes stop count) matches
+            self._ensure_stop_resources(cfg)
             # Check cache size matches current GPS data
             try:
                 probe = np.load(stop_cache, mmap_mode="r")
@@ -864,7 +866,8 @@ class ModeDetector:
                 from .features.stops import compute_stop_features
                 gps_seg_sorted = gps_seg.sort_values([cfg.col_trip_key, cfg.col_timestamp]).reset_index(drop=True)
                 stop_features = compute_stop_features(
-                    gps_seg_sorted, None, None, cfg, segment_col="segment",
+                    gps_seg_sorted, self._stop_tree, self._stop_df, cfg,
+                    segment_col="segment",
                     point_cache_path=stop_cache,
                 )
             else:
