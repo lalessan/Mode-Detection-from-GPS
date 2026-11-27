@@ -851,9 +851,9 @@ class ModeDetector:
         stop_cache = None
         if hasattr(self, '_ckpt_dir') and self._ckpt_dir is not None:
             stop_cache = self._ckpt_dir / "03_stop_point_cache.npz"
-        if stop_cache is not None and stop_cache.exists():
-            # Ensure stop resources loaded so cache key (which includes stop count) matches
-            self._ensure_stop_resources(cfg)
+        # Always ensure stop resources are loaded before attempting stop features
+        has_stops = self._ensure_stop_resources(cfg)
+        if stop_cache is not None and stop_cache.exists() and has_stops:
             # Check cache size matches current GPS data
             try:
                 probe = np.load(stop_cache, mmap_mode="r")
@@ -874,7 +874,9 @@ class ModeDetector:
                 logger.info("Stop cache size mismatch (%d vs %d points) — using BallTree.",
                             cache_len, n_points)
                 stop_cache = None  # fall through to BallTree path
-        if stop_cache is None and self._ensure_stop_resources(cfg):
+        else:
+            stop_cache = None
+        if stop_cache is None and has_stops:
             from .features.stops import compute_stop_features
             stop_features = compute_stop_features(
                 gps_seg, self._stop_tree, self._stop_df, cfg, segment_col="segment",
